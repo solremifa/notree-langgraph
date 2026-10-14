@@ -1,0 +1,4 @@
+langgraph>=1.0,<2
+langgraph-checkpoint-sqlite>=3,<4
+openai>=1.40   # --llm openai 쓸 때만 필요
+pytest         # 테스트용
