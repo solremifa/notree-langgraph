@@ -7,6 +7,7 @@
                                                        └─ (문제 + 2회) → needs_review ─ publish
 """
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -22,7 +23,8 @@ T0 = time.perf_counter()
 
 
 def log(node: str, msg: str) -> None:
-    print(f"  [{time.perf_counter() - T0:5.2f}s] {node:<13} {msg}", flush=True)
+    # 병렬 노드가 동시에 찍어도 줄이 섞이지 않게 한 번에 쓴다
+    sys.stdout.write(f"  [{time.perf_counter() - T0:5.2f}s] {node:<13} {msg}\n"); sys.stdout.flush()
 
 
 def opt(config: RunnableConfig, key: str, default=None):
@@ -88,19 +90,31 @@ def needs_review(state: CourseUpdateState):
     return {"status": "확인 필요"}
 
 
-def publish(state: CourseUpdateState, config: RunnableConfig):
-    """멱등키(= thread_id)로 한 번만 발행. 실제로는 MCP note.publish의 발행 게이트."""
-    out = Path(opt(config, "out_dir", "out")); out.mkdir(exist_ok=True)
-    db = out / "published.json"
-    published = json.loads(db.read_text("utf-8")) if db.exists() else {}
+class FileNoteStore:
+    """--saver sqlite 일 때 쓰는 발행 저장소 (out/published.json)."""
+
+    def __init__(self, out_dir: str) -> None:
+        self.db = Path(out_dir) / "published.json"
+        self.db.parent.mkdir(parents=True, exist_ok=True)
+
+    async def publish(self, key: str, course: str, note: str, status: str) -> bool:
+        published = json.loads(self.db.read_text("utf-8")) if self.db.exists() else {}
+        if key in published:
+            return False
+        published[key] = {"course": course, "note": note, "status": status}
+        self.db.write_text(json.dumps(published, ensure_ascii=False, indent=2), "utf-8")
+        return True
+
+
+async def publish(state: CourseUpdateState, config: RunnableConfig):
+    """멱등키(= thread_id)로 한 번만 발행. --saver mcp면 MCP note_publish, 아니면 파일."""
+    store = opt(config, "notes") or FileNoteStore(opt(config, "out_dir", "out"))
     key = opt(config, "thread_id")
     status = state.get("status") or "완료"
-    if key in published:
-        log("publish", f"이미 발행됨(멱등키 {key}) → 중복 발행 막음")
-    else:
-        published[key] = {"course": state.get("course"), "note": state["draft"], "status": status}
-        db.write_text(json.dumps(published, ensure_ascii=False, indent=2), "utf-8")
+    if await store.publish(key, state.get("course", ""), state["draft"], status):
         log("publish", f"새 버전 저장: {state['draft']!r} [{status}]")
+    else:
+        log("publish", f"이미 발행됨(멱등키 {key}) → 중복 발행 막음")
     maybe_crash(config, "publish")         # 커밋 '직후' 죽는 경우
     return {"status": status}
 

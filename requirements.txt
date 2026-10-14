@@ -1,4 +1,5 @@
 langgraph>=1.0,<2
-langgraph-checkpoint-sqlite>=3,<4
-openai>=1.40   # --llm openai 쓸 때만 필요
-pytest         # 테스트용
+langgraph-checkpoint-sqlite>=3,<4   # --saver sqlite 비교용
+mcp>=1.10,<2                        # 내부 MCP 서버/클라이언트 (A안)
+openai>=1.40                        # --llm openai 쓸 때만 필요
+pytest                              # 테스트용
