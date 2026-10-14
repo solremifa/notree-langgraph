@@ -1,4 +1,4 @@
-# notree-langgraph-hello
+# notree-langgraph
 
 Notree **과목 노트 업데이트**와 같은 모양의 LangGraph를 hello world 입출력으로 돌려 보는 PoC.
 실제 노트 대신 단어를 쓰고, 실제 DB/MCP 대신 `out/` 폴더의 파일을 씁니다.
