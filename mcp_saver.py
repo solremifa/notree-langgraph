@@ -24,23 +24,28 @@ from langgraph.checkpoint.base import (
 )
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 
 SERVER = Path(__file__).with_name("mcp_server.py")
 
 
 class McpClient:
-    """mcp_server.py를 stdio 하위 프로세스로 띄우고 도구를 호출한다.
-    (실제 배포에서는 compose 네트워크의 streamable HTTP 주소로 바뀌는 부분)"""
+    """내부 MCP 서버에 붙어 도구를 호출한다.
+    url이 있으면 streamable HTTP(실제 compose 배치와 같은 방식), 없으면 mcp_server.py를 stdio 하위 프로세스로 띄운다."""
 
-    def __init__(self, env: dict[str, str] | None = None) -> None:
+    def __init__(self, env: dict[str, str] | None = None, url: str | None = None) -> None:
         self.env = env
+        self.url = url
         self.calls: list[str] = []
         self._stack = AsyncExitStack()
         self.session: ClientSession | None = None
 
     async def __aenter__(self) -> "McpClient":
-        params = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=self.env)
-        read, write = await self._stack.enter_async_context(stdio_client(params))
+        if self.url:
+            read, write, _ = await self._stack.enter_async_context(streamablehttp_client(self.url))
+        else:
+            params = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=self.env)
+            read, write = await self._stack.enter_async_context(stdio_client(params))
         self.session = await self._stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
         return self

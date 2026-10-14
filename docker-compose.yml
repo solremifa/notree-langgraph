@@ -1,0 +1,5 @@
+# 진짜 Redis로 여러 프로세스를 띄워 보고 싶을 때:  docker compose up -d
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]

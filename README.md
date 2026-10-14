@@ -42,6 +42,16 @@ run.py (worker)                                 mcp_server.py (내부 MCP 서버
 | compose 네트워크의 내부 MCP | stdio 하위 프로세스 (배포 시 streamable HTTP로 바뀌는 부분) |
 | operation_id | `--thread` |
 
+## worker까지 붙인 전체 흐름
+
+api → scheduler(배정기) → Redis Streams → worker → (죽으면) 다른 worker가 이어받기까지 붙어 있습니다.
+흐름 설명은 **[docs/worker-flow.md](docs/worker-flow.md)** 에 따로 정리했습니다.
+
+```powershell
+python demo.py                    # Redis 없이 한 번에: worker-A가 extract 도중 죽고 worker-B가 체크포인트에서 이어감
+python demo.py --die-at publish   # 발행 직후 죽음 → 중복 발행 없이 마무리
+```
+
 ## 설치 (Windows PowerShell 기준)
 
 ```powershell
@@ -69,7 +79,7 @@ python run.py --thread op2 --resume             # "중복 발행 막음"
 python run.py --thread op1 --history            # 체크포인트 이력 (MCP checkpoint_list)
 python run.py --saver sqlite                    # 비교: worker가 DB 파일에 직접
 python run.py --graph                           # Mermaid 그래프 → out/graph.mmd (mermaid.live 에 붙여 넣기)
-pytest -q                                       # 9개: 시나리오 4개 × (memory, mcp) + DB 차단 테스트
+pytest -q                                       # 12개: 그래프 시나리오 9개 + worker 인계 시나리오 3개
 ```
 
 출력의 `💾 checkpoint step=N 다음=[...]`이 단계(super-step)마다 상태를 저장하는 지점이고,
@@ -105,11 +115,14 @@ python run.py --llm openai
 
 - `state.py` — 그래프 상태 (`extracts`는 `operator.add` reducer)
 - `graph.py` — 노드, 분기, `build_graph()`, 파일 발행 저장소
-- `mcp_server.py` — 내부 MCP 서버 (DB 소유자)
-- `mcp_saver.py` — `McpClient`, `McpCheckpointSaver`(A안), `McpNoteStore`
+- `mcp_server.py` — 내부 MCP 서버 (DB 소유자). 체크포인트·발행·작업(job)/lease 도구. `--http`로 HTTP 실행
+- `mcp_saver.py` — `McpClient`(stdio/HTTP), `McpCheckpointSaver`(A안), `McpNoteStore`
+- `api.py` · `scheduler.py` · `worker.py` — 요청 → 배정기 → worker 루프
+- `demo.py` — 위 전부를 한 번에 돌리는 데모 · `settings.py` — 공통 설정
+- `docs/worker-flow.md` — worker 실행 흐름 설명
 - `llm.py` — FakeLLM / OpenAI 교체 지점, 호출 기록 `CALLS`
 - `run.py` — CLI, 스트리밍 출력, 이어하기
-- `tests/test_flow.py`
+- `tests/test_flow.py` · `tests/test_worker.py`
 
 ## A안 검증에서 알게 된 것
 
@@ -125,6 +138,5 @@ python run.py --llm openai
 ## 아직 안 한 것
 
 - 서명된 permit 토큰 검사, 세대(generation) 비교로 삭제된 출처를 막는 발행 게이트
-- 편집 lease 60초 · heartbeat 20초, Redis 재배송(XAUTOCLAIM)으로 다른 worker가 이어받기
 - PostgreSQL 저장 (지금은 MCP 서버 뒤의 SQLite) · streamable HTTP 전송
 - 끝난 thread 체크포인트 정리 (`checkpoint_delete_thread`는 있음, 주기 실행은 없음)

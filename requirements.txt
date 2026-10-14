@@ -3,3 +3,5 @@ langgraph-checkpoint-sqlite>=3,<4   # --saver sqlite 비교용
 mcp>=1.10,<2                        # 내부 MCP 서버/클라이언트 (A안)
 openai>=1.40                        # --llm openai 쓸 때만 필요
 pytest                              # 테스트용
+redis>=5                            # worker·scheduler의 Redis Streams 클라이언트
+fakeredis>=2.20                     # demo.py · 테스트에서 Redis 없이 돌릴 때
