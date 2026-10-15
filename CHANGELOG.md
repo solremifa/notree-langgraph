@@ -11,6 +11,10 @@
 
 ## 2026-10-15
 
+### 업데이트 목록 추가 · `6d0de84`
+- 🆕 `CHANGELOG.md`: 이 목록. 앞으로 커밋마다 갱신
+- 🆕 `CLAUDE.md`: 변경 기록 규칙, uv·계약 문서·테스트 규칙
+
 ### 팀 결정 확정 반영 + MCP 도구 계약 · `cd20225`
 자세히: [docs/changes/2026-10-15-team-decisions.md](docs/changes/2026-10-15-team-decisions.md)
 
