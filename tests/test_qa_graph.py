@@ -13,8 +13,8 @@ from notree.graphs.qa.llm import FakeQALLM
 from notree.graphs.qa.retriever import sample_corpus
 
 
-def run(question, *, deadline_in=None, bad_citation=False, corpus=None):
-    llm, ret, saved = FakeQALLM(bad_citation=bad_citation), FakeRetriever(corpus or sample_corpus()), []
+def run(question, *, deadline_in=None, bad_citation=False, corpus=None, cite_min=0.6):
+    llm, ret, saved = FakeQALLM(bad_citation=bad_citation, cite_min=cite_min), FakeRetriever(corpus or sample_corpus()), []
 
     async def sink(result):
         saved.append(result)
@@ -120,3 +120,20 @@ def test_openai_requests_always_mention_json():
     out = asyncio.run(build_qa_graph().ainvoke({"question": "스택은 어떤 구조야?"}, cfg))
     assert out["citations"] == ["n1"]
     assert len(sent) == 2 and all("json" in _json.dumps(m, ensure_ascii=False).lower() for m in sent)
+
+
+def test_borderline_evidence_reaches_llm_and_labels_by_citation():
+    """실제 LLM 실행에서 나온 경우: 정답 근거 t1이 0.5점(멈춤 기준 0.6 미만)이라 LLM에게 전달되지 않아 근거 부족이 됐었음.
+    이제 0.3 이상이면 LLM에게 주고, LLM이 인용하면 그 출처로 라벨을 붙인다."""
+    out, _, ret, _ = run("스택 오버플로 원인 메모리", cite_min=0.3)   # 검색어 4개 → t1 0.5, n1 0.25
+    assert ret.calls == ["note", "transcript", "web"]                 # 0.6 미만이라 웹까지는 찾음
+    assert out["citations"] == ["t1"] and out["label"] == "강의" and out["status"] == "completed"
+
+
+def test_label_follows_cited_source_not_top_hit():
+    from notree.graphs.qa.graph import label_for
+    note = {"id": "n1", "source": "note"}; web = {"id": "w1", "source": "web"}
+    assert label_for(True, [web]) == "웹"
+    assert label_for(True, [web, note]) == "강의"
+    assert label_for(True, []) == "근거 부족"
+    assert label_for(False, [note]) == "일반 지식"

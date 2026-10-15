@@ -9,10 +9,12 @@
                                                └(부족·시간 있음)→ web_search ┘
 
 규칙
-- 충분: 최고 점수 ≥ ENOUGH_SCORE
+- 검색을 멈추는 기준: 최고 점수 ≥ ENOUGH_SCORE
+- LLM에게 주는 근거: 점수 ≥ EVIDENCE_MIN인 것 전부 (멈춤 기준보다 낮게. 애매한 점수의 정답 근거도 LLM이 판단하게)
 - 전사 검색은 남은 시간 ≥ TRANSCRIPT_MIN_SEC, 웹 검색은 ≥ WEB_MIN_SEC일 때만 (웹은 그래프 구조상 최대 1번)
-- 답변의 인용은 모두 이번에 찾은 근거 ID여야 하고, 강의·웹 라벨이면 인용이 1개 이상
-- 라벨은 LLM이 아니라 근거로 정한다: 관련 없음 → 일반 지식, 충분한 근거의 출처 → 강의/웹, 그 외 → 근거 부족
+- 답변의 인용은 모두 LLM에게 준 근거 ID여야 함
+- 라벨은 LLM이 실제로 인용한 근거의 출처로 정한다: 관련 없음 → 일반 지식, 강의 근거 인용 → 강의,
+  웹 근거만 인용 → 웹, 인용 없음 → 근거 부족
 
 실행에 필요한 것은 config["configurable"]로 받는다: llm, retriever, deadline_at(epoch 초, 없으면 무제한), sink(선택).
 체크포인트는 쓰지 않는다.
@@ -24,7 +26,9 @@ from langchain_core.runnables import RunnableConfig
 
 from notree.graphs.qa.state import HitDict, QAState
 
-ENOUGH_SCORE = 0.6
+ENOUGH_SCORE = 0.6     # 이 이상이면 더 찾지 않음
+EVIDENCE_MIN = 0.3     # 이 이상이면 LLM에게 근거로 줌
+MAX_EVIDENCE = 5
 TRANSCRIPT_MIN_SEC = 10.0
 WEB_MIN_SEC = 25.0
 MAX_ANSWER_ATTEMPTS = 2
@@ -50,8 +54,16 @@ def enough(hits: list[HitDict]) -> bool:
 
 
 def evidence(hits: list[HitDict]) -> list[HitDict]:
-    """답변에 넘길 근거: 충분한 점수의 근거만, 점수 순."""
-    return sorted((h for h in hits if h["score"] >= ENOUGH_SCORE), key=lambda h: -h["score"])
+    """답변에 넘길 근거: EVIDENCE_MIN 이상, 점수 순, 최대 MAX_EVIDENCE개."""
+    return sorted((h for h in hits if h["score"] >= EVIDENCE_MIN), key=lambda h: -h["score"])[:MAX_EVIDENCE]
+
+
+def label_for(related: bool, cited: list[HitDict]) -> str:
+    if not related:
+        return "일반 지식"
+    if any(h["source"] in ("note", "transcript") for h in cited):
+        return "강의"
+    return "웹" if cited else "근거 부족"
 
 
 # ── 노드 ─────────────────────────────────────────────────────────
@@ -74,12 +86,8 @@ async def answer(state: QAState, config: RunnableConfig) -> dict:
     ev = evidence(state.get("hits", [])) if state.get("related") else []
     a = await _cfg(config)["llm"].answer(state["question"], ev, attempt, state.get("verify_problem", ""),
                                          related=bool(state.get("related")))
-    if not state.get("related"):
-        label = "일반 지식"
-    elif ev:
-        label = "웹" if ev[0]["source"] == "web" else "강의"
-    else:
-        label = "근거 부족"
+    by_id = {h["id"]: h for h in ev}
+    label = label_for(bool(state.get("related")), [by_id[c] for c in a.citations if c in by_id])
     return {"answer": a.answer, "citations": a.citations, "label": label, "answer_attempts": attempt}
 
 
@@ -89,8 +97,6 @@ async def verify(state: QAState) -> dict:
     unknown = [c for c in cites if c not in known]
     if unknown:
         problem = f"근거에 없는 인용 {unknown}"
-    elif state.get("label") in ("강의", "웹") and not cites:
-        problem = "근거가 있는데 인용이 없음"
     else:
         problem = ""
     return {"verify_problem": problem}
