@@ -9,6 +9,14 @@ from typing import Protocol
 from notree.graphs.qa.state import HitDict, Source
 
 
+class SearchUnavailable(Exception):
+    """일시적인 검색 장애 (타임아웃·연결 끊김·서버 과부하). 그래프는 한 번 다시 시도하고, 안 되면 다음 출처로 넘어간다."""
+
+
+class SearchForbidden(Exception):
+    """권한 없음·삭제된 자료. 다시 해도 안 되므로 그래프를 멈춘다 (worker에서는 FatalError로)."""
+
+
 class Hit(dict):
     """HitDict 생성 도우미."""
 

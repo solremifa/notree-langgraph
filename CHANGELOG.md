@@ -11,6 +11,19 @@
 
 ## 2026-10-15
 
+### Q&A 그래프 보완 5가지 · (이번 커밋)
+자세히: [docs/changes/2026-10-15-qa-hardening.md](docs/changes/2026-10-15-qa-hardening.md)
+
+- 🐛 인용 검증이 끝내 실패하면 틀린 본문까지 저장되던 문제 → 정해진 "근거 부족" 안내문으로 저장
+- 🐛 본문의 `[ID]`와 인용 목록이 어긋날 수 있던 문제 → LLM은 문장별 인용만 내고 `[ID]` 표시는 코드가 생성
+- 🆕 점수가 높아도 LLM이 "답할 수 없음"이면 다음 출처로 다시 검색 (LLM 호출 실행당 4번까지)
+- 🆕 검색 장애 처리: 일시 장애·타임아웃은 1번 다시 후 다음 출처, 권한 없음·삭제는 `QAFatal`
+- 🆕 시간 예산: 검색·LLM 호출별 제한, 답변·저장용 시간 확보, 모자라면 "시간 초과" 안내문
+- 🔧 `docs/team-decisions.md` 10번 보완 목록 6~10번 ✅
+- ⚠️ LLM `answer()` 반환이 `Answer(sentences, needs_more_evidence)`로 바뀜 (OpenAI 답변 JSON 형식도 변경)
+- ⚠️ 상태에 `시간 초과` 추가, 남은 시간이 아주 적으면 검색 없이 답변
+- 테스트 53 → 63개
+
 ### Q&A 그래프를 main에 합침 (결정 변경: Q&A에 LangGraph 사용) · `e7ab556`
 - 🆕 `feat/qa-graph` 병합: `notree/graphs/qa/`, `notree/dev/qa_run.py`, `tests/test_qa_graph.py` (16개)
 - 🔧 `docs/team-decisions.md` 10번: "LangGraph 안 씀" → **LangGraph로 구현**. 실험·외부 검토에서 나온 보완 목록은 그대로 두고, 그래프에 이미 반영된 것과 남은 것을 표시
