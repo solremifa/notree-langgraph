@@ -6,8 +6,10 @@ payload
   fail   : "fatal"     → 매번 FatalError
            "retry:N"   → 처음 N번 시도는 RetryableError, 그 뒤 성공
            "always"    → 매번 RetryableError (시도 한도 확인용)
+  fail_if_exists : 이 경로에 파일이 있으면 RetryableError (되살리기 확인용: 파일을 지우고 job_retry)
 """
 import asyncio
+import os
 
 from notree.common.log import log
 from notree.worker.registry import FatalError, JobContext, RetryableError, handler
@@ -22,4 +24,6 @@ async def echo(ctx: JobContext) -> None:
         raise FatalError("입력이 잘못됨 (시험)")
     if fail == "always" or (fail.startswith("retry:") and ctx.attempt <= int(fail.split(":")[1])):
         raise RetryableError("일시적 오류 (시험)")
+    if p.get("fail_if_exists") and os.path.exists(p["fail_if_exists"]):
+        raise RetryableError("외부 조건 미충족 (시험)")
     log("echo", f"{p.get('text', '')!r}")

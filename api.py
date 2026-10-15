@@ -12,7 +12,7 @@ from mcp_saver import McpClient
 
 async def request_course_update(mcp: McpClient, lectures: list[str], llm: str = "fake") -> str:
     ACTOR.set("api")
-    job = await mcp.call("job_create", kind="course_update",
+    job = await mcp.tool("job_create", kind="course_update", user_id="demo-user",
                          payload={"course": "자료구조", "sources": lectures, "llm": llm})
     log("request", f"과목 노트 업데이트 요청 → 의도 기록 job={job['job_id']}  sources={lectures}")
     return job["job_id"]

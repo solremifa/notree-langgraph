@@ -6,10 +6,14 @@ LangGraph·A안·인계 흐름을 확인하려고 만든 1차 PoC이고, **실�
 ```
 notree/
 ├─ common/
-│   ├─ settings.py        Redis·MCP 주소, rt/batch별 시간 값(StreamConfig) — 전부 환경변수로 덮어쓰기 가능
+│   ├─ settings.py        Redis·MCP 주소, rt/batch별 시간 값(StreamConfig), 종류별 시도 한도, 주기 작업 값
 │   └─ log.py             역할 이름이 붙는 한 줄 로그
+├─ contracts/             MCP 도구 계약 (팀 결정 8번) — MCP 서버와 worker가 같이 import
+│   ├─ envelope.py        공통 응답 형식 {ok, data} / {ok:false, code, message, retryable}, 오류 코드
+│   └─ tools.py           도구별 입력·출력 Pydantic 모델, 담당, 모델 노출 여부 (→ docs/tool-contracts.md 자동 생성)
 ├─ scheduler/
-│   └─ allocator.py       의도 → 실행 허가 → XADD (작업 종류별 Stream)
+│   ├─ allocator.py       의도 → 실행 허가 → XADD (작업 종류별 Stream). 실행하면 periodic도 같이 돎
+│   └─ periodic.py        누락 복구(멈춘 reserved/sent 다시 보내기), 체크포인트 정리
 ├─ worker/
 │   ├─ main.py            진입점: python -m notree.worker --stream rt|batch --name A
 │   ├─ loop.py            Worker: 메시지 받기·동시 실행·결과별 처리·ACK·종료 처리
@@ -25,8 +29,10 @@ notree/
 │       ├─ grading.py         rt  — 스텁
 │       └─ final_note.py      batch — 스텁
 └─ dev/
-    ├─ enqueue.py         작업 하나 넣기 (api 흉내)
-    └─ demo.py            rt·batch worker + 배정기 + 여러 시나리오를 한 번에
+    ├─ enqueue.py         작업 하나 넣기 (api 흉내). --user, --deadline-in
+    ├─ jobs.py            작업 조회 / 되살리기 (get, retry)
+    ├─ gen_tool_docs.py   계약 → docs/tool-contracts.md
+    └─ demo.py            rt·batch worker + scheduler + 여러 시나리오를 한 번에
 ```
 
 ## 작업 하나가 코드를 지나가는 길
@@ -36,17 +42,22 @@ allocator.run_allocator     job_reserve_pending → XADD {job_id} → job_mark_s
         ▼
 Worker.run                  빈 슬롯이 있을 때만 _next()
 Worker._next                XAUTOCLAIM(방치된 것 먼저) → 없으면 XREADGROUP
-Worker.process              job_start ─ done/failed/unknown → XACK
+Worker.process              job_start → data.status
+                                      ├ done/failed/unknown → XACK
                                       ├ leased → 손대지 않음
-                                      └ ok → JobContext 만들고
+                                      └ started → JobContext 만들고 (permit, 시도 한도, 마감 시각)
                             async with Lease(ctx):                     ← heartbeat 시작
-                                await wait_for(handler(ctx), job_timeout)
+                                await wait_for(handler(ctx), min(job_timeout, 마감까지 남은 시간))
                             ├ 성공            job_finish → XACK
-                            ├ FatalError      job_fail   → XACK
+                            ├ FatalError      job_fail(다시 시도 불가) → XACK
+                            ├ 마감 지남·초과   job_fail(다시 시도 가능) → XACK   ※ 재시도 안 함
                             ├ 그 밖의 예외     시도 < 한도: job_release (ACK 없음 → claim_idle 뒤 재배송)
-                            │                  시도 = 한도: job_fail → XACK
+                            │                  시도 = 한도: job_fail(다시 시도 가능) → XACK
                             ├ LeaseLost       아무것도 안 함 (다른 worker 것)
                             └ 종료로 취소      job_release (ACK 없음 → 곧 다른 worker가 잡음)
+
+periodic.run_periodic       10초마다 job_resend_stale → 다시 XADD,  1시간마다 checkpoint_cleanup
+job_retry (api)             failed(다시 시도 가능) → pending → 배정기가 다시 보냄 → 체크포인트에서 이어감
 ```
 
 ## 핸들러 규약
@@ -56,9 +67,11 @@ from notree.worker.registry import FatalError, JobContext, RetryableError, handl
 
 @handler("live_summary")
 async def live_summary(ctx: JobContext) -> None:
-    seg = await ctx.tool("transcript.range", lecture_id=ctx.payload["lecture_id"])   # permit 자동 첨부
-    text = await summarize(ctx.extras["openai"], seg)                                 # 비동기
-    await ctx.tool("summary.publish", idem_key=ctx.job_id, generation=seg["generation"], text=text)
+    seg = await ctx.tool("transcript_range", lecture_id=ctx.payload["lecture_id"], after_seq=...)  # permit 자동, data만 옴
+    text = await summarize(ctx.extras["openai"], seg)                                              # 비동기
+    await ctx.tool("summary_publish", idem_key=ctx.job_id, lecture_id=..., upto_seq=seg["last_seq"],
+                   expected_generation=seg["generation"], text=text)
+    # 서버가 generation_mismatch로 거절하면 ctx.tool()이 ToolRejected(FatalError)를 던진다 → 루프가 실패 확정
 ```
 
 | 규칙 | 이유 |
@@ -67,23 +80,27 @@ async def live_summary(ctx: JobContext) -> None:
 | 결과는 MCP 발행 도구로만, 멱등키 = `ctx.job_id` | 재배송·재시도로 두 번 실행돼도 결과가 하나 |
 | LLM·네트워크 호출은 비동기 | 동기로 오래 막으면 heartbeat가 멈춰 작업을 빼앗긴다 |
 | 일시적 실패는 `RetryableError`, 영구 실패는 `FatalError` | 루프가 재시도할지 실패 확정할지 정한다 |
+| MCP 도구 거절은 직접 판단하지 않음 | `ctx.tool()`이 서버의 `retryable` 값으로 `ToolUnavailable`/`ToolRejected` 변환 |
+| 마감이 있으면 `ctx.time_left()` 참고 | 루프가 마감에 맞춰 끊지만, 남은 시간으로 일을 줄일 수 있다 (Q&A 도구 호출 횟수 등) |
 | ACK·lease·완료 표시는 신경 쓰지 않음 | 루프가 한다 |
 
-`JobContext`에 있는 것: `job_id`, `kind`, `payload`, `attempt`(1부터), `permit`, `worker`, `cfg`(시간 값), `mcp`, `extras`(공용 자원).
+`JobContext`에 있는 것: `job_id`, `kind`, `payload`, `attempt`(1부터), `max_attempts`, `deadline_at`, `permit`, `worker`, `cfg`(시간 값), `mcp`, `extras`(공용 자원).
 
 ## 새 핸들러 추가하기
 
 1. `notree/worker/handlers/<이름>.py`를 만들고 `@handler("<kind>")` 함수를 쓴다
 2. `notree/worker/handlers/__init__.py`의 import 목록에 추가
 3. `mcp_server.py`의 `STREAM_OF`에 작업 종류 → Stream(rt/batch) 추가 (실제로는 api가 의도를 쓸 때 정함)
-4. 쓰는 MCP 도구가 없으면 서버에 추가. **worker용 도구는 모두 `permit` 인자를 받는다**
-5. 테스트: `tests/test_skeleton.py`처럼 fakeredis + MCP로 성공·실패 한 번씩
+4. 재시도 한도가 기본값과 다르면 `settings.KIND_MAX_ATTEMPTS`에 추가
+5. 쓰는 MCP 도구가 없으면 **먼저 `notree/contracts/tools.py`에 계약 추가** → `gen_tool_docs`로 문서 재생성 → 서버에 `@tool`로 구현.
+   worker용 도구는 모두 `permit` 인자를 받는다 (테스트가 확인)
+6. 테스트: `tests/test_skeleton.py`의 `Env`로 fakeredis + MCP 환경에서 성공·실패 한 번씩
 
 ## 돌려 보기
 
 ```powershell
-uv run python -m notree.dev.demo                 # 한 번에: 성공·Fatal·재시도·한도 초과·미구현·LangGraph 이어하기·종료 처리
-uv run pytest -q tests/test_skeleton.py          # 결과별 처리, lease 상실, 종료 대기/반납, 동시 실행, permit 위조
+uv run python -m notree.dev.demo                 # 성공·Fatal·재시도·한도 초과·마감 초과·미구현·LangGraph 이어하기·누락 복구·되살리기·종료 처리
+uv run pytest -q tests/test_skeleton.py tests/test_decisions.py
 
 # 진짜 Redis + 프로세스 분리 (docker compose up -d 후, 터미널 여러 개)
 uv run mcp_server.py --http
@@ -91,7 +108,10 @@ uv run python -m notree.scheduler.allocator
 uv run python -m notree.worker --stream rt --name A
 uv run python -m notree.worker --stream batch --name A
 uv run python -m notree.dev.enqueue echo text=hi sleep=3 --stream rt
-uv run python -m notree.dev.enqueue course_update sources=hello,big,world
+uv run python -m notree.dev.enqueue echo sleep=5 --stream rt --deadline-in 2      # 마감 초과 → 실패(다시 시도 가능)
+uv run python -m notree.dev.enqueue course_update sources=hello,big,world --user u-42
+uv run python -m notree.dev.jobs get <job_id>
+uv run python -m notree.dev.jobs retry <job_id> --deadline-in 90
 ```
 
 worker 창에서 Ctrl+C 한 번이면 진행 중인 작업을 끝내고 종료, 두 번이면 즉시 종료합니다.
@@ -103,7 +123,7 @@ worker 창에서 Ctrl+C 한 번이면 진행 중인 작업을 끝내고 종료, 
 | `mcp_server.py` (SQLite, 도구 몇 개) | FastAPI 코드베이스의 mcp 프로세스. SQLAlchemy + PG + RLS. permit의 사용자 ID로 `SET LOCAL` |
 | `allocator`가 MCP 도구로 의도를 읽음 | scheduler가 PG에 직접 (SKIP LOCKED, 동시 상한·예산) |
 | `course_update`가 루트의 `graph.py`를 import | 그래프를 `notree/worker/graphs/course_update.py` 같은 곳으로 이동 |
-| permit = HMAC 문자열, 사용자 정보 없음 | 형식·비밀키·담긴 정보 결정 필요 (team-decisions.md 4절) |
-| 시간 값 = 제안값 | 팀 결정 후 settings 기본값 수정 |
+| `note_publish`가 permit의 사용자 ID로 저장 (RLS 흉내) | MCP 서버가 permit의 사용자 ID로 `SET LOCAL app.user_id` → 진짜 RLS |
+| `contracts/tools.py`의 계획된 도구 12개 = 초안 | 담당자 PR로 필드 확정 후 서버 구현 |
 
 `worker/` 아래(`loop.py`, `lease.py`, `registry.py`, `mcp_client.py`, `checkpointer.py`)는 거의 그대로 옮길 수 있게 만들었습니다.

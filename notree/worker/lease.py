@@ -9,6 +9,7 @@
 import asyncio
 
 from notree.common.log import log
+from notree.contracts.envelope import ErrorCode, ToolError
 from notree.worker.registry import JobContext
 
 
@@ -33,13 +34,20 @@ class Lease:
         while True:
             await asyncio.sleep(c.cfg.heartbeat_sec)
             try:
-                res = await c.tool("job_heartbeat", job_id=c.job_id, worker=c.worker, lease_sec=c.cfg.lease_sec)
-            except Exception as e:  # MCP 일시 장애: 이번 박동만 건너뜀. lease가 만료되기 전 다음 박동에 기대
+                res = await c.mcp.tool("job_heartbeat", permit=c.permit, job_id=c.job_id, worker=c.worker,
+                                       lease_sec=c.cfg.lease_sec)
+                renewed, why = res["renewed"], "다른 worker에게 넘어감"
+            except ToolError as e:
+                if e.code != ErrorCode.PERMIT_INVALID:          # 일시 장애: 이번 박동만 건너뜀
+                    log("lease", f"heartbeat 실패({e.code}) → 다음 주기에 재시도")
+                    continue
+                renewed, why = False, e.message
+            except Exception as e:                              # 연결 문제 등도 이번 박동만 건너뜀
                 log("lease", f"heartbeat 실패({type(e).__name__}) → 다음 주기에 재시도")
                 continue
-            if not res.get("ok"):
+            if not renewed:
                 self.lost = True
-                log("lease", f"lease를 잃음({res.get('reason', '다른 worker에게 넘어감')}) → 작업 취소")
+                log("lease", f"lease를 잃음({why}) → 작업 취소")
                 self._owner.cancel()
                 return
 

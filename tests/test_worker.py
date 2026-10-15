@@ -50,18 +50,18 @@ async def scenario(tmp_path, die_at=None, slow_a=False, monkeypatch=None):
         ok = await until(lambda: _done(m_api, job_id))
         stop.set()
         res = await asyncio.gather(sched, wa, wb, return_exceptions=True)
-        job = await m_api.call("job_get", job_id=job_id)
-        note = await m_api.call("note_get", idem_key=job_id)
+        job = await m_api.tool("job_get", job_id=job_id)
+        note = await m_api.tool("note_get", idem_key=job_id)
         pending = (await r.xpending(S.BATCH_STREAM, S.GROUP))["pending"]
         return ok, job, note, pending, res
 
 
 async def _started(m, job_id):
-    return (await m.call("job_get", job_id=job_id)).get("state") in ("running", "done")
+    return (await m.tool("job_get", job_id=job_id)).get("state") in ("running", "done")
 
 
 async def _done(m, job_id):
-    return (await m.call("job_get", job_id=job_id)).get("state") == "done"
+    return (await m.tool("job_get", job_id=job_id)).get("state") == "done"
 
 
 def test_dead_worker_job_is_taken_over_and_resumed(tmp_path):

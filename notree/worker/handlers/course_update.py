@@ -11,14 +11,15 @@ from notree.worker.registry import JobContext, RetryableError, handler
 
 @handler("course_update")
 async def course_update(ctx: JobContext) -> None:
-    app = build_graph(McpCheckpointSaver(ctx.mcp))
+    app = build_graph(McpCheckpointSaver(ctx.mcp, permit=ctx.permit))
     config = {"configurable": {
-        "thread_id": ctx.job_id, "llm": ctx.payload.get("llm", "fake"), "notes": McpNoteStore(ctx.mcp),
-        # 시험용: 첫 시도에서만 지정 지점에서 실패 → 재시도 때 체크포인트에서 이어가는지 확인
-        "crash_at": ctx.payload.get("crash_at") if ctx.attempt == 1 else None,
+        "thread_id": ctx.job_id, "llm": ctx.payload.get("llm", "fake"),
+        "notes": McpNoteStore(ctx.mcp, permit=ctx.permit),
     }}
     snap = await app.aget_state(config)
     if not snap.values:
+        # 시험용: 처음 실행할 때만 지정 지점에서 실패 → 재시도·되살리기 때 체크포인트에서 이어가는지 확인
+        config["configurable"]["crash_at"] = ctx.payload.get("crash_at")
         inp = {"course": ctx.payload.get("course", ""), "sources": ctx.payload["sources"]}
     elif snap.next:
         done = [e["lecture"] for e in snap.values.get("extracts", [])]

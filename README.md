@@ -48,7 +48,9 @@ run.py (worker)                                 mcp_server.py (내부 MCP 서버
 핸들러 규약, 동시 실행, 재시도 한도, lease 상실 시 취소, 종료 신호 처리, permit 토큰까지 들어 있습니다.
 
 - 구조와 코드 흐름: **[docs/worker-structure.md](docs/worker-structure.md)**
-- 팀이 정해야 할 것: **[docs/team-decisions.md](docs/team-decisions.md)**
+- 팀 결정 사항 (2026-10-15 확정): **[docs/team-decisions.md](docs/team-decisions.md)**
+- MCP 도구 계약 (자동 생성): **[docs/tool-contracts.md](docs/tool-contracts.md)**
+- 변경 정리: **[docs/changes/](docs/changes/)**
 
 ```powershell
 uv run python -m notree.dev.demo                       # 성공·실패·재시도·한도 초과·미구현·LangGraph 이어하기·종료 처리
@@ -98,7 +100,7 @@ uv run run.py --thread op2 --resume             # "중복 발행 막음"
 uv run run.py --thread op1 --history            # 체크포인트 이력 (MCP checkpoint_list)
 uv run run.py --saver sqlite                    # 비교: worker가 DB 파일에 직접
 uv run run.py --graph                           # Mermaid 그래프 → out/graph.mmd (mermaid.live 에 붙여 넣기)
-uv run pytest -q                                # 18개: 그래프 9 + worker 인계 3 + notree 뼈대 6
+uv run pytest -q                                # 31개: 그래프 9 + worker 인계 3 + notree 뼈대 6 + 팀 결정 13
 ```
 
 출력의 `💾 checkpoint step=N 다음=[...]`이 단계(super-step)마다 상태를 저장하는 지점이고,

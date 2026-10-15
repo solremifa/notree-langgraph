@@ -57,7 +57,7 @@ HANDLERS = {"course_update": course_update}
 async def heartbeat(mcp: McpClient, job_id: str, name: str) -> None:
     while True:
         await asyncio.sleep(S.HEARTBEAT_SEC)
-        if not (await mcp.call("job_heartbeat", job_id=job_id, worker=name, lease_sec=S.LEASE_SEC))["ok"]:
+        if not (await mcp.tool("job_heartbeat", job_id=job_id, worker=name, lease_sec=S.LEASE_SEC))["renewed"]:
             log("lease", "lease를 잃음 (다른 worker에게 넘어감)")
             return
 
@@ -67,13 +67,13 @@ async def handle(r, mcp: McpClient, name: str, stream: str, msg_id: str, fields:
     """처리 후 계속 살아 있으면 True, 죽었으면 False."""
     job_id = fields["job_id"]
     log("redis", f"{how} 메시지 {msg_id} → job {job_id}")
-    st = await mcp.call("job_start", job_id=job_id, worker=name, lease_sec=S.LEASE_SEC)
-    if not st["ok"]:
-        if st["reason"] in ("done", "unknown"):
+    st = await mcp.tool("job_start", job_id=job_id, worker=name, lease_sec=S.LEASE_SEC)
+    if st["status"] != "started":
+        if st["status"] in ("done", "failed", "unknown"):
             await r.xack(stream, S.GROUP, msg_id)
-            log("permit", f"이미 끝난 작업({st['reason']}) → ACK만 하고 넘어감")
+            log("permit", f"이미 끝난 작업({st['status']}) → ACK만 하고 넘어감")
         else:
-            log("permit", f"{st['owner']}의 lease가 {st['left']}초 남음 → 건드리지 않음")
+            log("permit", f"{st['owner']}의 lease가 {st['lease_left_sec']}초 남음 → 건드리지 않음")
         return True
 
     prev = f", 이전 담당={st['previous_owner']}" if st.get("previous_owner") not in (None, name) else ""
@@ -90,7 +90,7 @@ async def handle(r, mcp: McpClient, name: str, stream: str, msg_id: str, fields:
         log("error", f"{type(e).__name__}: {e} → ACK 안 함, 재배송 대기")
         return True
     hb.cancel()
-    await mcp.call("job_finish", job_id=job_id, worker=name)
+    await mcp.tool("job_finish", job_id=job_id, worker=name)
     await r.xack(stream, S.GROUP, msg_id)
     log("redis", f"job_finish → XACK {msg_id}")
     return True

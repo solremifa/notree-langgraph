@@ -13,11 +13,13 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from notree.contracts.envelope import ToolError, unwrap  # noqa: F401  (ToolError 재노출)
+
 SERVER = Path(__file__).resolve().parents[2] / "mcp_server.py"
 
 
 class McpToolError(RuntimeError):
-    """MCP 도구가 오류를 돌려줌 (인자 오류, 서버 예외 등)."""
+    """MCP 프로토콜 수준 오류 (도구 이름 없음, 인자 스키마 불일치 등). 도구의 '거절'은 ToolError."""
 
 
 class McpClient:
@@ -44,7 +46,15 @@ class McpClient:
     async def __aexit__(self, *exc) -> None:
         await self._stack.aclose()
 
+    async def tool(self, name: str, **args: Any) -> dict:
+        """공통 응답 형식을 풀어 data만 돌려준다. 거절(ok=false)이면 ToolError (code, retryable 포함).
+        permit이 None이면 보내지 않는다 (작업 밖에서 부르는 PoC 스크립트용)."""
+        if args.get("permit", "") is None:
+            args.pop("permit")
+        return unwrap(name, await self.call(name, **args))
+
     async def call(self, tool: str, **args: Any) -> dict:
+        """날것 그대로의 응답 (envelope 포함)."""
         self.calls.append(tool)
         res = await self.session.call_tool(tool, args)
         if res.isError:

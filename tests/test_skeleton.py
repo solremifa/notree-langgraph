@@ -22,7 +22,8 @@ RT = dataclasses.replace(S.RT, lease_sec=1.0, heartbeat_sec=0.3, claim_idle_ms=1
 
 
 class Env:
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, allocator: bool = True):
+        self.with_allocator = allocator
         self.db = tmp_path / "skel.db"
         self.env = {**os.environ, "NOTREE_DB": str(self.db), "NOTREE_REQUIRE_PERMIT": "1"}
         self.r = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)  # 테스트마다 새 Redis
@@ -33,7 +34,8 @@ class Env:
         self.api = await self.stack.enter_async_context(McpClient(env=self.env))
         self.m_s = await self.stack.enter_async_context(McpClient(env=self.env))
         self.m_w = await self.stack.enter_async_context(McpClient(env=self.env))
-        self.tasks = [asyncio.create_task(run_allocator(self.r, self.m_s, self.stop, interval=0.1))]
+        self.tasks = ([asyncio.create_task(run_allocator(self.r, self.m_s, self.stop, interval=0.1))]
+                      if self.with_allocator else [])
         return self
 
     def start_worker(self, cfg=RT, **kw):
@@ -42,10 +44,11 @@ class Env:
         return w
 
     async def job(self, payload, kind="echo"):
-        return (await self.api.call("job_create", kind=kind, payload=payload, stream=RT.stream))["job_id"]
+        return (await self.api.tool("job_create", kind=kind, payload=payload, user_id="u-test",
+                                    stream=RT.stream))["job_id"]
 
     async def row(self, job_id):
-        return await self.api.call("job_get", job_id=job_id)
+        return await self.api.tool("job_get", job_id=job_id)
 
     async def wait_state(self, job_id, states=("done", "failed"), timeout=15):
         end = time.time() + timeout
@@ -153,11 +156,14 @@ def test_forged_permit_is_rejected(tmp_path):
     async def t():
         async with Env(tmp_path) as e:
             j = await e.job({})
-            await e.api.call("job_reserve_pending")
-            st = await e.api.call("job_start", job_id=j, worker="w", lease_sec=5)
-            assert st["ok"]
+            await e.api.tool("job_reserve_pending")
+            st = await e.api.tool("job_start", job_id=j, worker="w", lease_sec=5)
+            assert st["status"] == "started"
             bad = st["permit"][:-4] + "0000"
-            assert (await e.api.call("job_finish", job_id=j, worker="w", permit=bad))["ok"] is False
-            assert (await e.api.call("job_finish", job_id=j, worker="w"))["reason"] == "permit 필요"
-            assert (await e.api.call("job_finish", job_id=j, worker="w", permit=st["permit"]))["ok"] is True
+            forged = await e.api.call("job_finish", job_id=j, worker="w", permit=bad)
+            assert forged == {"ok": False, "code": "permit_invalid", "message": "permit 서명 불일치",
+                              "retryable": False}
+            missing = await e.api.call("job_finish", job_id=j, worker="w")
+            assert missing["code"] == "permit_invalid" and missing["message"] == "permit 필요"
+            assert (await e.api.tool("job_finish", job_id=j, worker="w", permit=st["permit"]))["finished"] is True
     run(t())

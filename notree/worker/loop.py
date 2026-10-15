@@ -3,13 +3,14 @@
     Worker(name, cfg, redis, mcp).run(stop_event)
 
 한 메시지의 처리 (process)
-  job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)
+  job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
              ├─ leased                  → 손대지 않음 (다른 worker가 살아서 하는 중)
-             └─ ok → Lease 안에서 핸들러 실행 (job_timeout 제한)
+             └─ started → Lease 안에서 핸들러 실행 (job_timeout과 마감 시각 중 짧은 쪽으로 제한)
                       ├─ 성공            → job_finish → XACK
-                      ├─ FatalError      → job_fail   → XACK
+                      ├─ FatalError      → job_fail(다시 시도 불가) → XACK
+                      ├─ 마감 시각 지남   → job_fail(다시 시도 가능) → XACK
                       ├─ 그 밖의 실패     → 시도 < 한도: job_release (ACK 안 함 → claim_idle 뒤 재배송)
-                      │                    시도 = 한도: job_fail → XACK
+                      │                    시도 = 한도: job_fail(다시 시도 가능) → XACK
                       ├─ LeaseLost       → 아무것도 안 함 (이미 다른 worker 것)
                       └─ 종료 신호로 취소 → job_release (ACK 안 함 → 다른 worker가 곧 이어받음)
 """
@@ -23,6 +24,10 @@ from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
 from notree.worker.registry import FatalError, JobContext, load_handlers
+
+
+class DeadlinePassed(Exception):
+    """payload의 deadline_at이 이미 지남 → 실행하지 않고 실패 확정 (사용자는 다시 시도 가능)."""
 
 
 class Worker:
@@ -111,55 +116,71 @@ class Worker:
 
     async def process(self, msg_id: str, job_id: str, how: str) -> None:
         ACTOR.set(self.name)
-        st = await self.mcp.call("job_start", job_id=job_id, worker=self.name, lease_sec=self.cfg.lease_sec)
-        if not st["ok"]:
-            if st["reason"] in ("done", "failed", "unknown"):
-                await self._ack(msg_id)
-                log("skip", f"{job_id}: 이미 {st['reason']} → ACK만")
-            else:
-                log("skip", f"{job_id}: {st['owner']}가 lease 보유({st['left']}초 남음) → 손대지 않음")
+        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=self.cfg.lease_sec)
+        if st["status"] in ("done", "failed", "unknown"):
+            await self._ack(msg_id)
+            log("skip", f"{job_id}: 이미 {st['status']} → ACK만")
+            return
+        if st["status"] == "leased":
+            log("skip", f"{job_id}: {st['owner']}가 lease 보유({st['lease_left_sec']}초 남음) → 손대지 않음")
             return
 
-        ctx = JobContext(job_id=job_id, kind=st["kind"], payload=st["payload"], attempt=st["attempt"],
-                         permit=st["permit"], worker=self.name, cfg=self.cfg, mcp=self.mcp, extras=self.extras)
-        fn = self.handlers.get(ctx.kind)
-        log("job", f"{how} {job_id} [{ctx.kind}] 시도 {ctx.attempt}/{self.cfg.max_attempts}")
+        kind = st["kind"]
+        ctx = JobContext(job_id=job_id, kind=kind, payload=st["payload"], attempt=st["attempt"],
+                         permit=st["permit"], worker=self.name, cfg=self.cfg, mcp=self.mcp,
+                         max_attempts=S.max_attempts_for(kind, self.cfg),
+                         deadline_at=st["payload"].get("deadline_at"), extras=self.extras)
+        fn = self.handlers.get(kind)
+        left = ctx.time_left()
+        log("job", f"{how} {job_id} [{kind}] 시도 {ctx.attempt}/{ctx.max_attempts}"
+                   + (f" · 마감까지 {left:.0f}초" if left is not None else ""))
         try:
             if fn is None:
-                raise FatalError(f"핸들러 없음: {ctx.kind}")
+                raise FatalError(f"핸들러 없음: {kind}")
+            timeout = self.cfg.job_timeout_sec
+            if left is not None:
+                if left <= 0:
+                    raise DeadlinePassed()
+                timeout = min(timeout, left)
             async with Lease(ctx):
-                await asyncio.wait_for(fn(ctx), timeout=self.cfg.job_timeout_sec)
+                await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")
         except asyncio.CancelledError:
-            await self._safe(ctx.tool("job_release", job_id=job_id, worker=self.name, reason="shutdown"))
+            await self._ctl(ctx, "job_release", reason="shutdown")
             log("job", f"{job_id}: 종료로 중단 → lease 반납")
             raise
+        except DeadlinePassed:
+            await self._fail(ctx, msg_id, "마감 시각 지남", user_retryable=True)
         except FatalError as e:
-            await self._fail(ctx, msg_id, f"fatal: {e}")
+            await self._fail(ctx, msg_id, f"fatal: {e}", user_retryable=False)
         except Exception as e:  # RetryableError, TimeoutError, 예상 못 한 오류
             reason = "timeout" if isinstance(e, TimeoutError) else f"{type(e).__name__}: {e}"
-            if ctx.attempt >= self.cfg.max_attempts:
-                await self._fail(ctx, msg_id, f"시도 한도 초과 ({reason})")
+            left = ctx.time_left()
+            if left is not None and left <= 0:
+                await self._fail(ctx, msg_id, f"마감 시각 초과 ({reason})", user_retryable=True)
+            elif ctx.attempt >= ctx.max_attempts:
+                await self._fail(ctx, msg_id, f"시도 한도 초과 ({reason})", user_retryable=True)
             else:
-                await ctx.tool("job_release", job_id=job_id, worker=self.name, reason=reason)
+                await self._ctl(ctx, "job_release", reason=reason)
                 log("retry", f"{job_id}: {reason} → lease 반납, {self.cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
         else:
-            await ctx.tool("job_finish", job_id=job_id, worker=self.name)
+            await self._ctl(ctx, "job_finish")
             await self._ack(msg_id)
             log("done", f"{job_id} 완료 → XACK")
 
-    async def _fail(self, ctx: JobContext, msg_id: str, reason: str) -> None:
-        await ctx.tool("job_fail", job_id=ctx.job_id, worker=self.name, reason=reason)
+    async def _fail(self, ctx: JobContext, msg_id: str, reason: str, *, user_retryable: bool) -> None:
+        await self._ctl(ctx, "job_fail", reason=reason, user_retryable=user_retryable)
         await self._ack(msg_id)
-        log("fail", f"{ctx.job_id}: 실패 확정 ({reason}) → XACK")
+        log("fail", f"{ctx.job_id}: 실패 확정 ({reason}){' · 다시 시도 가능' if user_retryable else ''} → XACK")
+
+    async def _ctl(self, ctx: JobContext, name: str, **args) -> None:
+        """루프 자신의 작업 제어 호출. 거절돼도 루프는 멈추지 않는다 (재배송·누락 복구가 뒤를 받친다)."""
+        try:
+            await self.mcp.tool(name, permit=ctx.permit, job_id=ctx.job_id, worker=self.name, **args)
+        except Exception as e:
+            log("error", f"{ctx.job_id}: {name} 실패({type(e).__name__}: {e})")
 
     async def _ack(self, msg_id: str) -> None:
         await self.r.xack(self.cfg.stream, S.GROUP, msg_id)
 
-    @staticmethod
-    async def _safe(coro) -> None:
-        try:
-            await coro
-        except Exception:
-            pass

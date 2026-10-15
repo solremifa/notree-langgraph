@@ -95,8 +95,8 @@ def test_publish_crash_does_not_double_publish(tmp_path, kind):
                 await go(app, {"sources": ["hello", "world"]}, cfg(tmp_path, "t5", notes, crash_at="publish"))
             await go(app, None, cfg(tmp_path, "t5", notes))
             if client:
-                assert (await client.call("tool_stats", thread_id="t5"))["note_publish"] == 2
-                assert (await client.call("note_get", idem_key="t5"))["note"] == "HELLO WORLD!"
+                assert (await client.tool("tool_stats", thread_id="t5"))["counts"]["note_publish"] == 2
+                assert (await client.tool("note_get", idem_key="t5"))["note"] == "HELLO WORLD!"
     asyncio.run(t())
 
 

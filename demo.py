@@ -95,7 +95,7 @@ async def main() -> None:
             ACTOR.set("")
 
             async def job_state():
-                return (await m_obs.call("job_get", job_id=job_id))["state"]
+                return (await m_obs.tool("job_get", job_id=job_id))["state"]
 
             await wait_until(lambda: _done_or(wa, job_state), 30)
             if wa.done() and wa.result() == "died":
@@ -110,10 +110,10 @@ async def main() -> None:
             await asyncio.gather(sched, wa, *( [wb] if wb else [] ), return_exceptions=True)
 
             banner("4. 결과")
-            job = await m_obs.call("job_get", job_id=job_id)
-            note = await m_obs.call("note_get", idem_key=job_id)
+            job = await m_obs.tool("job_get", job_id=job_id)
+            note = await m_obs.tool("note_get", idem_key=job_id)
             pending = await r.xpending(S.BATCH_STREAM, S.GROUP)
-            stats = await m_obs.call("tool_stats", thread_id=job_id)
+            stats = (await m_obs.tool("tool_stats", thread_id=job_id))["counts"]
             print(f"  job      : state={job['state']}  시도={job['attempts']}회  마지막 담당={job['lease_owner']}")
             print(f"  노트     : {note.get('note')!r} [{note.get('status')}]")
             print(f"  Redis    : ACK 안 된 메시지 {pending['pending']}개")

@@ -1,6 +1,6 @@
 """배정기(allocator): 대기 중인 의도 → 실행 허가 → Redis Stream에 job_id만 XADD → 전송 완료.
 
-    uv run python -m notree.scheduler.allocator
+    uv run python -m notree.scheduler.allocator      (주기 작업 periodic.py도 같이 돈다)
 
 실제 설계에서는 PG에 직접 붙어 SKIP LOCKED로 의도를 고르고, 사용자·과목 동시 상한과 예산을 확인한다.
 이 PoC는 같은 일을 MCP 서버의 job_reserve_pending / job_mark_sent 도구로 흉내 낸다.
@@ -20,13 +20,12 @@ async def run_allocator(r, mcp: McpClient, stop: asyncio.Event | None = None, in
     stop = stop or asyncio.Event()
     while not stop.is_set():
         try:
-            for j in (await mcp.call("job_reserve_pending", limit=10))["jobs"]:
+            for j in (await mcp.tool("job_reserve_pending", limit=10))["jobs"]:
                 msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
-                await mcp.call("job_mark_sent", job_id=j["job_id"])
+                await mcp.tool("job_mark_sent", job_id=j["job_id"])
                 log("allocator", f"{j['job_id']} [{j['kind']}] 허가 → XADD {j['stream']} {msg_id}")
         except Exception as e:  # 한 번 실패해도 배정기는 죽지 않는다.
-            # 주의: 허가(reserved) 뒤 XADD 전에 실패하면 그 의도는 reserved에 머문다 → 실제 구현에선
-            #       'reserved인데 오래된 의도 다시 보내기' 주기 작업이 필요 (team-decisions.md)
+            # 허가(reserved) 뒤 XADD 전에 실패하면 그 의도는 reserved에 머문다 → periodic.resend_stale이 다시 보냄
             log("error", f"배정 실패({type(e).__name__}: {e}) → 다음 주기에 재시도")
         try:
             await asyncio.wait_for(stop.wait(), interval)
@@ -35,9 +34,11 @@ async def run_allocator(r, mcp: McpClient, stop: asyncio.Event | None = None, in
 
 
 async def main() -> None:
+    """scheduler 프로세스: 배정기 + 주기 작업(누락 복구·체크포인트 정리)."""
+    from notree.scheduler.periodic import run_periodic
     r = aioredis.from_url(S.REDIS_URL, decode_responses=True)
     async with McpClient(url=S.MCP_URL) as mcp:
-        await run_allocator(r, mcp)
+        await asyncio.gather(run_allocator(r, mcp), run_periodic(r, mcp))
 
 
 if __name__ == "__main__":

@@ -1,16 +1,26 @@
-"""내부 MCP 서버 (A안).
+"""내부 MCP 서버.
 
-이 프로세스만 DB(out/notree.db)를 연다. worker(그래프)는 아래 도구를 MCP로 호출할 뿐이다.
-실제 설계의 checkpoint.put/get, note.publish에 해당한다. (MCP 도구 이름은 점 대신 밑줄)
+이 프로세스만 DB(out/notree.db)를 연다. worker는 아래 도구를 MCP로 호출할 뿐이다 (A안).
+도구 이름·입출력·응답 형식은 notree/contracts/ 가 기준이다 (팀 결정 8번).
 
-체크포인트 내용은 LangGraph가 직렬화한 바이트를 base64로 받아 그대로 저장한다.
-서버는 LangGraph를 몰라도 된다(불투명 blob 저장소).
+  - 응답: {"ok": true, "data": ...} / {"ok": true, "data": ..., "duplicate": true} / {"ok": false, "code", "message", "retryable"}
+  - worker용 도구는 permit을 받는다. 서버는 permit에서 job_id·worker·사용자 ID를 꺼낸다.
+    사용자 ID는 인자로 받지 않는다 (실제 구현에서는 이 값으로 SET LOCAL app.user_id → RLS).
+  - 체크포인트는 LangGraph가 직렬화한 바이트를 base64로 받아 그대로 저장한다 (서버는 LangGraph를 몰라도 됨).
 
 실행
-  stdio : run.py가 하위 프로세스로 자동으로 띄운다
+  stdio : run.py·테스트가 하위 프로세스로 자동으로 띄운다
   HTTP  : uv run mcp_server.py --http   (compose의 내부 mcp 컨테이너 역할, 기본 127.0.0.1:8765/mcp)
   확인  : uv run mcp dev mcp_server.py
+
+환경변수
+  NOTREE_DB                  DB 파일 (기본 out/notree.db)
+  NOTREE_REQUIRE_PERMIT=1    permit 없는 worker 도구 호출 거절 (기본 0: PoC 스크립트 호환)
+  NOTREE_PERMIT_SECRET       permit 서명 키
+  NOTREE_PERMIT_TTL_RT / _BATCH   permit 유효 시간 (기본 300 / 1800초, 팀 결정 4번)
 """
+import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -23,13 +33,23 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # notree 패키지 import (stdio로 띄워질 때)
+from notree.contracts import tools as C  # noqa: E402
+from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
+
 DB = Path(os.getenv("NOTREE_DB", "out/notree.db"))
 DB.parent.mkdir(parents=True, exist_ok=True)
 
 mcp = FastMCP("notree-internal", log_level="WARNING",
               host=os.getenv("NOTREE_MCP_HOST", "127.0.0.1"), port=int(os.getenv("NOTREE_MCP_PORT", "8765")))
 
+# 작업 종류 → Stream. rt = 사용자가 화면 앞에서 기다리는 짧은 작업, batch = 길어도 되는 작업
+STREAM_OF = {
+    "live_summary": "notree:rt", "qa": "notree:rt", "grading": "notree:rt",
+    "final_note": "notree:batch", "course_update": "notree:batch",
+}
 
+# ── DB ───────────────────────────────────────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(
   job_id TEXT PRIMARY KEY, kind TEXT, payload TEXT, stream TEXT,
@@ -48,6 +68,11 @@ CREATE TABLE IF NOT EXISTS notes(
 CREATE TABLE IF NOT EXISTS tool_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT, thread_id TEXT);
 """
+# 나중에 추가된 컬럼 (이전 버전 DB 호환)
+ADDED_COLUMNS = [
+    ("jobs", "user_id TEXT"), ("jobs", "updated_at REAL"), ("jobs", "user_retryable INTEGER"),
+    ("notes", "user_id TEXT"),
+]
 
 
 def _init_db() -> None:
@@ -58,10 +83,11 @@ def _init_db() -> None:
             con = sqlite3.connect(DB, timeout=10)
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(SCHEMA)
-            try:  # 이전 버전에서 만든 DB 호환
-                con.execute("ALTER TABLE jobs ADD COLUMN fail_reason TEXT")
-            except sqlite3.OperationalError:
-                pass
+            for table, col in ADDED_COLUMNS:
+                try:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass
             con.commit()
             con.close()
             return
@@ -80,53 +106,118 @@ def _log(con, tool: str, thread_id: str) -> None:
     con.execute("INSERT INTO tool_log(tool, thread_id) VALUES(?,?)", (tool, thread_id))
 
 
+# ── 오류 처리: 모든 도구를 감싸 공통 응답 형식으로 ──────────────────
+class Reject(Exception):
+    def __init__(self, code: ErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def guarded(fn):
+    """도구 안에서 난 예외를 공통 거절 형식으로 바꾼다. (FastMCP는 functools.wraps로 원래 시그니처를 읽는다)"""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Reject as e:
+            return err(e.code, str(e))
+        except sqlite3.OperationalError as e:
+            return err(ErrorCode.UNAVAILABLE, f"DB: {e}")
+        except (ValueError, KeyError, TypeError) as e:
+            return err(ErrorCode.INVALID_ARGS, f"{type(e).__name__}: {e}")
+    return wrapper
+
+
+def tool(fn):
+    """계약(notree.contracts.tools.TOOLS)에 등록된 이름만 도구로 공개한다."""
+    if fn.__name__ not in C.TOOLS:
+        raise RuntimeError(f"계약에 없는 도구: {fn.__name__}")
+    return mcp.tool(description=C.TOOLS[fn.__name__].summary or None)(guarded(fn))
+
+
+# ── permit (팀 결정 4번) ─────────────────────────────────────────
+# 형식: base64url({"j": job_id, "w": worker, "u": user_id, "e": 만료}) + "." + HMAC-SHA256 앞 32자
+PERMIT_SECRET = os.getenv("NOTREE_PERMIT_SECRET", "dev-only-secret").encode()
+PERMIT_TTL = {"notree:rt": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
+              "notree:batch": float(os.getenv("NOTREE_PERMIT_TTL_BATCH", "1800"))}
+REQUIRE_PERMIT = os.getenv("NOTREE_REQUIRE_PERMIT", "0") == "1"
+
+
+def _sign(body: str) -> str:
+    return hmac.new(PERMIT_SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _issue_permit(job_id: str, worker: str, user_id: str, stream: str) -> str:
+    claims = {"j": job_id, "w": worker, "u": user_id, "e": int(time.time() + PERMIT_TTL.get(stream, 1800))}
+    body = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"{body}.{_sign(body)}"
+
+
+def _claims(permit: str | None, job_id: str) -> dict | None:
+    """permit을 확인하고 claims를 돌려준다. permit이 없으면 None (REQUIRE_PERMIT=1이면 거절)."""
+    if permit is None:
+        if REQUIRE_PERMIT:
+            raise Reject(ErrorCode.PERMIT_INVALID, "permit 필요")
+        return None
+    try:
+        body, sig = permit.rsplit(".", 1)
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except ValueError:
+        raise Reject(ErrorCode.PERMIT_INVALID, "permit 형식 오류") from None
+    if not hmac.compare_digest(sig, _sign(body)):
+        raise Reject(ErrorCode.PERMIT_INVALID, "permit 서명 불일치")
+    if claims.get("j") != job_id:
+        raise Reject(ErrorCode.PERMIT_INVALID, "다른 작업의 permit")
+    if claims.get("e", 0) < time.time():
+        raise Reject(ErrorCode.PERMIT_INVALID, "permit 만료")
+    return claims
+
+
+# ── 체크포인트 (thread_id = job_id) ──────────────────────────────
 def _row_to_ck(con, r) -> dict:
     ws = con.execute(
         "SELECT task_id, channel, v_type, v_b64, task_path, idx FROM writes "
         "WHERE thread_id=? AND ns=? AND checkpoint_id=? ORDER BY task_id, idx",
         (r["thread_id"], r["ns"], r["checkpoint_id"]),
     ).fetchall()
-    return {
-        "thread_id": r["thread_id"], "ns": r["ns"], "checkpoint_id": r["checkpoint_id"],
-        "parent_id": r["parent_id"],
-        "checkpoint": [r["ck_type"], r["ck_b64"]], "metadata": [r["meta_type"], r["meta_b64"]],
-        "writes": [[w["task_id"], w["channel"], [w["v_type"], w["v_b64"]], w["task_path"], w["idx"]] for w in ws],
-    }
+    return C.CheckpointItem(
+        thread_id=r["thread_id"], ns=r["ns"], checkpoint_id=r["checkpoint_id"], parent_id=r["parent_id"],
+        checkpoint=[r["ck_type"], r["ck_b64"]], metadata=[r["meta_type"], r["meta_b64"]],
+        writes=[[w["task_id"], w["channel"], [w["v_type"], w["v_b64"]], w["task_path"], w["idx"]] for w in ws],
+    ).model_dump()
 
 
-# ── 체크포인트 도구 ───────────────────────────────────────────────
-@mcp.tool()
+@tool
 def checkpoint_put(thread_id: str, ns: str, checkpoint_id: str, parent_id: str | None,
-                   checkpoint: list[str], metadata: list[str]) -> dict:
+                   checkpoint: list[str], metadata: list[str], permit: str | None = None) -> dict:
     """단계(super-step)가 끝날 때 상태 전체를 저장한다."""
+    _claims(permit, thread_id)
     with db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO checkpoints VALUES(?,?,?,?,?,?,?,?)",
-            (thread_id, ns, checkpoint_id, parent_id, *checkpoint, *metadata),
-        )
+        con.execute("INSERT OR REPLACE INTO checkpoints VALUES(?,?,?,?,?,?,?,?)",
+                    (thread_id, ns, checkpoint_id, parent_id, *checkpoint, *metadata))
         _log(con, "checkpoint_put", thread_id)
-    return {"ok": True}
+    return ok(C.Empty())
 
 
-@mcp.tool()
-def checkpoint_put_writes(thread_id: str, ns: str, checkpoint_id: str, task_id: str,
-                          task_path: str, writes: list[list]) -> dict:
-    """노드 하나가 끝날 때 그 결과(pending write)를 저장한다. 병렬 노드 중 먼저 끝난 것이 여기서 살아남는다.
-    writes: [[idx, channel, v_type, v_b64], ...]  idx<0(특수 채널)은 덮어쓰고, idx>=0은 이미 있으면 유지."""
+@tool
+def checkpoint_put_writes(thread_id: str, ns: str, checkpoint_id: str, task_id: str, task_path: str,
+                          writes: list[list], permit: str | None = None) -> dict:
+    """노드 하나의 결과(pending write) 저장. idx<0(특수 채널)은 덮어쓰고, idx>=0은 이미 있으면 유지."""
+    _claims(permit, thread_id)
     with db() as con:
         for idx, channel, v_type, v_b64 in writes:
             verb = "INSERT OR REPLACE" if idx < 0 else "INSERT OR IGNORE"
-            con.execute(
-                f"{verb} INTO writes VALUES(?,?,?,?,?,?,?,?,?)",
-                (thread_id, ns, checkpoint_id, task_id, idx, channel, v_type, v_b64, task_path),
-            )
+            con.execute(f"{verb} INTO writes VALUES(?,?,?,?,?,?,?,?,?)",
+                        (thread_id, ns, checkpoint_id, task_id, idx, channel, v_type, v_b64, task_path))
         _log(con, "checkpoint_put_writes", thread_id)
-    return {"ok": True}
+    return ok(C.Empty())
 
 
-@mcp.tool()
-def checkpoint_get(thread_id: str, ns: str = "", checkpoint_id: str | None = None) -> dict:
-    """checkpoint_id가 없으면 최신 체크포인트. 없으면 {"found": false}."""
+@tool
+def checkpoint_get(thread_id: str, ns: str = "", checkpoint_id: str | None = None,
+                   permit: str | None = None) -> dict:
+    """checkpoint_id가 없으면 최신. 없으면 found=false."""
+    _claims(permit, thread_id)
     with db() as con:
         if checkpoint_id:
             r = con.execute("SELECT * FROM checkpoints WHERE thread_id=? AND ns=? AND checkpoint_id=?",
@@ -135,13 +226,14 @@ def checkpoint_get(thread_id: str, ns: str = "", checkpoint_id: str | None = Non
             r = con.execute("SELECT * FROM checkpoints WHERE thread_id=? AND ns=? "
                             "ORDER BY checkpoint_id DESC LIMIT 1", (thread_id, ns)).fetchone()
         _log(con, "checkpoint_get", thread_id)
-        return {"found": True, **_row_to_ck(con, r)} if r else {"found": False}
+        return ok(C.CheckpointGetOut(found=bool(r), item=_row_to_ck(con, r) if r else None))
 
 
-@mcp.tool()
-def checkpoint_list(thread_id: str, ns: str | None = None, before: str | None = None,
-                    limit: int | None = None) -> dict:
+@tool
+def checkpoint_list(thread_id: str, ns: str | None = None, before: str | None = None, limit: int | None = None,
+                    permit: str | None = None) -> dict:
     """최신 → 과거 순서."""
+    _claims(permit, thread_id)
     q, args = "SELECT * FROM checkpoints WHERE thread_id=?", [thread_id]
     if ns is not None:
         q += " AND ns=?"; args.append(ns)
@@ -153,196 +245,228 @@ def checkpoint_list(thread_id: str, ns: str | None = None, before: str | None = 
     with db() as con:
         rows = con.execute(q, args).fetchall()
         _log(con, "checkpoint_list", thread_id)
-        return {"items": [_row_to_ck(con, r) for r in rows]}
+        return ok(C.CheckpointListOut(items=[_row_to_ck(con, r) for r in rows]))
 
 
-@mcp.tool()
-def checkpoint_delete_thread(thread_id: str) -> dict:
-    """끝난 작업의 체크포인트 정리 (실제로는 scheduler 주기 작업)."""
+@tool
+def checkpoint_delete_thread(thread_id: str, permit: str | None = None) -> dict:
+    """thread 하나의 체크포인트를 지운다."""
+    _claims(permit, thread_id)
     with db() as con:
         for t in ("checkpoints", "writes"):
             con.execute(f"DELETE FROM {t} WHERE thread_id=?", (thread_id,))
         _log(con, "checkpoint_delete_thread", thread_id)
-    return {"ok": True}
+    return ok(C.Empty())
 
 
-# ── 작업(job) · 실행 허가(permit) · lease ────────────────────────
-# 실제 설계에서 job_create는 api가, job_reserve_pending/job_mark_sent는 scheduler가 PG에 직접 하는 일이다.
-# 이 PoC는 DB를 MCP 서버 하나에 모아 두었기 때문에 같은 서버의 도구로 흉내 낸다.
-# worker가 쓰는 것은 job_start / job_heartbeat / job_finish 뿐이다.
-STREAM_OF = {  # 작업 종류 → Stream. rt = 사용자가 화면 앞에서 기다리는 짧은 작업, batch = 길어도 되는 작업
-    "live_summary": "notree:rt", "qa": "notree:rt", "grading": "notree:rt",
-    "final_note": "notree:batch", "course_update": "notree:batch",
-}
-
-# ── permit 토큰 ─────────────────────────────────────────────────
-# job_start가 발급하고, worker는 이후 모든 도구 호출에 첨부한다. 서버는 서명·만료·job_id 일치를 확인한다.
-# 형식: "<job_id>.<worker>.<만료 unix초>.<HMAC-SHA256 앞 32자>"   (실제로는 비밀키를 환경변수/시크릿으로)
-PERMIT_SECRET = os.getenv("NOTREE_PERMIT_SECRET", "dev-only-secret").encode()
-PERMIT_TTL = float(os.getenv("NOTREE_PERMIT_TTL", "3600"))
-REQUIRE_PERMIT = os.getenv("NOTREE_REQUIRE_PERMIT", "0") == "1"   # 1이면 permit 없는 worker 도구 호출 거절
-
-
-def _sign(body: str) -> str:
-    return hmac.new(PERMIT_SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]
-
-
-def _issue_permit(job_id: str, worker: str) -> str:
-    body = f"{job_id}.{worker}.{int(time.time() + PERMIT_TTL)}"
-    return f"{body}.{_sign(body)}"
-
-
-def _check_permit(permit: str | None, job_id: str) -> str | None:
-    """문제가 없으면 None, 있으면 거절 사유."""
-    if permit is None:
-        return "permit 필요" if REQUIRE_PERMIT else None
-    try:
-        body, sig = permit.rsplit(".", 1)
-        p_job, _worker, exp = body.rsplit(".", 2)
-    except ValueError:
-        return "permit 형식 오류"
-    if not hmac.compare_digest(sig, _sign(body)):
-        return "permit 서명 불일치"
-    if p_job != job_id:
-        return "다른 작업의 permit"
-    if float(exp) < time.time():
-        return "permit 만료"
-    return None
-
-
-@mcp.tool()
-def job_create(kind: str, payload: dict, stream: str | None = None) -> dict:
-    """[api 역할] 업무 데이터와 같은 트랜잭션에 '의도(intent)'를 남긴다. 큐에는 아직 안 간다."""
-    job_id = f"op-{uuid.uuid4().hex[:8]}"
+@tool
+def checkpoint_cleanup(older_than_sec: float = 7 * 24 * 3600) -> dict:
+    """[scheduler] 완료·실패 후 older_than_sec 넘게 지난 작업의 체크포인트를 지운다 (팀 결정 9번)."""
+    cutoff = time.time() - older_than_sec
     with db() as con:
-        con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created) VALUES(?,?,?,?,?,?)",
+        ids = [r["job_id"] for r in con.execute(
+            "SELECT job_id FROM jobs WHERE state IN ('done','failed') AND updated_at < ?", (cutoff,))]
+        n = 0
+        for j in ids:
+            if con.execute("SELECT 1 FROM checkpoints WHERE thread_id=? LIMIT 1", (j,)).fetchone():
+                n += 1
+            con.execute("DELETE FROM checkpoints WHERE thread_id=?", (j,))
+            con.execute("DELETE FROM writes WHERE thread_id=?", (j,))
+    return ok(C.CheckpointCleanupOut(deleted_threads=n))
+
+
+# ── 작업 · 실행 허가 · lease ─────────────────────────────────────
+# 실제 설계에서 job_create·job_retry는 api가, job_reserve_pending·job_mark_sent·job_resend_stale는 scheduler가
+# PG에 직접 하는 일이다. 이 PoC는 DB를 MCP 서버 하나에 모아 두어 같은 서버의 도구로 흉내 낸다.
+def _set(con, job_id: str, **cols) -> int:
+    cols["updated_at"] = time.time()
+    sets = ", ".join(f"{k}=?" for k in cols)
+    return con.execute(f"UPDATE jobs SET {sets} WHERE job_id=?", (*cols.values(), job_id)).rowcount
+
+
+@tool
+def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None) -> dict:
+    """[api] 업무 데이터와 같은 트랜잭션에 '의도(intent)'를 남긴다. 큐에는 아직 안 간다."""
+    job_id = f"op-{uuid.uuid4().hex[:8]}"
+    now = time.time()
+    with db() as con:
+        con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (job_id, kind, json.dumps(payload, ensure_ascii=False),
-                     stream or STREAM_OF.get(kind, "notree:batch"), "pending", time.time()))
+                     stream or STREAM_OF.get(kind, "notree:batch"), "pending", now, now, user_id))
         _log(con, "job_create", job_id)
-    return {"job_id": job_id}
+    return ok(C.JobCreateOut(job_id=job_id))
 
 
-@mcp.tool()
+@tool
 def job_reserve_pending(limit: int = 10) -> dict:
-    """[scheduler 배정기] 대기 중인 의도를 골라 실행 허가(reserved)를 기록. 동시 상한·예산 검사가 들어갈 자리."""
+    """[scheduler 배정기] 대기 중인 의도 → 실행 허가(reserved). 동시 상한·예산 검사가 들어갈 자리."""
     with db() as con:
         rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' ORDER BY created LIMIT ?",
                            (limit,)).fetchall()
         for r in rows:
-            con.execute("UPDATE jobs SET state='reserved' WHERE job_id=?", (r["job_id"],))
+            _set(con, r["job_id"], state="reserved")
             _log(con, "job_reserve_pending", r["job_id"])
-        return {"jobs": [dict(r) for r in rows]}
+        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in rows]))
 
 
-@mcp.tool()
+@tool
 def job_mark_sent(job_id: str) -> dict:
-    """[scheduler 배정기] Redis에 XADD한 뒤 '전송 완료'로 표시."""
+    """[scheduler 배정기] XADD 후 '전송 완료'로 표시."""
     with db() as con:
-        con.execute("UPDATE jobs SET state='sent' WHERE job_id=? AND state='reserved'", (job_id,))
+        cur = con.execute("UPDATE jobs SET state='sent', updated_at=? WHERE job_id=? AND state='reserved'",
+                          (time.time(), job_id))
         _log(con, "job_mark_sent", job_id)
-    return {"ok": True}
+        return ok(C.JobMarkSentOut(marked=cur.rowcount == 1))
 
 
-@mcp.tool()
+@tool
+def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: float = 120, limit: int = 50) -> dict:
+    """[scheduler] 허가 후 XADD 전에 죽었거나, 메시지가 유실돼 멈춘 의도를 다시 보낼 목록 (팀 결정 6번).
+    돌려준 작업은 updated_at을 갱신해 다음 주기에 또 나오지 않게 한다. 중복 메시지는 job_start가 걸러 낸다."""
+    now = time.time()
+    with db() as con:
+        rows = con.execute(
+            "SELECT job_id, kind, stream FROM jobs WHERE (state='reserved' AND updated_at < ?) "
+            "OR (state='sent' AND updated_at < ?) ORDER BY updated_at LIMIT ?",
+            (now - reserved_older_than_sec, now - sent_older_than_sec, limit)).fetchall()
+        for r in rows:
+            _set(con, r["job_id"], state="sent")
+            _log(con, "job_resend_stale", r["job_id"])
+        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in rows]))
+
+
+@tool
 def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
-    """[worker] 실행 시작. 다른 worker의 lease가 살아 있으면 거절, 이미 끝났거나 실패 확정이면 그 사실을 알려 준다.
-    성공하면 permit 토큰을 발급한다."""
+    """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown."""
     now = time.time()
     with db() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         _log(con, "job_start", job_id)
         if not r:
-            return {"ok": False, "reason": "unknown"}
+            return ok(C.JobStartOut(status="unknown"))
         if r["state"] in ("done", "failed"):
-            return {"ok": False, "reason": r["state"]}
-        if r["state"] == "running" and r["lease_owner"] != worker and r["lease_until"] > now:
-            return {"ok": False, "reason": "leased", "owner": r["lease_owner"],
-                    "left": round(r["lease_until"] - now, 1)}
-        con.execute("UPDATE jobs SET state='running', lease_owner=?, lease_until=?, attempts=attempts+1 "
-                    "WHERE job_id=?", (worker, now + lease_sec, job_id))
-        return {"ok": True, "kind": r["kind"], "payload": json.loads(r["payload"]),
-                "attempt": r["attempts"] + 1, "previous_owner": r["lease_owner"],
-                "permit": _issue_permit(job_id, worker)}
+            return ok(C.JobStartOut(status=r["state"]))
+        if r["state"] == "running" and r["lease_owner"] != worker and (r["lease_until"] or 0) > now:
+            return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
+                                    lease_left_sec=round(r["lease_until"] - now, 1)))
+        _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
+             attempts=r["attempts"] + 1)
+        return ok(C.JobStartOut(
+            status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1,
+            previous_owner=r["lease_owner"],
+            permit=_issue_permit(job_id, worker, r["user_id"] or "anonymous", r["stream"])))
 
 
-@mcp.tool()
+@tool
 def job_heartbeat(job_id: str, worker: str, lease_sec: float, permit: str | None = None) -> dict:
-    """[worker] lease 연장. 다른 worker에게 넘어갔으면 ok=false → 하던 일을 멈춰야 한다."""
-    if err := _check_permit(permit, job_id):
-        return {"ok": False, "reason": err}
+    """[worker] lease 연장. renewed=false면 다른 worker에게 넘어간 것."""
+    _claims(permit, job_id)
     with db() as con:
         cur = con.execute("UPDATE jobs SET lease_until=? WHERE job_id=? AND lease_owner=? AND state='running'",
                           (time.time() + lease_sec, job_id, worker))
-        return {"ok": cur.rowcount == 1}
+        return ok(C.JobHeartbeatOut(renewed=cur.rowcount == 1))
 
 
-@mcp.tool()
+@tool
 def job_finish(job_id: str, worker: str, permit: str | None = None) -> dict:
     """[worker] 완료 표시. 이 뒤에 XACK."""
-    if err := _check_permit(permit, job_id):
-        return {"ok": False, "reason": err}
+    _claims(permit, job_id)
     with db() as con:
-        cur = con.execute("UPDATE jobs SET state='done', lease_until=NULL WHERE job_id=? AND lease_owner=?",
-                          (job_id, worker))
+        cur = con.execute("UPDATE jobs SET state='done', lease_until=NULL, updated_at=? "
+                          "WHERE job_id=? AND lease_owner=?", (time.time(), job_id, worker))
         _log(con, "job_finish", job_id)
-        return {"ok": cur.rowcount == 1}
+        return ok(C.JobFinishOut(finished=cur.rowcount == 1))
 
 
-@mcp.tool()
-def job_fail(job_id: str, worker: str, reason: str, permit: str | None = None) -> dict:
-    """[worker] 다시 해도 안 되는 실패로 확정. 이 뒤에 XACK. (화면에 '실패'를 보여 줄 근거)"""
-    if err := _check_permit(permit, job_id):
-        return {"ok": False, "reason": err}
+@tool
+def job_fail(job_id: str, worker: str, reason: str, user_retryable: bool, permit: str | None = None) -> dict:
+    """[worker] 실패 확정. 이 뒤에 XACK. user_retryable은 화면의 '다시 시도' 버튼 근거 (팀 결정 3·7번)."""
+    _claims(permit, job_id)
     with db() as con:
-        cur = con.execute("UPDATE jobs SET state='failed', lease_until=NULL, fail_reason=? "
-                          "WHERE job_id=? AND lease_owner=?", (reason, job_id, worker))
+        cur = con.execute("UPDATE jobs SET state='failed', lease_until=NULL, fail_reason=?, user_retryable=?, "
+                          "updated_at=? WHERE job_id=? AND lease_owner=?",
+                          (reason, int(user_retryable), time.time(), job_id, worker))
         _log(con, "job_fail", job_id)
-        return {"ok": cur.rowcount == 1}
+        return ok(C.JobFailOut(failed=cur.rowcount == 1))
 
 
-@mcp.tool()
+@tool
 def job_release(job_id: str, worker: str, reason: str, permit: str | None = None) -> dict:
-    """[worker] 일시적 실패. lease를 바로 반납해 재배송 때 누구든 곧바로 다시 잡을 수 있게 한다. ACK는 안 함."""
-    if err := _check_permit(permit, job_id):
-        return {"ok": False, "reason": err}
+    """[worker] 일시적 실패. lease를 바로 반납해 재배송 때 누구든 곧바로 잡을 수 있게 한다. ACK는 안 함."""
+    _claims(permit, job_id)
     with db() as con:
-        cur = con.execute("UPDATE jobs SET state='sent', lease_until=NULL, fail_reason=? "
-                          "WHERE job_id=? AND lease_owner=? AND state='running'", (reason, job_id, worker))
+        cur = con.execute("UPDATE jobs SET state='sent', lease_until=NULL, fail_reason=?, updated_at=? "
+                          "WHERE job_id=? AND lease_owner=? AND state='running'",
+                          (reason, time.time(), job_id, worker))
         _log(con, "job_release", job_id)
-        return {"ok": cur.rowcount == 1}
+        return ok(C.JobReleaseOut(released=cur.rowcount == 1))
 
 
-@mcp.tool()
+@tool
+def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
+    """[api] 사용자의 '다시 시도'. 다시 해도 되는 실패만 pending으로 되살린다. 체크포인트는 그대로라 이어서 실행된다.
+    마감이 있던 작업은 deadline_at으로 새 마감을 준다 (안 주면 지난 마감 그대로라 바로 다시 실패)."""
+    with db() as con:
+        r = con.execute("SELECT state, user_retryable, payload FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if not r:
+            raise Reject(ErrorCode.NOT_FOUND, job_id)
+        if r["state"] != "failed":
+            return ok(C.JobRetryOut(revived=False, reason=f"failed 상태가 아님 ({r['state']})"))
+        if not r["user_retryable"]:
+            return ok(C.JobRetryOut(revived=False, reason="영구 실패라 다시 시도할 수 없음"))
+        payload = json.loads(r["payload"])
+        if deadline_at is not None:
+            payload["deadline_at"] = deadline_at
+        _set(con, job_id, state="pending", attempts=0, lease_owner=None, lease_until=None, fail_reason=None,
+             user_retryable=None, payload=json.dumps(payload, ensure_ascii=False))
+        _log(con, "job_retry", job_id)
+        return ok(C.JobRetryOut(revived=True))
+
+
+@tool
 def job_get(job_id: str) -> dict:
+    """[dev/api] 작업 상태 조회."""
     with db() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-        return {**dict(r), "payload": json.loads(r["payload"])} if r else {}
+        if not r:
+            return ok(C.JobRow(found=False))
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"])
+        d["user_retryable"] = None if d["user_retryable"] is None else bool(d["user_retryable"])
+        return ok(C.JobRow(found=True, **d))
 
 
-# ── 발행 도구 ─────────────────────────────────────────────────────
-@mcp.tool()
-def note_publish(idem_key: str, course: str, note: str, status: str) -> dict:
-    """멱등키로 한 번만 발행. 실제 설계의 발행 게이트(세대·출처 확인)는 여기서 하게 된다."""
+# ── 발행 ─────────────────────────────────────────────────────────
+@tool
+def note_publish(idem_key: str, course: str, note: str, status: str, permit: str | None = None) -> dict:
+    """멱등키로 한 번만 발행. 두 번째부터는 duplicate=true (성공). 사용자 ID는 permit에서 꺼낸다.
+    실제 설계의 발행 게이트(세대·출처 확인)는 여기서 한다."""
+    claims = _claims(permit, idem_key)
+    user = claims["u"] if claims else "anonymous"
     with db() as con:
-        cur = con.execute("INSERT OR IGNORE INTO notes VALUES(?,?,?,?)", (idem_key, course, note, status))
+        cur = con.execute("INSERT OR IGNORE INTO notes(idem_key, course, note, status, user_id) VALUES(?,?,?,?,?)",
+                          (idem_key, course, note, status, user))
         _log(con, "note_publish", idem_key)
-        return {"published": cur.rowcount == 1}
+        return ok(C.NotePublishOut(idem_key=idem_key), duplicate=cur.rowcount == 0)
 
 
-@mcp.tool()
+@tool
 def note_get(idem_key: str) -> dict:
+    """[dev] 발행된 노트 조회."""
     with db() as con:
         r = con.execute("SELECT * FROM notes WHERE idem_key=?", (idem_key,)).fetchone()
-        return dict(r) if r else {}
+        return ok(C.NoteGetOut(found=True, **{k: r[k] for k in ("user_id", "course", "note", "status")})
+                  if r else C.NoteGetOut(found=False))
 
 
-@mcp.tool()
+@tool
 def tool_stats(thread_id: str) -> dict:
-    """이 thread에 대해 각 도구가 몇 번 불렸는지 (실행 흐름 확인용)."""
+    """[dev] 이 thread(=job)에 대해 각 도구가 몇 번 불렸는지."""
     with db() as con:
         rows = con.execute("SELECT tool, COUNT(*) n FROM tool_log WHERE thread_id=? GROUP BY tool",
                            (thread_id,)).fetchall()
-        return {r["tool"]: r["n"] for r in rows}
+        return ok(C.ToolStatsOut(counts={r["tool"]: r["n"] for r in rows}))
 
 
 _init_db()

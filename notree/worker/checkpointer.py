@@ -32,9 +32,13 @@ def _dec(pair: list[str]) -> tuple[str, bytes]:
 class McpCheckpointSaver(BaseCheckpointSaver):
     """BaseCheckpointSaver의 비동기 메서드를 MCP 도구 호출로 구현. 그래프는 ainvoke/astream으로 돌린다."""
 
-    def __init__(self, client: McpClient) -> None:
+    def __init__(self, client: McpClient, permit: str | None = None) -> None:
         super().__init__()
         self.client = client
+        self.permit = permit          # worker 안에서는 ctx.permit. thread_id = job_id라 permit의 job_id와 맞아야 함
+
+    async def _tool(self, name: str, **args):
+        return await self.client.tool(name, permit=self.permit, **args)
 
     # ── 읽기 ──
     def _to_tuple(self, d: dict) -> CheckpointTuple:
@@ -52,16 +56,16 @@ class McpCheckpointSaver(BaseCheckpointSaver):
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         c = config["configurable"]
-        d = await self.client.call("checkpoint_get", thread_id=c["thread_id"],
-                                   ns=c.get("checkpoint_ns", ""), checkpoint_id=get_checkpoint_id(config))
-        return self._to_tuple(d) if d.get("found") else None
+        d = await self._tool("checkpoint_get", thread_id=c["thread_id"],
+                             ns=c.get("checkpoint_ns", ""), checkpoint_id=get_checkpoint_id(config))
+        return self._to_tuple(d["item"]) if d["found"] else None
 
     async def alist(self, config: RunnableConfig | None, *, filter: dict[str, Any] | None = None,
                     before: RunnableConfig | None = None, limit: int | None = None
                     ) -> AsyncIterator[CheckpointTuple]:
         c = (config or {}).get("configurable", {})
-        d = await self.client.call("checkpoint_list", thread_id=c["thread_id"], ns=c.get("checkpoint_ns"),
-                                   before=get_checkpoint_id(before) if before else None, limit=None)
+        d = await self._tool("checkpoint_list", thread_id=c["thread_id"], ns=c.get("checkpoint_ns"),
+                             before=get_checkpoint_id(before) if before else None, limit=None)
         n = 0
         for item in d["items"]:
             t = self._to_tuple(item)
@@ -77,7 +81,7 @@ class McpCheckpointSaver(BaseCheckpointSaver):
                    new_versions: ChannelVersions) -> RunnableConfig:
         c = config["configurable"]
         ns = c.get("checkpoint_ns", "")
-        await self.client.call(
+        await self._tool(
             "checkpoint_put", thread_id=c["thread_id"], ns=ns, checkpoint_id=checkpoint["id"],
             parent_id=c.get("checkpoint_id"),
             checkpoint=_enc(self.serde.dumps_typed(checkpoint)),
@@ -90,11 +94,11 @@ class McpCheckpointSaver(BaseCheckpointSaver):
                           task_path: str = "") -> None:
         c = config["configurable"]
         rows = [[WRITES_IDX_MAP.get(ch, i), ch, *_enc(self.serde.dumps_typed(v))] for i, (ch, v) in enumerate(writes)]
-        await self.client.call("checkpoint_put_writes", thread_id=c["thread_id"], ns=c.get("checkpoint_ns", ""),
+        await self._tool("checkpoint_put_writes", thread_id=c["thread_id"], ns=c.get("checkpoint_ns", ""),
                                checkpoint_id=c["checkpoint_id"], task_id=task_id, task_path=task_path, writes=rows)
 
     async def adelete_thread(self, thread_id: str) -> None:
-        await self.client.call("checkpoint_delete_thread", thread_id=thread_id)
+        await self._tool("checkpoint_delete_thread", thread_id=thread_id)
 
     # ── 동기 API는 쓰지 않는다 (MCP 클라이언트가 비동기) ──
     def get_tuple(self, config):  # noqa: D102
@@ -111,11 +115,13 @@ class McpCheckpointSaver(BaseCheckpointSaver):
 
 
 class McpNoteStore:
-    """publish 노드가 쓰는 발행 저장소 (MCP note_publish)."""
+    """publish 노드가 쓰는 발행 저장소 (MCP note_publish). 새로 저장했으면 True, 이미 있었으면(duplicate) False."""
 
-    def __init__(self, client: McpClient) -> None:
+    def __init__(self, client: McpClient, permit: str | None = None) -> None:
         self.client = client
+        self.permit = permit
 
     async def publish(self, key: str, course: str, note: str, status: str) -> bool:
-        return (await self.client.call("note_publish", idem_key=key, course=course or "", note=note,
-                                       status=status))["published"]
+        d = await self.client.tool("note_publish", permit=self.permit, idem_key=key, course=course or "",
+                                   note=note, status=status)
+        return not d.get("duplicate", False)

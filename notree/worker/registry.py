@@ -13,13 +13,18 @@
        RetryableError : 잠시 후 다시 하면 될 수 있음 (OpenAI 429·타임아웃·일시 장애)
        FatalError     : 다시 해도 안 됨 (입력 깨짐, 출처 삭제됨, 권한 없음)
      그 밖의 예외는 RetryableError처럼 취급되고, 시도 한도를 넘으면 실패 확정된다.
+     MCP 도구의 거절은 ctx.tool()이 서버가 준 retryable 값을 보고 알아서 둘 중 하나로 바꿔 던진다.
   5. ACK·완료 표시·lease는 신경 쓰지 않는다 (루프가 한다).
+  6. payload에 deadline_at(unix 초)이 있으면 루프가 남은 시간만큼만 실행한다 (Q&A 90초 약속, 팀 결정 2번).
+     핸들러가 더 잘게 쓰고 싶으면 ctx.time_left()를 본다.
 """
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from notree.common.settings import StreamConfig
+from notree.contracts.envelope import ToolError
 from notree.worker.mcp_client import McpClient
 
 
@@ -29,6 +34,22 @@ class RetryableError(Exception):
 
 class FatalError(Exception):
     """다시 해도 안 되는 실패."""
+
+
+class ToolUnavailable(RetryableError):
+    """MCP 도구가 retryable=true로 거절 (locked, unavailable)."""
+
+    def __init__(self, e: ToolError) -> None:
+        super().__init__(str(e))
+        self.code = e.code
+
+
+class ToolRejected(FatalError):
+    """MCP 도구가 retryable=false로 거절 (invalid_args, permit_invalid, not_found, generation_mismatch)."""
+
+    def __init__(self, e: ToolError) -> None:
+        super().__init__(str(e))
+        self.code = e.code
 
 
 @dataclass
@@ -41,11 +62,20 @@ class JobContext:
     worker: str
     cfg: StreamConfig
     mcp: McpClient
+    max_attempts: int = 1
+    deadline_at: float | None = None                         # 사용자에게 약속한 마감 (unix 초)
     extras: dict[str, Any] = field(default_factory=dict)   # 공용 자원(OpenAI 클라이언트 등)
 
     async def tool(self, name: str, **args: Any) -> dict:
-        """permit을 자동으로 붙여 MCP 도구를 부른다. (worker용 도구는 모두 permit 인자를 받는 게 규칙)"""
-        return await self.mcp.call(name, permit=self.permit, **args)
+        """permit을 자동으로 붙여 MCP 도구를 부르고 data만 돌려준다.
+        거절되면 서버가 준 retryable 값에 따라 ToolUnavailable(RetryableError) / ToolRejected(FatalError)."""
+        try:
+            return await self.mcp.tool(name, permit=self.permit, **args)
+        except ToolError as e:
+            raise (ToolUnavailable(e) if e.retryable else ToolRejected(e)) from e
+
+    def time_left(self) -> float | None:
+        return None if self.deadline_at is None else self.deadline_at - time.time()
 
 
 Handler = Callable[[JobContext], Awaitable[None]]
