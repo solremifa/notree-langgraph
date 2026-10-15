@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### [실험 브랜치 `feat/taskiq`] worker 루프를 taskiq로 바꿔 비교 · (이번 커밋)
+### [실험 브랜치 `feat/taskiq`] worker 루프를 taskiq로 바꿔 비교 · `1471673`
 자세히: [docs/changes/2026-10-15-taskiq-trial.md](docs/changes/2026-10-15-taskiq-trial.md). **main에는 합치지 않음. 결론: 지금 루프 유지 권고.**
 
 - 🆕 `notree/worker_tq/`: Redis 부분만 taskiq로 바꾼 `TqWorker`, 회수 방식을 고친 `ReclaimingStreamBroker`, taskiq 형식으로 보내는 배정기
