@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### 실행 안정성 4건 수정 · (이번 커밋)
+### 실행 안정성 4건 수정 · `b6fe820`
 자세히: [docs/changes/2026-10-15-execution-safety.md](docs/changes/2026-10-15-execution-safety.md)
 
 - 🐛 같은 worker가 자기 실행 중인 메시지를 다시 가져와 중복 실행하던 문제: heartbeat마다 Redis 방치 시간 초기화(`XCLAIM … JUSTID`),
