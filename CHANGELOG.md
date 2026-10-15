@@ -11,6 +11,12 @@
 
 ## 2026-10-15
 
+### Q&A 그래프를 main에 합침 (결정 변경: Q&A에 LangGraph 사용) · (이번 커밋)
+- 🆕 `feat/qa-graph` 병합: `notree/graphs/qa/`, `notree/dev/qa_run.py`, `tests/test_qa_graph.py` (16개)
+- 🔧 `docs/team-decisions.md` 10번: "LangGraph 안 씀" → **LangGraph로 구현**. 실험·외부 검토에서 나온 보완 목록은 그대로 두고, 그래프에 이미 반영된 것과 남은 것을 표시
+- 기존 코드·명령 변경 없음. 새 명령 `uv run python -m notree.dev.qa_run`
+- 테스트 37 → 53개
+
 ### 팀 결정 10번 보강: Q&A 외부 검토 반영 · `5fb69ab`
 - 🔧 `docs/team-decisions.md` 10번에 Q&A 핸들러에 넣을 것 9가지 추가 (실패 시 본문 교체, 본문·인용 일치, 답변 불가 시 다음 출처, 점수 보정, 대화 맥락, 장애 구분, 시간 예산, `qa_context` 연결)
 - 🐛 7번의 "임베딩 검색" 표현 수정: 계약상 `notes_search`는 pg_trgm. 검색 방식은 팀 확인 필요로 표시
@@ -20,6 +26,26 @@
 - 🔧 `docs/team-decisions.md` 10번 추가: Q&A는 설계서대로 tool calling. `feat/qa-graph` 브랜치는 합치지 않고 참고용으로 보관
 - 🔧 같은 10번에 실험에서 확인한 것 중 구현 방식과 상관없이 Q&A 핸들러에 넣을 것 7가지 (근거 기준 분리, 코드로 인용 확인, 인용 기준 라벨 등)
 - 코드 변경 없음
+### [실험 브랜치 `feat/qa-graph`] 실제 LLM 실행 결과 반영: 근거 기준 분리 · `35ed1b7`
+- 🐛 정답 근거를 찾고도 "근거 부족"이 되던 문제: 멈춤 기준(0.6)이 LLM에게 줄 근거까지 걸렀음.
+  이제 `EVIDENCE_MIN`(0.3) 이상인 근거는 모두 LLM에게 주고, 라벨은 **LLM이 실제로 인용한 근거의 출처**로 정함
+- 🔧 OpenAI 프롬프트: 검색어는 일반 단어 빼고 2~4개, 근거가 없으면 추측하지 말 것
+- 🔧 `FakeQALLM(cite_min=0.6)`: 답이 되는 근거만 인용하는 흉내
+- 🆕 테스트 2개 (총 53개)
+
+### [실험 브랜치 `feat/qa-graph`] OpenAI JSON 모드 400 오류 수정 · `77c0325`
+- 🐛 `--llm openai`에서 answer 단계가 400으로 실패: JSON 모드는 메시지에 'json'이라는 단어가 있어야 하는데 답변 프롬프트에 없었음.
+  모든 요청에 "JSON으로만 답하라"는 system 메시지를 붙임
+- 🆕 회귀 테스트 `test_openai_requests_always_mention_json` (가짜 클라이언트, 총 51개)
+
+### [실험 브랜치 `feat/qa-graph`] Q&A 근거 탐색 그래프 · `5302e14`
+자세히·merge 기준: [docs/changes/2026-10-15-qa-graph.md](docs/changes/2026-10-15-qa-graph.md). **main에는 아직 합치지 않음.**
+
+- 🆕 `notree/graphs/qa/`: 노트 → 강의 전사 → 웹 순서로 근거를 찾고, 충분하면 멈추고, 마감이 가까우면 비싼 단계를 건너뛰고,
+  근거에 없는 인용은 1번 다시 답하게 한 뒤 그래도 틀리면 "근거 부족"으로 저장하는 LangGraph. 체크포인트 없음
+- 🆕 `notree/dev/qa_run.py`: 단계별 진행 출력 데모 (`--deadline-in`, `--bad-citation`, `--llm openai`, `--graph`)
+- 🆕 `tests/test_qa_graph.py` 13개 (총 50개)
+- 기존 코드·명령 변경 없음
 
 ### 실행 안정성 4건 수정 · `b6fe820`
 자세히: [docs/changes/2026-10-15-execution-safety.md](docs/changes/2026-10-15-execution-safety.md)
