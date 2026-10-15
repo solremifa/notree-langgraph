@@ -155,3 +155,27 @@ def test_shutdown_grace_starts_immediately_when_slots_are_full(tmp_path):
             row = await e.row(j)
             assert row["state"] == "sent" and await e.pending() == 1         # 반납 → 다른 worker가 이어받을 수 있음
     asyncio.run(t())
+
+
+# ── 5. 사용자 재시도 뒤 이전 permit (2026-10-15 2차 검토) ──────────
+def test_permit_from_before_user_retry_is_rejected(tmp_path):
+    """job_retry가 시도 횟수를 0으로 되돌려도, 재시도 전 실행의 permit은 새 실행에서 쓸 수 없어야 한다.
+    (시도 횟수와 별개로 되돌아가지 않는 실행 세대가 필요)"""
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            j = await job_rt(e, {})
+            await e.api.tool("job_reserve_pending")
+            first = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=30)
+            await e.api.tool("job_fail", permit=first["permit"], job_id=j, worker="rt-A", reason="x",
+                             user_retryable=True)
+            assert (await e.api.tool("job_retry", job_id=j))["revived"] is True
+            await e.api.tool("job_reserve_pending")
+            second = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=30)
+            assert second["status"] == "started" and second["attempt"] == 1      # 시도 횟수는 새로 셈
+            fin = await e.api.tool("job_finish", permit=first["permit"], job_id=j, worker="rt-A")
+            assert fin["finished"] is False, "재시도 전 permit으로 새 실행을 완료 처리함"
+            pub = await e.api.call("note_publish", idem_key=j, course="c", note="old", status="완료",
+                                   permit=first["permit"])
+            assert pub["ok"] is False and pub["code"] == "permit_invalid"
+            assert (await e.api.tool("job_finish", permit=second["permit"], job_id=j, worker="rt-A"))["finished"]
+    asyncio.run(t())

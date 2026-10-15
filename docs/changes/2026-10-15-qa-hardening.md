@@ -55,3 +55,26 @@ understand → search_note ─(충분)→ answer → verify ─(통과)───
 - **바뀐 OpenAI 프롬프트(문장별 JSON, `needs_more_evidence`)는 실제 모델로 아직 돌려 보지 않았습니다.**
   `uv run python -m notree.dev.qa_run --llm openai`로 확인이 필요합니다.
 - 시간 예산의 숫자는 실측 전 값입니다. 실제 검색·LLM 지연을 재 보고 조정해야 합니다.
+
+## 2차 검토 반영 (같은 날)
+
+`9d470e2` 기준 외부 검토에서 재현된 네 가지를 고쳤습니다. 먼저 재현 테스트를 쓰고 실패를 확인한 뒤 고쳤습니다.
+
+| # | 문제 | 고친 방법 | 테스트 |
+|---|---|---|---|
+| 1 | 인용 표시를 지우는 정규식이 **코드·수식을 훼손** (`a = [1, 2, 3]` → `a =`) | 인용 표시를 `[^ID]` 문법으로 정함. 지우는 것은 `[^..]`와 이번 근거 ID와 정확히 같은 `[ID]`뿐 | `test_render_keeps_code_and_math_brackets`, `test_render_strips_only_citation_markers` |
+| 2 | LLM이 "근거가 더 필요"라고 했는데 더 찾을 곳이 없어도 `completed` / 인용 없는 과목 답변이 본문째 저장 | 상태를 라벨과 분리: `부분 답변` 추가. 과목 질문에 인용이 없으면 본문을 버리고 안내문 | `test_partial_answer_is_not_saved_as_completed`, `test_uncited_course_answer_is_replaced_by_notice` |
+| 3 | "웹 최대 1번"인데 장애 시 실제 요청은 2번 | 웹은 다시 요청하지 않음 (`SEARCH_RETRIES`: 노트 1, 전사 1, 웹 0) | `test_web_search_is_requested_at_most_once_even_on_error` |
+| 4 | `job_retry`가 시도 번호를 0으로 되돌려, **재시도 전 permit이 새 실행에서 통함** (공통 worker 문제) | 되돌리지 않는 실행 세대 `exec_epoch`를 따로 두고 permit(`x`)과 실행권 확인에 사용 | `test_permit_from_before_user_retry_is_rejected` |
+
+- LLM이 지어낸 모르는 ID(`[x9]`)가 본문에 남으면 지우지 않습니다. 코드·수식과 구분할 수 없어서입니다. 프롬프트에서 인용 표시를 쓰지 말라고 하고, 화면은 `citations`로 출처를 보여 주는 것을 전제로 합니다.
+
+### 깨지는 변경
+
+| 무엇 | 이전 | 이후 |
+|---|---|---|
+| 본문의 인용 표시 | `[n1]` | `[^n1]` |
+| 상태 | completed / 근거 부족 / 시간 초과 | 여기에 `부분 답변` 추가 |
+| 인용 없는 과목 답변 | LLM 본문 그대로 + 근거 부족 | 본문을 안내문으로 교체 |
+| 웹 검색 장애 | 1번 다시 요청 | 다시 요청하지 않고 건너뜀 |
+| permit | `{j, w, a, u, e}` | `{j, w, a, x, u, e}`. 실행권 확인은 `x`(실행 세대). 이전 permit은 쓰기 도구에서 `permit_invalid` |

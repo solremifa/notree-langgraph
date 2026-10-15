@@ -31,4 +31,4 @@ class QAState(TypedDict, total=False):
     label: Label                                       # 화면에 붙일 출처 라벨
     answer_attempts: int
     verify_problem: str                                # 근거 확인 실패 사유 (없으면 "")
-    status: str                                        # completed / 근거 부족 / 시간 초과
+    status: str                                        # completed / 부분 답변 / 근거 부족 / 시간 초과

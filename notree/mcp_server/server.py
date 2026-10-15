@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tool_log(
 # 나중에 추가된 컬럼 (이전 버전 DB 호환)
 ADDED_COLUMNS = [
     ("jobs", "user_id TEXT"), ("jobs", "updated_at REAL"), ("jobs", "user_retryable INTEGER"),
+    ("jobs", "exec_epoch INTEGER DEFAULT 0"),   # 실행 세대: job_start마다 +1, 절대 되돌리지 않음 (job_retry도)
     ("notes", "user_id TEXT"),
 ]
 
@@ -154,7 +155,8 @@ def tool(fn):
 
 
 # ── permit (팀 결정 4번) ─────────────────────────────────────────
-# 형식: base64url({"j": job_id, "w": worker, "a": 시도 번호(실행 세대), "u": user_id, "e": 만료}) + "." + HMAC 앞 32자
+# 형식: base64url({"j": job_id, "w": worker, "a": 시도 번호, "x": 실행 세대, "u": user_id, "e": 만료}) + "." + HMAC 앞 32자
+# 시도 번호(attempts)는 재시도 한도용이라 사용자 재시도(job_retry) 때 0으로 돌아간다. 실행권 확인은 되돌아가지 않는 실행 세대(x)로 한다.
 # 서명은 '위조되지 않았다'만 증명한다. '지금도 실행권이 있다'는 쓰기 트랜잭션 안에서 _require_live()로 DB와 대조한다.
 PERMIT_SECRET = os.getenv("NOTREE_PERMIT_SECRET", "dev-only-secret").encode()
 PERMIT_TTL = {"notree:rt": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
@@ -166,8 +168,8 @@ def _sign(body: str) -> str:
     return hmac.new(PERMIT_SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def _issue_permit(job_id: str, worker: str, attempt: int, user_id: str, stream: str) -> str:
-    claims = {"j": job_id, "w": worker, "a": attempt, "u": user_id,
+def _issue_permit(job_id: str, worker: str, attempt: int, epoch: int, user_id: str, stream: str) -> str:
+    claims = {"j": job_id, "w": worker, "a": attempt, "x": epoch, "u": user_id,
               "e": int(time.time() + PERMIT_TTL.get(stream, 1800))}
     body = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
     return f"{body}.{_sign(body)}"
@@ -194,12 +196,13 @@ def _claims(permit: str | None, job_id: str) -> dict | None:
 
 
 def _is_live(con, claims: dict | None, job_id: str) -> bool:
-    """permit의 실행자가 지금도 이 작업의 실행권을 가졌는지: running이고, 소유자와 실행 세대(시도 번호)가 같아야 한다.
+    """permit의 실행자가 지금도 이 작업의 실행권을 가졌는지: running이고, 소유자와 실행 세대(exec_epoch)가 같아야 한다.
     permit 없이 부르는 경우(REQUIRE_PERMIT=0, 작업 밖에서 그래프만 돌릴 때)는 검사하지 않는다."""
     if claims is None:
         return True
-    r = con.execute("SELECT state, lease_owner, attempts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-    return bool(r) and r["state"] == "running" and r["lease_owner"] == claims["w"] and r["attempts"] == claims.get("a")
+    r = con.execute("SELECT state, lease_owner, exec_epoch FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    return (bool(r) and r["state"] == "running" and r["lease_owner"] == claims["w"]
+            and claims.get("x") is not None and r["exec_epoch"] == claims["x"])
 
 
 def _require_live(con, claims: dict | None, job_id: str) -> None:
@@ -389,12 +392,13 @@ def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
         if r["state"] == "running" and (r["lease_until"] or 0) > now:
             return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
                                     lease_left_sec=round(r["lease_until"] - now, 1)))
+        epoch = (r["exec_epoch"] or 0) + 1
         _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
-             attempts=r["attempts"] + 1)
+             attempts=r["attempts"] + 1, exec_epoch=epoch)
         return ok(C.JobStartOut(
             status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1,
             previous_owner=r["lease_owner"],
-            permit=_issue_permit(job_id, worker, r["attempts"] + 1, r["user_id"] or "anonymous", r["stream"])))
+            permit=_issue_permit(job_id, worker, r["attempts"] + 1, epoch, r["user_id"] or "anonymous", r["stream"])))
 
 
 @tool

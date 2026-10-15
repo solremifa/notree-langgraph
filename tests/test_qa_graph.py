@@ -13,6 +13,7 @@ from notree.graphs.qa.llm import FakeQALLM
 from notree.graphs.qa import QAFatal, SearchForbidden, SearchUnavailable  # noqa: E402
 from notree.graphs.qa import graph as G  # noqa: E402
 from notree.graphs.qa.graph import INSUFFICIENT_TEXT, TIMEOUT_TEXT, render  # noqa: E402
+from notree.graphs.qa.llm import NOT_FOUND_TEXT  # noqa: E402
 from notree.graphs.qa.retriever import sample_corpus
 
 
@@ -123,7 +124,7 @@ def test_openai_requests_always_mention_json():
 
     async def create(**kw):
         sent.append(kw["messages"])
-        body = '{"related": true, "keywords": ["스택"]}' if len(sent) == 1 else ('{"sentences": [{"text": "스택은 LIFO다 [x9]", "citations": ["n1"]}], '
+        body = '{"related": true, "keywords": ["스택"]}' if len(sent) == 1 else ('{"sentences": [{"text": "스택은 LIFO다 [n1]", "citations": ["n1"]}], '
                                                                                    '"needs_more_evidence": false}')
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=body))])
 
@@ -133,7 +134,7 @@ def test_openai_requests_always_mention_json():
     cfg = {"configurable": {"llm": llm, "retriever": FakeRetriever(sample_corpus())}}
     out = asyncio.run(build_qa_graph().ainvoke({"question": "스택은 어떤 구조야?"}, cfg))
     assert out["citations"] == ["n1"]
-    assert out["answer"] == "스택은 LIFO다 [n1]"          # LLM이 본문에 넣은 [x9]는 지우고 코드가 [n1]을 붙임
+    assert out["answer"] == "스택은 LIFO다 [^n1]"         # LLM이 본문에 넣은 [n1]은 지우고 코드가 [^n1]을 붙임
     assert len(sent) == 2 and all("json" in _json.dumps(m, ensure_ascii=False).lower() for m in sent)
 
 
@@ -251,5 +252,59 @@ def test_render_builds_markers_from_citations():
     text, cites = render([{"text": "스택은 LIFO다 [x9].", "citations": ["n1", "n1"]},
                           {"text": "재귀가 깊으면 넘친다", "citations": ["t1", "n1"]},
                           {"text": "정리하면 위와 같다", "citations": []}])
-    assert text == "스택은 LIFO다. [n1] 재귀가 깊으면 넘친다 [t1] [n1] 정리하면 위와 같다"
+    assert text == "스택은 LIFO다 [x9]. [^n1] 재귀가 깊으면 넘친다 [^t1] [^n1] 정리하면 위와 같다"   # 모르는 [x9]는 내용으로 둠
     assert cites == ["n1", "t1"]
+
+
+# ── 2차 검토 (2026-10-15) ─────────────────────────────────────────
+
+def test_render_keeps_code_and_math_brackets():
+    text, cites = render([{"text": "배열 a = [1, 2, 3], 첫 원소 a[0], 구간 [0, 1].", "citations": ["n1"]}],
+                         known_ids={"n1"})
+    assert text == "배열 a = [1, 2, 3], 첫 원소 a[0], 구간 [0, 1]. [^n1]"
+    assert cites == ["n1"]
+
+
+def test_render_strips_only_citation_markers():
+    text, _ = render([{"text": "스택은 LIFO다 [n1] [^t1], 예: s[0]", "citations": ["n1"]}], known_ids={"n1", "t1"})
+    assert text == "스택은 LIFO다, 예: s[0] [^n1]"
+
+
+class PartialLLM(FakeQALLM):
+    """일부만 답하고(정상 인용) 매번 '근거가 더 필요'라고 하는 LLM."""
+
+    async def answer(self, question, evidence, attempt, problem="", related=True):
+        from notree.graphs.qa.llm import Answer, Sentence
+        self.calls.append(f"answer#{attempt}")
+        return Answer(sentences=[Sentence(text="스택은 LIFO 구조다.", citations=[evidence[0]["id"]])],
+                      needs_more_evidence=True)
+
+
+def test_partial_answer_is_not_saved_as_completed():
+    ret = ScriptedRetriever({"note": [LIFO], "transcript": [CAUSE], "web": [dict(CAUSE, id="w1", source="web")]})
+    out, _ = run_with("스택 오버플로의 원인은?", ret, PartialLLM())
+    assert out["citations"] and out["status"] == "부분 답변"
+
+
+class UncitedLLM(FakeQALLM):
+    """근거를 받고도 인용 없이 지어낸 답을 내는 LLM."""
+
+    async def answer(self, question, evidence, attempt, problem="", related=True):
+        from notree.graphs.qa.llm import Answer, Sentence
+        self.calls.append(f"answer#{attempt}")
+        return Answer(sentences=[Sentence(text="스택 오버플로는 우주선 때문이다.")])
+
+
+def test_uncited_course_answer_is_replaced_by_notice():
+    ret = ScriptedRetriever({"note": [LIFO]})
+    out, _ = run_with("스택은 어떤 구조야?", ret, UncitedLLM())
+    assert out["status"] == "근거 부족" and "우주선" not in out["answer"]
+    assert out["answer"] == NOT_FOUND_TEXT
+
+
+def test_web_search_is_requested_at_most_once_even_on_error():
+    ret = ScriptedRetriever({"web": [dict(CAUSE, id="w1", source="web")]},
+                            errors={"web": [SearchUnavailable("timeout")]})
+    out, _ = run_with("힙 정렬의 시간 복잡도는?", ret)
+    assert ret.calls.count("web") == 1
+    assert any("web: 일시 장애" in s and "건너뜀" in s for s in out["skipped"])

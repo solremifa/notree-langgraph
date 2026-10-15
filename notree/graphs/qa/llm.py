@@ -125,7 +125,7 @@ class OpenAIQALLM:
         if evidence:
             ev = "\n".join(f"[{h['id']}] {h['text']}" for h in evidence)
             rule = ("아래 근거 중 질문에 실제로 답이 되는 것만 사용해 문장별로 답해. 문장마다 그 문장에 쓴 근거 ID를 citations에 넣고, "
-                    "문장 text에는 [ID] 같은 표시를 쓰지 마. 근거에 없는 내용은 덧붙이지 마. "
+                    "문장 text에는 [ID]나 [^ID] 같은 인용 표시를 쓰지 마 (코드가 붙인다). 근거에 없는 내용은 덧붙이지 마. "
                     "답이 되는 근거가 하나도 없으면 내용을 추측하지 말고 '강의 자료에서 근거를 찾지 못했다'는 문장 하나만 쓰고 "
                     "needs_more_evidence를 true로 해.")
         elif related:

@@ -11,11 +11,15 @@
 - 검색을 멈추는 기준: 최고 점수 ≥ ENOUGH_SCORE
 - LLM에게 주는 근거: 점수 ≥ EVIDENCE_MIN인 것 (멈춤 기준보다 낮게. 애매한 점수의 정답 근거도 LLM이 판단하게)
 - 점수가 높아도 LLM이 "답할 수 없음"(needs_more_evidence)이라고 하면, 남은 출처와 시간이 있을 때 다음 출처를 찾는다
-- 웹은 그래프 구조상 최대 1번. LLM 호출은 실행 전체에서 MAX_LLM_CALLS번까지
-- 답변 본문의 [ID] 표시는 LLM이 아니라 코드가 문장별 citations로 만든다 → 본문과 인용 목록이 어긋날 수 없다
+- 웹은 단계도 요청도 최대 1번 (장애가 나도 다시 요청하지 않음). LLM 호출은 실행 전체에서 MAX_LLM_CALLS번까지
+- 답변 본문의 인용 표시 [^ID]는 LLM이 아니라 코드가 문장별 citations로 만든다 → 본문과 인용 목록이 어긋날 수 없다.
+  LLM이 본문에 넣은 표시는 [^..] 형식이거나 이번 근거 ID인 [ID]만 지운다 (a[0], [1, 2] 같은 코드·수식은 그대로)
 - 인용 ID가 받은 근거에 없으면 1번 다시 답하고, 그래도 틀리면 본문을 버리고 정해진 "근거 부족" 안내문으로 저장
-- 라벨은 실제로 인용한 근거의 출처로: 관련 없음 → 일반 지식, 강의 근거 → 강의, 웹만 → 웹, 인용 없음 → 근거 부족
-- 검색 장애: SearchUnavailable·타임아웃 → 시간이 되면 1번 다시, 안 되면 다음 출처 / SearchForbidden → QAFatal로 멈춤
+- 라벨(어디서 왔나)은 실제로 인용한 근거의 출처로: 관련 없음 → 일반 지식, 강의 근거 → 강의, 웹만 → 웹, 인용 없음 → 근거 부족
+- 상태(얼마나 답했나)는 라벨과 따로: completed / 부분 답변(인용은 있으나 LLM이 근거가 더 필요하다고 함) /
+  근거 부족(과목 질문인데 인용 없음 → 본문은 정해진 안내문) / 시간 초과
+- 검색 장애: SearchUnavailable·타임아웃 → 노트·전사는 시간이 되면 1번 다시, 웹은 다시 안 함. 안 되면 다음 출처 /
+  SearchForbidden → QAFatal로 멈춤
 - 시간 예산 (deadline_at 기준)
   · 검색은 답변에 쓸 시간(ANSWER_RESERVE_SEC)을 남기는 범위에서만, 한 번에 최대 SEARCH_TIMEOUT_SEC
   · LLM 호출은 최대 LLM_TIMEOUT_SEC, 저장에 쓸 시간(SAVE_RESERVE_SEC)은 남김
@@ -31,7 +35,7 @@ import time
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
-from notree.graphs.qa.llm import Understanding, keywords_of
+from notree.graphs.qa.llm import NOT_FOUND_TEXT, Understanding, keywords_of
 from notree.graphs.qa.retriever import SearchForbidden, SearchUnavailable
 from notree.graphs.qa.state import HitDict, QAState
 
@@ -52,6 +56,7 @@ INSUFFICIENT_TEXT = "근거를 확인할 수 있는 답을 만들지 못했습�
 TIMEOUT_TEXT = "시간 안에 답을 만들지 못했습니다. 잠시 뒤 다시 물어봐 주세요."
 SOURCES = ("note", "transcript", "web")
 MIN_SEC = {"note": 0.0, "transcript": TRANSCRIPT_MIN_SEC, "web": WEB_MIN_SEC}
+SEARCH_RETRIES = {"note": 1, "transcript": 1, "web": 0}   # 장애 때 다시 요청하는 횟수. 웹은 요청 비용 때문에 0
 
 
 class QAFatal(Exception):
@@ -90,16 +95,20 @@ def label_for(related: bool, cited: list[HitDict]) -> str:
     return "웹" if cited else "근거 부족"
 
 
-_MARK = re.compile(r"\s*\[[^\[\]]{1,40}\]")
+_FOOTNOTE = re.compile(r"\s*\[\^[^\[\]\s]{1,40}\]")
 
 
-def render(sentences: list[dict]) -> tuple[str, list[str]]:
-    """문장별 {text, citations} → (화면용 본문, 인용 목록). LLM이 text에 넣은 [..] 표시는 지우고 코드가 다시 붙인다."""
+def render(sentences: list[dict], known_ids: set[str] | frozenset = frozenset()) -> tuple[str, list[str]]:
+    """문장별 {text, citations} → (화면용 본문, 인용 목록).
+    인용 표시는 [^ID] 형식으로 코드가 붙인다. LLM이 text에 넣은 표시는 [^..] 형식, 또는 이번 근거·인용 ID와 정확히 같은
+    [ID]만 지운다. 그 밖의 대괄호(a[0], [1, 2, 3], 구간 [0, 1])는 내용이므로 건드리지 않는다."""
     parts, cites = [], []
     for s in sentences:
-        text = _MARK.sub("", s["text"]).strip()
-        ids = [c for c in dict.fromkeys(s.get("citations") or [])]
-        parts.append(text + "".join(f" [{c}]" for c in ids))
+        ids = list(dict.fromkeys(s.get("citations") or []))
+        text = _FOOTNOTE.sub("", s["text"])
+        for i in set(known_ids) | set(ids):
+            text = re.sub(r"\s*\[" + re.escape(i) + r"\]", "", text)
+        parts.append(text.strip() + "".join(f" [^{c}]" for c in ids))
         cites += [c for c in ids if c not in cites]
     return " ".join(p for p in parts if p), cites
 
@@ -144,7 +153,7 @@ def _search(source: str):
     async def node(state: QAState, config: RunnableConfig) -> dict:
         retriever, notes = _cfg(config)["retriever"], []
         reset = {"answer_attempts": 0, "verify_problem": "", "needs_more": False}
-        for i in range(2):
+        for i in range(1 + SEARCH_RETRIES[source]):
             limit = min(SEARCH_TIMEOUT_SEC, time_left(config) - ANSWER_RESERVE_SEC)
             if limit <= 0:
                 notes.append(f"{source}: 답변할 시간을 남기려고 검색 중단")
@@ -154,7 +163,7 @@ def _search(source: str):
                 return {"hits": hits, "searched": [source], "skipped": notes, **reset}
             except (SearchUnavailable, TimeoutError) as e:
                 why = "시간 초과" if isinstance(e, TimeoutError) else f"일시 장애: {e}"
-                notes.append(f"{source}: {why} → {'다시 시도' if i == 0 else '건너뜀'}")
+                notes.append(f"{source}: {why} → {'다시 시도' if i < SEARCH_RETRIES[source] else '건너뜀'}")
             except SearchForbidden as e:
                 raise QAFatal(f"{source} 검색 불가: {e}") from e
         return {"hits": [], "searched": [source], "skipped": notes, **reset}
@@ -179,8 +188,8 @@ async def answer(state: QAState, config: RunnableConfig) -> dict:
     except TimeoutError:
         return {**timed_out, "llm_calls": calls + 1}
     sentences = [s.model_dump() for s in a.sentences]
-    text, cites = render(sentences)
     by_id = {h["id"]: h for h in ev}
+    text, cites = render(sentences, known_ids=set(by_id))
     return {"answer": text, "sentences": sentences, "citations": cites,
             "label": label_for(related, [by_id[c] for c in cites if c in by_id]),
             "answer_attempts": attempt, "llm_calls": calls + 1,
@@ -202,8 +211,11 @@ async def save(state: QAState, config: RunnableConfig) -> dict:
         out.update(status="시간 초과", label="근거 부족", answer=TIMEOUT_TEXT, citations=[], sentences=[])
     elif state.get("verify_problem"):          # 재시도까지 실패 → 틀린 본문은 버리고 정해진 안내문으로
         out.update(status="근거 부족", label="근거 부족", answer=INSUFFICIENT_TEXT, citations=[], sentences=[])
-    elif state.get("label") == "근거 부족":
-        out["status"] = "근거 부족"
+    elif state.get("related") and not state.get("citations"):
+        # 과목 질문인데 인용이 하나도 없음 → LLM 본문(근거 없이 지어냈을 수 있음)은 버리고 안내문만
+        out.update(status="근거 부족", label="근거 부족", answer=NOT_FOUND_TEXT, sentences=[])
+    elif state.get("related") and state.get("needs_more"):
+        out["status"] = "부분 답변"            # 인용은 있지만 LLM이 근거가 더 필요하다고 했고, 더 찾을 곳·시간이 없음
     sink = _cfg(config).get("sink")
     if sink is not None:
         await sink({**state, **out})
