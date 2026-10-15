@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### Q&A 그래프를 main에 합침 (결정 변경: Q&A에 LangGraph 사용) · (이번 커밋)
+### Q&A 그래프를 main에 합침 (결정 변경: Q&A에 LangGraph 사용) · `e7ab556`
 - 🆕 `feat/qa-graph` 병합: `notree/graphs/qa/`, `notree/dev/qa_run.py`, `tests/test_qa_graph.py` (16개)
 - 🔧 `docs/team-decisions.md` 10번: "LangGraph 안 씀" → **LangGraph로 구현**. 실험·외부 검토에서 나온 보완 목록은 그대로 두고, 그래프에 이미 반영된 것과 남은 것을 표시
 - 기존 코드·명령 변경 없음. 새 명령 `uv run python -m notree.dev.qa_run`
