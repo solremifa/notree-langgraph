@@ -11,6 +11,15 @@
 
 ## 2026-10-15
 
+### [실험 브랜치 `feat/taskiq`] worker 루프를 taskiq로 바꿔 비교 · (이번 커밋)
+자세히: [docs/changes/2026-10-15-taskiq-trial.md](docs/changes/2026-10-15-taskiq-trial.md). **main에는 합치지 않음. 결론: 지금 루프 유지 권고.**
+
+- 🆕 `notree/worker_tq/`: Redis 부분만 taskiq로 바꾼 `TqWorker`, 회수 방식을 고친 `ReclaimingStreamBroker`, taskiq 형식으로 보내는 배정기
+- 🆕 `tests/test_worker_compare.py`: loop / taskiq / taskiq+reclaim을 진짜 redis-server에서 같은 시나리오로 비교 (24개, 원본 taskiq 실패 3개는 `xfail(strict=True)`)
+- 🆕 `echo` 핸들러 `die_on` 옵션 (지정한 worker가 실행하면 죽음)
+- 🔧 의존성 `taskiq`, `taskiq-redis` 추가
+- 확인한 것: 원본 taskiq-redis는 새 메시지가 올 때만 방치 메시지를 회수 → 조용할 때 죽은 worker 인계·재시도·완료 기록 장애 복구가 멈춤. 고쳐도 실행 중 작업의 방치 시간을 초기화할 수 없어 불필요한 재회수가 생기고, 코드는 줄지 않음 (89줄 → 108줄)
+
 ### 팀 결정 10번 보강: Q&A 외부 검토 반영 · `5fb69ab`
 - 🔧 `docs/team-decisions.md` 10번에 Q&A 핸들러에 넣을 것 9가지 추가 (실패 시 본문 교체, 본문·인용 일치, 답변 불가 시 다음 출처, 점수 보정, 대화 맥락, 장애 구분, 시간 예산, `qa_context` 연결)
 - 🐛 7번의 "임베딩 검색" 표현 수정: 계약상 `notes_search`는 pg_trgm. 검색 방식은 팀 확인 필요로 표시
