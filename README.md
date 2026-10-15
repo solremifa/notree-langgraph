@@ -42,6 +42,19 @@ run.py (worker)                                 mcp_server.py (내부 MCP 서버
 | compose 네트워크의 내부 MCP | stdio 하위 프로세스 (배포 시 streamable HTTP로 바뀌는 부분) |
 | operation_id | `--thread` |
 
+## notree/ — 팀 저장소로 옮길 worker 구조
+
+평면 파일들은 흐름을 확인하려고 만든 1차 PoC이고, 실제로 옮길 뼈대는 `notree/` 패키지입니다.
+핸들러 규약, 동시 실행, 재시도 한도, lease 상실 시 취소, 종료 신호 처리, permit 토큰까지 들어 있습니다.
+
+- 구조와 코드 흐름: **[docs/worker-structure.md](docs/worker-structure.md)**
+- 팀이 정해야 할 것: **[docs/team-decisions.md](docs/team-decisions.md)**
+
+```powershell
+uv run python -m notree.dev.demo                       # 성공·실패·재시도·한도 초과·미구현·LangGraph 이어하기·종료 처리
+uv run python -m notree.worker --stream rt --name A    # 실제 worker 프로세스 (Redis·MCP 서버 필요)
+```
+
 ## worker까지 붙인 전체 흐름
 
 api → scheduler(배정기) → Redis Streams → worker → (죽으면) 다른 worker가 이어받기까지 붙어 있습니다.
@@ -85,7 +98,7 @@ uv run run.py --thread op2 --resume             # "중복 발행 막음"
 uv run run.py --thread op1 --history            # 체크포인트 이력 (MCP checkpoint_list)
 uv run run.py --saver sqlite                    # 비교: worker가 DB 파일에 직접
 uv run run.py --graph                           # Mermaid 그래프 → out/graph.mmd (mermaid.live 에 붙여 넣기)
-uv run pytest -q                                # 12개: 그래프 시나리오 9개 + worker 인계 시나리오 3개
+uv run pytest -q                                # 18개: 그래프 9 + worker 인계 3 + notree 뼈대 6
 ```
 
 출력의 `💾 checkpoint step=N 다음=[...]`이 단계(super-step)마다 상태를 저장하는 지점이고,

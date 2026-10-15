@@ -1,0 +1,67 @@
+"""핸들러 규약.
+
+작업 종류(kind)마다 핸들러 함수 하나:
+
+    @handler("live_summary")
+    async def live_summary(ctx: JobContext) -> None: ...
+
+핸들러가 지킬 것
+  1. 입력은 ctx.payload(= DB의 작업 입력)와 MCP 읽기 도구로만 얻는다.
+  2. 결과는 MCP 발행 도구로만 저장하고, 멱등키는 ctx.job_id를 쓴다 → 두 번 실행돼도 결과가 같다.
+  3. LLM·네트워크 호출은 비동기로 한다 (동기로 오래 막으면 heartbeat가 멈춰 작업을 빼앗긴다).
+  4. 실패는 둘 중 하나로 던진다.
+       RetryableError : 잠시 후 다시 하면 될 수 있음 (OpenAI 429·타임아웃·일시 장애)
+       FatalError     : 다시 해도 안 됨 (입력 깨짐, 출처 삭제됨, 권한 없음)
+     그 밖의 예외는 RetryableError처럼 취급되고, 시도 한도를 넘으면 실패 확정된다.
+  5. ACK·완료 표시·lease는 신경 쓰지 않는다 (루프가 한다).
+"""
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from notree.common.settings import StreamConfig
+from notree.worker.mcp_client import McpClient
+
+
+class RetryableError(Exception):
+    """다시 하면 될 수 있는 실패."""
+
+
+class FatalError(Exception):
+    """다시 해도 안 되는 실패."""
+
+
+@dataclass
+class JobContext:
+    job_id: str
+    kind: str
+    payload: dict
+    attempt: int            # 1부터. 재시도·재배송 때마다 증가
+    permit: str             # job_start가 발급한 서명 토큰
+    worker: str
+    cfg: StreamConfig
+    mcp: McpClient
+    extras: dict[str, Any] = field(default_factory=dict)   # 공용 자원(OpenAI 클라이언트 등)
+
+    async def tool(self, name: str, **args: Any) -> dict:
+        """permit을 자동으로 붙여 MCP 도구를 부른다. (worker용 도구는 모두 permit 인자를 받는 게 규칙)"""
+        return await self.mcp.call(name, permit=self.permit, **args)
+
+
+Handler = Callable[[JobContext], Awaitable[None]]
+HANDLERS: dict[str, Handler] = {}
+
+
+def handler(kind: str) -> Callable[[Handler], Handler]:
+    def deco(fn: Handler) -> Handler:
+        if kind in HANDLERS:
+            raise ValueError(f"핸들러 중복: {kind}")
+        HANDLERS[kind] = fn
+        return fn
+    return deco
+
+
+def load_handlers() -> dict[str, Handler]:
+    """handlers 패키지를 import하면 각 모듈의 @handler가 등록된다."""
+    import notree.worker.handlers  # noqa: F401
+    return HANDLERS

@@ -6,9 +6,7 @@
                                     └──────────────────┘
                                                        └─ (문제 + 2회) → needs_review ─ publish
 """
-import contextvars
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -17,23 +15,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from llm import get_llm
+from notree.common.log import ACTOR, log  # noqa: F401  (ACTOR는 기존 import 경로 호환)
 from state import CourseUpdateState, ExtractInput
 
 MAX_MERGE = 2
-ACTOR = contextvars.ContextVar("actor", default="")   # 지금 이 코드를 돌리는 프로세스 역할 (worker-A 등)
 
 
 class SimulatedCrash(RuntimeError):
     """--crash-at / die_at 으로 일부러 일으키는 중단. worker는 이걸 '프로세스가 죽었다'로 취급한다."""
-
-
-def log(node: str, msg: str) -> None:
-    # 병렬 노드가 동시에 찍어도 줄이 섞이지 않게 한 번에 쓴다
-    actor = ACTOR.get()
-    who = f"{actor:<10} " if actor else ""
-    now = time.time()
-    stamp = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"  # 프로세스끼리 비교되게 벽시계
-    sys.stdout.write(f"  [{stamp}] {who}{node:<13} {msg}\n"); sys.stdout.flush()
 
 
 def opt(config: RunnableConfig, key: str, default=None):
