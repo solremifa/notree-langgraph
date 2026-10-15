@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### [실험 브랜치 `feat/qa-graph`] Q&A 근거 탐색 그래프 · (이번 커밋)
+### [실험 브랜치 `feat/qa-graph`] Q&A 근거 탐색 그래프 · `5302e14`
 자세히·merge 기준: [docs/changes/2026-10-15-qa-graph.md](docs/changes/2026-10-15-qa-graph.md). **main에는 아직 합치지 않음.**
 
 - 🆕 `notree/graphs/qa/`: 노트 → 강의 전사 → 웹 순서로 근거를 찾고, 충분하면 멈추고, 마감이 가까우면 비싼 단계를 건너뛰고,
