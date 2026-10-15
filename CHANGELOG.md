@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### Q&A 결과 계약: 문장 정제, notice_code, sources · (이번 커밋)
+### Q&A 결과 계약: 문장 정제, notice_code, sources · `7b8bae4`
 - 🐛 `sentences[].text`에 LLM이 넣은 인용 표시가 남던 문제 → 문장을 먼저 정제하고 `answer`는 거기서 파생
 - 🆕 결과에 `notice_code`(not_found / insufficient / timeout)와 `sources`(인용된 근거만) 추가
 - 🔧 `docs/changes/2026-10-15-qa-hardening.md` "3차 검토 반영"
