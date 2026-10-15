@@ -11,6 +11,11 @@
 
 ## 2026-10-15
 
+### [실험 브랜치 `feat/qa-graph`] OpenAI JSON 모드 400 오류 수정 · (이번 커밋)
+- 🐛 `--llm openai`에서 answer 단계가 400으로 실패: JSON 모드는 메시지에 'json'이라는 단어가 있어야 하는데 답변 프롬프트에 없었음.
+  모든 요청에 "JSON으로만 답하라"는 system 메시지를 붙임
+- 🆕 회귀 테스트 `test_openai_requests_always_mention_json` (가짜 클라이언트, 총 51개)
+
 ### [실험 브랜치 `feat/qa-graph`] Q&A 근거 탐색 그래프 · `5302e14`
 자세히·merge 기준: [docs/changes/2026-10-15-qa-graph.md](docs/changes/2026-10-15-qa-graph.md). **main에는 아직 합치지 않음.**
 

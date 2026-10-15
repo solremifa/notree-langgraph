@@ -97,3 +97,26 @@ def test_progress_stream_shows_each_step():
         return [list(u)[0] async for u in build_qa_graph().astream(
             {"question": "스택 오버플로는 왜 생겨?"}, cfg, stream_mode="updates")]
     assert asyncio.run(go()) == ["understand", "search_note", "search_transcript", "answer", "verify", "save"]
+
+
+def test_openai_requests_always_mention_json():
+    """JSON 모드는 메시지에 'json'이 없으면 400 (실제 실행에서 answer 단계가 이걸로 실패했음)."""
+    import json as _json
+    from types import SimpleNamespace
+
+    from notree.graphs.qa.llm import OpenAIQALLM
+
+    sent = []
+
+    async def create(**kw):
+        sent.append(kw["messages"])
+        body = '{"related": true, "keywords": ["스택"]}' if len(sent) == 1 else '{"answer": "LIFO [n1]", "citations": ["n1"]}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=body))])
+
+    llm = OpenAIQALLM.__new__(OpenAIQALLM)
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    llm.model, llm.calls = "test", []
+    cfg = {"configurable": {"llm": llm, "retriever": FakeRetriever(sample_corpus())}}
+    out = asyncio.run(build_qa_graph().ainvoke({"question": "스택은 어떤 구조야?"}, cfg))
+    assert out["citations"] == ["n1"]
+    assert len(sent) == 2 and all("json" in _json.dumps(m, ensure_ascii=False).lower() for m in sent)

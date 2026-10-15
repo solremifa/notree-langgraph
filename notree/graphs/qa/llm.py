@@ -88,7 +88,9 @@ class OpenAIQALLM:
     async def _json(self, prompt: str) -> dict:
         r = await self.client.chat.completions.create(
             model=self.model, temperature=0, response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": prompt}],
+            # JSON 모드는 메시지 어딘가에 'json'이라는 단어가 없으면 400. 프롬프트와 상관없이 항상 넣는다
+            messages=[{"role": "system", "content": "Respond with a single JSON object only."},
+                      {"role": "user", "content": prompt}],
         )
         return json.loads(r.choices[0].message.content or "{}")
 
