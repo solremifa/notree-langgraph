@@ -11,6 +11,15 @@
 
 ## 2026-10-15
 
+### [실험 브랜치 `feat/qa-graph`] Q&A 근거 탐색 그래프 · (이번 커밋)
+자세히·merge 기준: [docs/changes/2026-10-15-qa-graph.md](docs/changes/2026-10-15-qa-graph.md). **main에는 아직 합치지 않음.**
+
+- 🆕 `notree/graphs/qa/`: 노트 → 강의 전사 → 웹 순서로 근거를 찾고, 충분하면 멈추고, 마감이 가까우면 비싼 단계를 건너뛰고,
+  근거에 없는 인용은 1번 다시 답하게 한 뒤 그래도 틀리면 "근거 부족"으로 저장하는 LangGraph. 체크포인트 없음
+- 🆕 `notree/dev/qa_run.py`: 단계별 진행 출력 데모 (`--deadline-in`, `--bad-citation`, `--llm openai`, `--graph`)
+- 🆕 `tests/test_qa_graph.py` 13개 (총 50개)
+- 기존 코드·명령 변경 없음
+
 ### 실행 안정성 4건 수정 · `b6fe820`
 자세히: [docs/changes/2026-10-15-execution-safety.md](docs/changes/2026-10-15-execution-safety.md)
 

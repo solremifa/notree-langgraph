@@ -24,7 +24,8 @@ Redis 없이 바로 됩니다 (fakeredis).
 uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초과·마감 초과·LangGraph 이어하기·누락 복구·되살리기·종료 처리
 uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
-uv run pytest -q                         # 37개
+uv run python -m notree.dev.qa_run       # Q&A 근거 탐색 그래프 (feat/qa-graph 실험)
+uv run pytest -q                         # 50개
 ```
 
 진짜 Redis와 프로세스 분리로 (`docker compose up -d` 후 터미널 여러 개):
@@ -50,7 +51,7 @@ notree/
 ├─ scheduler/      배정기 + 주기 작업 (누락 복구, 체크포인트 정리)
 ├─ worker/         worker 루프, lease, 핸들러 규약, MCP 클라이언트, LangGraph 체크포인트 저장기
 │   └─ handlers/   작업 종류별 핸들러 (course_update 동작, 나머지는 스텁)
-├─ graphs/         LangGraph 그래프 (course_update)
+├─ graphs/         LangGraph 그래프 (course_update, qa)
 ├─ common/         설정, 로그
 └─ dev/            데모·개발 도구
 docs/              설계·결정·계약 문서
