@@ -98,19 +98,28 @@ def label_for(related: bool, cited: list[HitDict]) -> str:
 _FOOTNOTE = re.compile(r"\s*\[\^[^\[\]\s]{1,40}\]")
 
 
-def render(sentences: list[dict], known_ids: set[str] | frozenset = frozenset()) -> tuple[str, list[str]]:
-    """문장별 {text, citations} → (화면용 본문, 인용 목록).
-    인용 표시는 [^ID] 형식으로 코드가 붙인다. LLM이 text에 넣은 표시는 [^..] 형식, 또는 이번 근거·인용 ID와 정확히 같은
-    [ID]만 지운다. 그 밖의 대괄호(a[0], [1, 2, 3], 구간 [0, 1])는 내용이므로 건드리지 않는다."""
-    parts, cites = [], []
+def clean_sentences(sentences: list[dict], known_ids: set[str] | frozenset = frozenset()) -> list[dict]:
+    """LLM이 문장 text에 넣은 인용 표시를 지운 문장 목록. 화면은 이 text를 그대로 그리고, 출처는 citations로만 만든다.
+    지우는 것: [^..] 형식, 이번 근거·인용 ID와 정확히 같은 [ID]. 그 밖의 대괄호(a[0], [1, 2, 3], 구간 [0, 1])는 내용이라 둔다."""
+    out = []
     for s in sentences:
         ids = list(dict.fromkeys(s.get("citations") or []))
         text = _FOOTNOTE.sub("", s["text"])
         for i in set(known_ids) | set(ids):
             text = re.sub(r"\s*\[" + re.escape(i) + r"\]", "", text)
-        parts.append(text.strip() + "".join(f" [^{c}]" for c in ids))
-        cites += [c for c in ids if c not in cites]
-    return " ".join(p for p in parts if p), cites
+        if text.strip():
+            out.append({"text": text.strip(), "citations": ids})
+    return out
+
+
+def render(sentences: list[dict], known_ids: set[str] | frozenset = frozenset()) -> tuple[str, list[str]]:
+    """문장별 {text, citations} → (파생 본문 answer, 인용 목록). 문장을 정제한 뒤 끝에 [^ID]를 붙여 잇는다.
+    answer는 미리보기·알림·로그용이고, 화면의 주 본문은 정제된 sentences로 그린다."""
+    cleaned = clean_sentences(sentences, known_ids)
+    cites: list[str] = []
+    for s in cleaned:
+        cites += [c for c in s["citations"] if c not in cites]
+    return " ".join(s["text"] + "".join(f" [^{c}]" for c in s["citations"]) for s in cleaned), cites
 
 
 def _llm_timeout(config: RunnableConfig) -> float:
@@ -187,9 +196,9 @@ async def answer(state: QAState, config: RunnableConfig) -> dict:
             timeout=_llm_timeout(config))
     except TimeoutError:
         return {**timed_out, "llm_calls": calls + 1}
-    sentences = [s.model_dump() for s in a.sentences]
     by_id = {h["id"]: h for h in ev}
-    text, cites = render(sentences, known_ids=set(by_id))
+    sentences = clean_sentences([s.model_dump() for s in a.sentences], known_ids=set(by_id))
+    text, cites = render(sentences)
     return {"answer": text, "sentences": sentences, "citations": cites,
             "label": label_for(related, [by_id[c] for c in cites if c in by_id]),
             "answer_attempts": attempt, "llm_calls": calls + 1,
@@ -205,17 +214,33 @@ async def verify(state: QAState) -> dict:
     return {"verify_problem": f"근거에 없는 인용 {unknown}" if unknown else ""}
 
 
+NOTICE_TEXT = {"timeout": TIMEOUT_TEXT, "insufficient": INSUFFICIENT_TEXT, "not_found": NOT_FOUND_TEXT}
+
+
+def sources_for(citations: list[str], hits: list[HitDict]) -> list[dict]:
+    """인용된 근거만 hits에서 골라 화면·저장용으로. 전체 hits는 내부 처리용이다."""
+    by_id = {h["id"]: h for h in hits}
+    return [{k: by_id[c][k] for k in ("id", "source", "text", "ref")} for c in citations if c in by_id]
+
+
 async def save(state: QAState, config: RunnableConfig) -> dict:
+    """결과 상태(status)와 안내문 코드(notice_code)를 정한다. 작업 실행 상태(done/failed)와는 다른 값이다:
+    시간 초과·근거 부족도 그래프는 정상 종료하므로 작업은 done이 된다."""
+    notice = None
     out: dict = {"status": "completed"}
     if state.get("timed_out"):
-        out.update(status="시간 초과", label="근거 부족", answer=TIMEOUT_TEXT, citations=[], sentences=[])
+        notice, out["status"] = "timeout", "시간 초과"
     elif state.get("verify_problem"):          # 재시도까지 실패 → 틀린 본문은 버리고 정해진 안내문으로
-        out.update(status="근거 부족", label="근거 부족", answer=INSUFFICIENT_TEXT, citations=[], sentences=[])
+        notice, out["status"] = "insufficient", "근거 부족"
     elif state.get("related") and not state.get("citations"):
         # 과목 질문인데 인용이 하나도 없음 → LLM 본문(근거 없이 지어냈을 수 있음)은 버리고 안내문만
-        out.update(status="근거 부족", label="근거 부족", answer=NOT_FOUND_TEXT, sentences=[])
+        notice, out["status"] = "not_found", "근거 부족"
     elif state.get("related") and state.get("needs_more"):
-        out["status"] = "부분 답변"            # 인용은 있지만 LLM이 근거가 더 필요하다고 했고, 더 찾을 곳·시간이 없음
+        out["status"] = "부분 답변"            # 인용은 있지만 LLM이 근거가 더 필요하다고 했고, 더 찾지 못함 (원인은 여러 가지)
+    if notice:
+        out.update(label="근거 부족", answer=NOTICE_TEXT[notice], citations=[], sentences=[])
+    out["notice_code"] = notice
+    out["sources"] = sources_for(out.get("citations", state.get("citations", [])), state.get("hits", []))
     sink = _cfg(config).get("sink")
     if sink is not None:
         await sink({**state, **out})

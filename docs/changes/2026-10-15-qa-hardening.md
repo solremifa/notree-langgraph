@@ -78,3 +78,14 @@ understand → search_note ─(충분)→ answer → verify ─(통과)───
 | 인용 없는 과목 답변 | LLM 본문 그대로 + 근거 부족 | 본문을 안내문으로 교체 |
 | 웹 검색 장애 | 1번 다시 요청 | 다시 요청하지 않고 건너뜀 |
 | permit | `{j, w, a, u, e}` | `{j, w, a, x, u, e}`. 실행권 확인은 `x`(실행 세대). 이전 permit은 쓰기 도구에서 `permit_invalid` |
+
+## 3차 검토 반영: 결과 계약 (같은 날)
+
+화면·API 공유 문서(Q&A 답변 결과 형식과 화면 표시)를 검토받고 코드를 맞췄습니다.
+
+- 🐛 인용 표시 정제가 `answer`에만 적용되고 `sentences[].text`에는 LLM이 넣은 `[n1]`, `[^x9]`가 남던 문제 → 문장을 먼저 정제(`clean_sentences`)하고 `answer`는 정제된 문장에서 파생
+- 🆕 `notice_code`: 안내문을 보일 때 `not_found` / `insufficient` / `timeout`, 아니면 `None`. 화면은 이 코드로 안내문을 고른다
+- 🆕 `sources`: 인용된 근거만 `{id, source, text, ref}`. 화면·저장용. 전체 `hits`는 내부 처리용
+- 결과 상태(`status`)는 작업 실행 상태(done/failed)와 별개. 시간 초과·근거 부족도 그래프는 정상 종료하므로 작업은 `done`이 된다 → "다시 묻기"는 `job_retry`가 아니라 새 Q&A 작업
+
+테스트 `test_sentences_text_is_cleaned_like_answer`, `test_sources_hold_only_cited_hits_and_notice_code_is_set`.

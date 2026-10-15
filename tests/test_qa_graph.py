@@ -308,3 +308,31 @@ def test_web_search_is_requested_at_most_once_even_on_error():
     out, _ = run_with("힙 정렬의 시간 복잡도는?", ret)
     assert ret.calls.count("web") == 1
     assert any("web: 일시 장애" in s and "건너뜀" in s for s in out["skipped"])
+
+
+# ── 결과 계약 (3차 검토) ───────────────────────────────────────────
+
+class MarkedLLM(FakeQALLM):
+    """문장 text에 인용 표시를 섞어 내는 LLM."""
+
+    async def answer(self, question, evidence, attempt, problem="", related=True):
+        from notree.graphs.qa.llm import Answer, Sentence
+        self.calls.append(f"answer#{attempt}")
+        return Answer(sentences=[Sentence(text="스택은 LIFO다 [n1] [^x9]. 예: s[0]", citations=["n1"])])
+
+
+def test_sentences_text_is_cleaned_like_answer():
+    out, _ = run_with("스택은 어떤 구조야?", ScriptedRetriever({"note": [LIFO]}), MarkedLLM())
+    assert out["sentences"] == [{"text": "스택은 LIFO다. 예: s[0]", "citations": ["n1"]}]
+    assert out["answer"] == "스택은 LIFO다. 예: s[0] [^n1]"
+
+
+def test_sources_hold_only_cited_hits_and_notice_code_is_set():
+    ret = ScriptedRetriever({"note": [LIFO, dict(CAUSE, id="n2", source="note", score=0.4)]})
+    out, _ = run_with("스택은 어떤 구조야?", ret)
+    assert out["notice_code"] is None
+    assert out["sources"] == [{"id": "n1", "source": "note", "text": LIFO["text"], "ref": "n1"}]
+    out2, _ = run_with("스택은 어떤 구조야?", ScriptedRetriever({"note": [LIFO]}), UncitedLLM())
+    assert out2["notice_code"] == "not_found" and out2["sources"] == [] and out2["sentences"] == []
+    out3, _ = run_with("스택은 어떤 구조야?", ScriptedRetriever({"note": [LIFO]}), deadline_in=-1)
+    assert out3["notice_code"] == "timeout"

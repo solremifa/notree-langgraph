@@ -31,4 +31,6 @@ class QAState(TypedDict, total=False):
     label: Label                                       # 화면에 붙일 출처 라벨
     answer_attempts: int
     verify_problem: str                                # 근거 확인 실패 사유 (없으면 "")
-    status: str                                        # completed / 부분 답변 / 근거 부족 / 시간 초과
+    status: str                                        # 결과 상태: completed / 부분 답변 / 근거 부족 / 시간 초과 (작업 상태 done/failed와 별개)
+    notice_code: str | None                            # 안내문을 보일 때: not_found / insufficient / timeout (아니면 None)
+    sources: list[dict]                                # 인용된 근거만 {id, source, text, ref} (화면·저장용. hits는 내부용)

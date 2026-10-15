@@ -11,6 +11,12 @@
 
 ## 2026-10-15
 
+### Q&A 결과 계약: 문장 정제, notice_code, sources · (이번 커밋)
+- 🐛 `sentences[].text`에 LLM이 넣은 인용 표시가 남던 문제 → 문장을 먼저 정제하고 `answer`는 거기서 파생
+- 🆕 결과에 `notice_code`(not_found / insufficient / timeout)와 `sources`(인용된 근거만) 추가
+- 🔧 `docs/changes/2026-10-15-qa-hardening.md` "3차 검토 반영"
+- 테스트 69 → 71개
+
 ### 2차 검토 반영: 인용 표시 훼손, 최종 상태, 웹 재시도, 실행 세대 · `9a91d80`
 자세히: [docs/changes/2026-10-15-qa-hardening.md](docs/changes/2026-10-15-qa-hardening.md) "2차 검토 반영"
 
