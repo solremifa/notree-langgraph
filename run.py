@@ -1,4 +1,4 @@
-"""실행기.  python run.py --help"""
+"""실행기.  uv run run.py --help"""
 import argparse
 import asyncio
 import os
@@ -87,7 +87,7 @@ async def main() -> None:
         except RuntimeError as e:
             snap = await app.aget_state(config)
             print(f"\n✖ {e}\n  남은 노드={list(snap.next)}  저장된 extract={len(snap.values.get('extracts', []))}개")
-            print(f"  이어서 실행: python run.py --saver {a.saver} --thread {thread} --resume")
+            print(f"  이어서 실행: uv run run.py --saver {a.saver} --thread {thread} --resume")
             return
         finally:
             print(f"  LLM 호출 {len(llm.CALLS)}회: {llm.CALLS}")

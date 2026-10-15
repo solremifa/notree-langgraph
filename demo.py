@@ -1,9 +1,9 @@
 """한 번에 보는 데모: api → scheduler → worker-A(죽음) → worker-B(이어받음).
 
-    python demo.py                         # Redis 없이 (fakeredis, 한 프로세스 안에서 역할별 코루틴)
-    python demo.py --redis redis://localhost:6379/0   # 진짜 Redis로
-    python demo.py --die-at publish        # 발행 직후 죽는 경우
-    python demo.py --die-at none           # 아무도 안 죽는 경우
+    uv run demo.py                         # Redis 없이 (fakeredis, 한 프로세스 안에서 역할별 코루틴)
+    uv run demo.py --redis redis://localhost:6379/0   # 진짜 Redis로
+    uv run demo.py --die-at publish        # 발행 직후 죽는 경우
+    uv run demo.py --die-at none           # 아무도 안 죽는 경우
 
 MCP 서버는 HTTP로 하나만 띄우고(compose의 mcp 컨테이너 역할), 각 역할이 따로 연결한다.
 """

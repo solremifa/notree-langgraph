@@ -1,6 +1,6 @@
 """scheduler 프로세스의 배정기(allocator).
 
-    python scheduler.py
+    uv run scheduler.py
 
 대기 중인 의도(intent)를 골라 실행 허가(reserved)를 기록하고, Redis Stream에 job_id만 XADD한 뒤
 '전송 완료'로 표시한다. api가 Redis에 직접 넣지 않는 이유는 설계서 2절(outbox) 참고.

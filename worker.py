@@ -1,7 +1,7 @@
 """worker-batch 프로세스.
 
-    python worker.py --name A                       # 계속 돌면서 작업을 받는다 (Ctrl+C로 종료)
-    python worker.py --name A --die-at extract:world  # 그 지점에서 '죽는' worker
+    uv run worker.py --name A                       # 계속 돌면서 작업을 받는다 (Ctrl+C로 종료)
+    uv run worker.py --name A --die-at extract:world  # 그 지점에서 '죽는' worker
 
 한 바퀴:
   1) XAUTOCLAIM : ACK 없이 CLAIM_IDLE_MS 넘게 방치된 메시지(= 죽은 worker의 작업)를 내 것으로 가져옴

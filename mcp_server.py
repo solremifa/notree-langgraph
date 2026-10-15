@@ -8,8 +8,8 @@
 
 실행
   stdio : run.py가 하위 프로세스로 자동으로 띄운다
-  HTTP  : python mcp_server.py --http   (compose의 내부 mcp 컨테이너 역할, 기본 127.0.0.1:8765/mcp)
-  확인  : mcp dev mcp_server.py
+  HTTP  : uv run mcp_server.py --http   (compose의 내부 mcp 컨테이너 역할, 기본 127.0.0.1:8765/mcp)
+  확인  : uv run mcp dev mcp_server.py
 """
 import json
 import os

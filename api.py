@@ -1,6 +1,6 @@
 """api 역할: 과목 노트 업데이트 요청을 받아 의도(intent)만 남긴다.
 
-    python api.py --lectures hello,big,world
+    uv run api.py --lectures hello,big,world
 """
 import argparse
 import asyncio

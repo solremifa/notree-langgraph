@@ -118,29 +118,29 @@ Redis가 아는 건 "ACK가 오래 안 왔다"뿐이라서, 살아 있는지는 
 ## 7. 돌려 보기
 
 ```powershell
-python demo.py                          # Redis 없이 (fakeredis). api·scheduler·worker A·B를 한 프로세스에서
-python demo.py --die-at publish         # 발행 직후 죽는 경우
-python demo.py --die-at none            # 아무도 안 죽는 경우
-pytest -q tests/test_worker.py          # 죽음 인계 · 중복 발행 방지 · 느린 worker 보호
+uv run demo.py                          # Redis 없이 (fakeredis). api·scheduler·worker A·B를 한 프로세스에서
+uv run demo.py --die-at publish         # 발행 직후 죽는 경우
+uv run demo.py --die-at none            # 아무도 안 죽는 경우
+uv run pytest -q tests/test_worker.py   # 죽음 인계 · 중복 발행 방지 · 느린 worker 보호
 ```
 
 진짜 Redis와 별도 프로세스로 (`docker compose up -d`로 Redis를 띄운 뒤, 터미널 4개):
 
 ```powershell
-python mcp_server.py --http                     # 1
-python scheduler.py                             # 2
-python worker.py --name A --die-at extract:world  # 3
-python worker.py --name B                       # 4
-python api.py --lectures hello,big,world        # 요청
+uv run mcp_server.py --http                     # 1
+uv run scheduler.py                             # 2
+uv run worker.py --name A --die-at extract:world  # 3
+uv run worker.py --name B                       # 4
+uv run api.py --lectures hello,big,world        # 요청
 ```
 
-일부러 죽이는 대신 진짜로 창을 닫아 보려면, 3번을 `$env:NOTREE_FAKE_DELAY="5"; python worker.py --name A`로 띄워
+일부러 죽이는 대신 진짜로 창을 닫아 보려면, 3번을 `$env:NOTREE_FAKE_DELAY="5"; uv run worker.py --name A`로 띄워
 가짜 LLM 호출이 5초씩 걸리게 한 뒤 extract 로그가 찍힐 때 창을 닫으면 됩니다.
 
 ```powershell
 
 
-`python demo.py` 실제 출력 (발췌):
+`uv run demo.py` 실제 출력 (발췌):
 
 ```
 ── 2. 사용자 요청 → api가 의도 기록 → scheduler가 큐에 넣음 → worker-A가 받음

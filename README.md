@@ -48,38 +48,44 @@ api → scheduler(배정기) → Redis Streams → worker → (죽으면) 다른
 흐름 설명은 **[docs/worker-flow.md](docs/worker-flow.md)** 에 따로 정리했습니다.
 
 ```powershell
-python demo.py                    # Redis 없이 한 번에: worker-A가 extract 도중 죽고 worker-B가 체크포인트에서 이어감
-python demo.py --die-at publish   # 발행 직후 죽음 → 중복 발행 없이 마무리
+uv run demo.py                    # Redis 없이 한 번에: worker-A가 extract 도중 죽고 worker-B가 체크포인트에서 이어감
+uv run demo.py --die-at publish   # 발행 직후 죽음 → 중복 발행 없이 마무리
 ```
 
-## 설치 (Windows PowerShell 기준)
+## 설치 (uv)
+
+[uv](https://docs.astral.sh/uv/)로 관리합니다. 의존성은 `pyproject.toml`, 고정 버전은 `uv.lock`에 있습니다.
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+# uv가 없으면 (Windows PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+uv sync            # .venv 생성 + uv.lock 그대로 설치 (Python 3.11 이상)
 ```
+
+가상환경을 직접 켤 필요 없이 `uv run <스크립트>`로 실행합니다.
+의존성을 추가할 때는 `uv add <패키지>`(개발용은 `uv add --dev <패키지>`)를 쓰고 `uv.lock`도 함께 커밋합니다.
 
 ## 돌려 보기
 
 ```powershell
-python run.py                                   # 정상 경로 (A안, MCP)
-python run.py --sloppy once                     # validate 실패 → merge 재시도 분기
-python run.py --sloppy always                   # 재시도 한도 → 확인 필요 분기
-python run.py --lectures a,b,c,d                # extract 4개 병렬
+uv run run.py                                   # 정상 경로 (A안, MCP)
+uv run run.py --sloppy once                     # validate 실패 → merge 재시도 분기
+uv run run.py --sloppy always                   # 재시도 한도 → 확인 필요 분기
+uv run run.py --lectures a,b,c,d                # extract 4개 병렬
 
 # worker가 죽었다가 다른 worker가 이어받는 상황
-python run.py --thread op1 --lectures hello,big,world --crash-at extract:world
-python run.py --thread op1 --resume             # 끝난 extract 2개는 다시 안 부름 (LLM 호출 수로 확인)
+uv run run.py --thread op1 --lectures hello,big,world --crash-at extract:world
+uv run run.py --thread op1 --resume             # 끝난 extract 2개는 다시 안 부름 (LLM 호출 수로 확인)
 
 # 발행 커밋 직후 죽는 상황
-python run.py --thread op2 --crash-at publish
-python run.py --thread op2 --resume             # "중복 발행 막음"
+uv run run.py --thread op2 --crash-at publish
+uv run run.py --thread op2 --resume             # "중복 발행 막음"
 
-python run.py --thread op1 --history            # 체크포인트 이력 (MCP checkpoint_list)
-python run.py --saver sqlite                    # 비교: worker가 DB 파일에 직접
-python run.py --graph                           # Mermaid 그래프 → out/graph.mmd (mermaid.live 에 붙여 넣기)
-pytest -q                                       # 12개: 그래프 시나리오 9개 + worker 인계 시나리오 3개
+uv run run.py --thread op1 --history            # 체크포인트 이력 (MCP checkpoint_list)
+uv run run.py --saver sqlite                    # 비교: worker가 DB 파일에 직접
+uv run run.py --graph                           # Mermaid 그래프 → out/graph.mmd (mermaid.live 에 붙여 넣기)
+uv run pytest -q                                # 12개: 그래프 시나리오 9개 + worker 인계 시나리오 3개
 ```
 
 출력의 `💾 checkpoint step=N 다음=[...]`이 단계(super-step)마다 상태를 저장하는 지점이고,
@@ -98,14 +104,14 @@ pytest -q                                       # 12개: 그래프 시나리오 
   LLM 호출 2회: ['extract:world', 'merge#1']
 ```
 
-MCP 서버 도구를 직접 눌러 보려면 `mcp dev mcp_server.py` (MCP Inspector).
+MCP 서버 도구를 직접 눌러 보려면 `uv run mcp dev mcp_server.py` (Node.js 필요) (MCP Inspector).
 
 ## 실제 OpenAI로
 
 ```powershell
 $env:OPENAI_API_KEY="sk-..."
 $env:NOTREE_MODEL="gpt-4o-mini"                  # 생략 시 gpt-4o-mini
-python run.py --llm openai
+uv run run.py --llm openai
 ```
 
 실제 모델은 문장을 자유롭게 바꾸기 때문에 validate에서 걸려 재시도·'확인 필요' 분기가 자연스럽게 나올 수 있습니다.
