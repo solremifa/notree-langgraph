@@ -11,7 +11,7 @@
 
 ## 2026-10-15
 
-### 저장소 정리: 코드를 notree/ 안으로 · (이번 커밋)
+### 저장소 정리: 코드를 notree/ 안으로 · `215a7b6`
 루트에 있던 1차 PoC 파일을 정리했습니다. 정리 전 상태는 `archive/poc-v1` 브랜치에 그대로 있습니다 (`git checkout archive/poc-v1`).
 
 - 🔧 `mcp_server.py` → `notree/mcp_server/server.py`
