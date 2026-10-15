@@ -5,8 +5,7 @@
 3. lease를 잃은 이전 실행자의 permit으로 쓰기가 성공함 (실행 세대 검증 없음)
 4. 슬롯이 꽉 찬 상태에서 종료 신호를 받으면 유예 시간이 바로 시작되지 않음
 
-지금은 모두 '알려진 버그'(xfail strict)로 표시돼 있다. 고치면 strict 때문에 XPASS가 실패로 잡히므로
-고친 항목의 표시를 반드시 지우게 된다.
+처음엔 '알려진 버그'(xfail strict)로 올렸고, 고친 뒤 표시를 지웠다.
 """
 import asyncio
 import dataclasses
@@ -14,7 +13,6 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,16 +22,11 @@ from notree.worker.loop import Worker  # noqa: E402
 from test_skeleton import RT, Env  # noqa: E402
 
 
-def known_bug(n: int):
-    return pytest.mark.xfail(strict=True, reason=f"알려진 버그 {n}번 (CHANGELOG 2026-10-15 참고)")
-
-
 async def job_rt(e: Env, payload: dict) -> str:
     return (await e.api.tool("job_create", kind="echo", payload=payload, user_id="u-t", stream=RT.stream))["job_id"]
 
 
 # ── 1. 자기 메시지 재회수로 인한 중복 실행 ─────────────────────────
-@known_bug(1)
 def test_worker_does_not_reclaim_its_own_running_job(tmp_path, capsys):
     """재배송 기준(0.6초)보다 오래 걸리는 작업 + 빈 슬롯 → 같은 worker가 다시 가져가면 안 된다."""
     cfg = dataclasses.replace(RT, lease_sec=3.0, heartbeat_sec=0.3, claim_idle_ms=600, job_timeout_sec=10,
@@ -52,7 +45,6 @@ def test_worker_does_not_reclaim_its_own_running_job(tmp_path, capsys):
     assert capsys.readouterr().out.count("'only-once'") == 1, "핸들러가 두 번 실행됨"
 
 
-@known_bug(1)
 def test_job_start_rejects_live_lease_even_for_same_worker(tmp_path):
     async def t():
         async with Env(tmp_path, allocator=False) as e:
@@ -82,7 +74,6 @@ class FlakyMcp:
         return getattr(self.inner, item)
 
 
-@known_bug(2)
 def test_finish_failure_does_not_lose_the_job(tmp_path):
     """job_finish가 일시적으로 실패해도 작업이 'DB는 running, Redis에선 사라짐' 상태로 버려지면 안 된다.
     최종적으로 done이 되고 ACK도 끝나야 한다 (재시도든 재배송이든)."""
@@ -100,7 +91,6 @@ def test_finish_failure_does_not_lose_the_job(tmp_path):
 
 
 # ── 3. 이전 실행자의 permit ───────────────────────────────────────
-@known_bug(3)
 def test_stale_permit_cannot_write_after_takeover(tmp_path):
     async def t():
         async with Env(tmp_path, allocator=False) as e:
@@ -127,7 +117,6 @@ def test_stale_permit_cannot_write_after_takeover(tmp_path):
     asyncio.run(t())
 
 
-@known_bug(3)
 def test_previous_attempt_permit_is_rejected_for_same_worker(tmp_path):
     """같은 worker 이름이라도 이전 시도(실행 세대)의 permit은 무효여야 한다."""
     async def t():
@@ -145,7 +134,6 @@ def test_previous_attempt_permit_is_rejected_for_same_worker(tmp_path):
 
 
 # ── 4. 슬롯이 꽉 찬 상태의 종료 ───────────────────────────────────
-@known_bug(4)
 def test_shutdown_grace_starts_immediately_when_slots_are_full(tmp_path):
     cfg = dataclasses.replace(RT, concurrency=1, job_timeout_sec=30)
 

@@ -47,19 +47,20 @@ notree/
 ```
 allocator.run_allocator     job_reserve_pending → XADD {job_id} → job_mark_sent
         ▼
-Worker.run                  빈 슬롯이 있을 때만 _next()
+Worker.run                  빈 슬롯이 생기거나 종료 신호가 올 때까지 대기 → _next()
 Worker._next                XAUTOCLAIM(방치된 것 먼저) → 없으면 XREADGROUP
 Worker.process              job_start → data.status
                                       ├ done/failed/unknown → XACK
-                                      ├ leased → 손대지 않음
+                                      ├ leased → 손대지 않음 (같은 worker라도)
                                       └ started → JobContext 만들고 (permit, 시도 한도, 마감 시각)
-                            async with Lease(ctx):                     ← heartbeat 시작
+                            async with Lease(ctx, touch):              ← heartbeat + Redis 방치 시간 초기화
                                 await wait_for(handler(ctx), min(job_timeout, 마감까지 남은 시간))
-                            ├ 성공            job_finish → XACK
-                            ├ FatalError      job_fail(다시 시도 불가) → XACK
-                            ├ 마감 지남·초과   job_fail(다시 시도 가능) → XACK   ※ 재시도 안 함
+                            ├ 성공            job_finish 확정 → XACK
+                            ├ FatalError      job_fail(다시 시도 불가) 확정 → XACK
+                            ├ 마감 지남·초과   job_fail(다시 시도 가능) 확정 → XACK   ※ 재시도 안 함
                             ├ 그 밖의 예외     시도 < 한도: job_release (ACK 없음 → claim_idle 뒤 재배송)
-                            │                  시도 = 한도: job_fail(다시 시도 가능) → XACK
+                            │                  시도 = 한도: job_fail(다시 시도 가능) 확정 → XACK
+                            │  ※ 확정 응답을 못 받으면 ACK하지 않는다 (재배송으로 다시 처리)
                             ├ LeaseLost       아무것도 안 함 (다른 worker 것)
                             └ 종료로 취소      job_release (ACK 없음 → 곧 다른 worker가 잡음)
 

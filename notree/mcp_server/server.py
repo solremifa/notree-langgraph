@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -102,6 +103,23 @@ def db() -> sqlite3.Connection:
     return con
 
 
+@contextmanager
+def tx():
+    """쓰기 트랜잭션. BEGIN IMMEDIATE로 시작해 '실행권 확인'과 '쓰기' 사이에 다른 쓰기가 끼어들지 못하게 한다.
+    (PG로 옮기면 SELECT ... FOR UPDATE 또는 조건부 UPDATE 한 문장으로 같은 효과)"""
+    con = sqlite3.connect(DB, timeout=10, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
 def _log(con, tool: str, thread_id: str) -> None:
     con.execute("INSERT INTO tool_log(tool, thread_id) VALUES(?,?)", (tool, thread_id))
 
@@ -136,7 +154,8 @@ def tool(fn):
 
 
 # ── permit (팀 결정 4번) ─────────────────────────────────────────
-# 형식: base64url({"j": job_id, "w": worker, "u": user_id, "e": 만료}) + "." + HMAC-SHA256 앞 32자
+# 형식: base64url({"j": job_id, "w": worker, "a": 시도 번호(실행 세대), "u": user_id, "e": 만료}) + "." + HMAC 앞 32자
+# 서명은 '위조되지 않았다'만 증명한다. '지금도 실행권이 있다'는 쓰기 트랜잭션 안에서 _require_live()로 DB와 대조한다.
 PERMIT_SECRET = os.getenv("NOTREE_PERMIT_SECRET", "dev-only-secret").encode()
 PERMIT_TTL = {"notree:rt": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
               "notree:batch": float(os.getenv("NOTREE_PERMIT_TTL_BATCH", "1800"))}
@@ -147,8 +166,9 @@ def _sign(body: str) -> str:
     return hmac.new(PERMIT_SECRET, body.encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def _issue_permit(job_id: str, worker: str, user_id: str, stream: str) -> str:
-    claims = {"j": job_id, "w": worker, "u": user_id, "e": int(time.time() + PERMIT_TTL.get(stream, 1800))}
+def _issue_permit(job_id: str, worker: str, attempt: int, user_id: str, stream: str) -> str:
+    claims = {"j": job_id, "w": worker, "a": attempt, "u": user_id,
+              "e": int(time.time() + PERMIT_TTL.get(stream, 1800))}
     body = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
     return f"{body}.{_sign(body)}"
 
@@ -173,6 +193,21 @@ def _claims(permit: str | None, job_id: str) -> dict | None:
     return claims
 
 
+def _is_live(con, claims: dict | None, job_id: str) -> bool:
+    """permit의 실행자가 지금도 이 작업의 실행권을 가졌는지: running이고, 소유자와 실행 세대(시도 번호)가 같아야 한다.
+    permit 없이 부르는 경우(REQUIRE_PERMIT=0, 작업 밖에서 그래프만 돌릴 때)는 검사하지 않는다."""
+    if claims is None:
+        return True
+    r = con.execute("SELECT state, lease_owner, attempts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    return bool(r) and r["state"] == "running" and r["lease_owner"] == claims["w"] and r["attempts"] == claims.get("a")
+
+
+def _require_live(con, claims: dict | None, job_id: str) -> None:
+    """쓰기 도구용: 실행권이 없으면 거절 (lease를 잃은 이전 실행자, 이전 시도, 이미 끝난 작업)."""
+    if not _is_live(con, claims, job_id):
+        raise Reject(ErrorCode.PERMIT_INVALID, "실행권 없음 (다른 실행으로 넘어갔거나 이미 끝난 작업)")
+
+
 # ── 체크포인트 (thread_id = job_id) ──────────────────────────────
 def _row_to_ck(con, r) -> dict:
     ws = con.execute(
@@ -191,8 +226,9 @@ def _row_to_ck(con, r) -> dict:
 def checkpoint_put(thread_id: str, ns: str, checkpoint_id: str, parent_id: str | None,
                    checkpoint: list[str], metadata: list[str], permit: str | None = None) -> dict:
     """단계(super-step)가 끝날 때 상태 전체를 저장한다."""
-    _claims(permit, thread_id)
-    with db() as con:
+    claims = _claims(permit, thread_id)
+    with tx() as con:
+        _require_live(con, claims, thread_id)
         con.execute("INSERT OR REPLACE INTO checkpoints VALUES(?,?,?,?,?,?,?,?)",
                     (thread_id, ns, checkpoint_id, parent_id, *checkpoint, *metadata))
         _log(con, "checkpoint_put", thread_id)
@@ -203,8 +239,9 @@ def checkpoint_put(thread_id: str, ns: str, checkpoint_id: str, parent_id: str |
 def checkpoint_put_writes(thread_id: str, ns: str, checkpoint_id: str, task_id: str, task_path: str,
                           writes: list[list], permit: str | None = None) -> dict:
     """노드 하나의 결과(pending write) 저장. idx<0(특수 채널)은 덮어쓰고, idx>=0은 이미 있으면 유지."""
-    _claims(permit, thread_id)
-    with db() as con:
+    claims = _claims(permit, thread_id)
+    with tx() as con:
+        _require_live(con, claims, thread_id)
         for idx, channel, v_type, v_b64 in writes:
             verb = "INSERT OR REPLACE" if idx < 0 else "INSERT OR IGNORE"
             con.execute(f"{verb} INTO writes VALUES(?,?,?,?,?,?,?,?,?)",
@@ -251,8 +288,9 @@ def checkpoint_list(thread_id: str, ns: str | None = None, before: str | None = 
 @tool
 def checkpoint_delete_thread(thread_id: str, permit: str | None = None) -> dict:
     """thread 하나의 체크포인트를 지운다."""
-    _claims(permit, thread_id)
-    with db() as con:
+    claims = _claims(permit, thread_id)
+    with tx() as con:
+        _require_live(con, claims, thread_id)
         for t in ("checkpoints", "writes"):
             con.execute(f"DELETE FROM {t} WHERE thread_id=?", (thread_id,))
         _log(con, "checkpoint_delete_thread", thread_id)
@@ -338,16 +376,17 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
 
 @tool
 def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
-    """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown."""
+    """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
+    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지)."""
     now = time.time()
-    with db() as con:
+    with tx() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         _log(con, "job_start", job_id)
         if not r:
             return ok(C.JobStartOut(status="unknown"))
         if r["state"] in ("done", "failed"):
             return ok(C.JobStartOut(status=r["state"]))
-        if r["state"] == "running" and r["lease_owner"] != worker and (r["lease_until"] or 0) > now:
+        if r["state"] == "running" and (r["lease_until"] or 0) > now:
             return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
                                     lease_left_sec=round(r["lease_until"] - now, 1)))
         _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
@@ -355,14 +394,16 @@ def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
         return ok(C.JobStartOut(
             status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1,
             previous_owner=r["lease_owner"],
-            permit=_issue_permit(job_id, worker, r["user_id"] or "anonymous", r["stream"])))
+            permit=_issue_permit(job_id, worker, r["attempts"] + 1, r["user_id"] or "anonymous", r["stream"])))
 
 
 @tool
 def job_heartbeat(job_id: str, worker: str, lease_sec: float, permit: str | None = None) -> dict:
-    """[worker] lease 연장. renewed=false면 다른 worker에게 넘어간 것."""
-    _claims(permit, job_id)
-    with db() as con:
+    """[worker] lease 연장. renewed=false면 실행권을 잃은 것 (다른 worker·다른 시도로 넘어감)."""
+    claims = _claims(permit, job_id)
+    with tx() as con:
+        if not _is_live(con, claims, job_id):
+            return ok(C.JobHeartbeatOut(renewed=False))
         cur = con.execute("UPDATE jobs SET lease_until=? WHERE job_id=? AND lease_owner=? AND state='running'",
                           (time.time() + lease_sec, job_id, worker))
         return ok(C.JobHeartbeatOut(renewed=cur.rowcount == 1))
@@ -370,22 +411,26 @@ def job_heartbeat(job_id: str, worker: str, lease_sec: float, permit: str | None
 
 @tool
 def job_finish(job_id: str, worker: str, permit: str | None = None) -> dict:
-    """[worker] 완료 표시. 이 뒤에 XACK."""
-    _claims(permit, job_id)
-    with db() as con:
+    """[worker] 완료 표시. finished=true를 확인한 뒤에만 XACK한다. 실행권이 없으면 finished=false."""
+    claims = _claims(permit, job_id)
+    with tx() as con:
+        if not _is_live(con, claims, job_id):
+            return ok(C.JobFinishOut(finished=False))
         cur = con.execute("UPDATE jobs SET state='done', lease_until=NULL, updated_at=? "
-                          "WHERE job_id=? AND lease_owner=?", (time.time(), job_id, worker))
+                          "WHERE job_id=? AND lease_owner=? AND state='running'", (time.time(), job_id, worker))
         _log(con, "job_finish", job_id)
         return ok(C.JobFinishOut(finished=cur.rowcount == 1))
 
 
 @tool
 def job_fail(job_id: str, worker: str, reason: str, user_retryable: bool, permit: str | None = None) -> dict:
-    """[worker] 실패 확정. 이 뒤에 XACK. user_retryable은 화면의 '다시 시도' 버튼 근거 (팀 결정 3·7번)."""
-    _claims(permit, job_id)
-    with db() as con:
+    """[worker] 실패 확정. failed=true를 확인한 뒤에만 XACK. user_retryable은 화면의 '다시 시도' 버튼 근거."""
+    claims = _claims(permit, job_id)
+    with tx() as con:
+        if not _is_live(con, claims, job_id):
+            return ok(C.JobFailOut(failed=False))
         cur = con.execute("UPDATE jobs SET state='failed', lease_until=NULL, fail_reason=?, user_retryable=?, "
-                          "updated_at=? WHERE job_id=? AND lease_owner=?",
+                          "updated_at=? WHERE job_id=? AND lease_owner=? AND state='running'",
                           (reason, int(user_retryable), time.time(), job_id, worker))
         _log(con, "job_fail", job_id)
         return ok(C.JobFailOut(failed=cur.rowcount == 1))
@@ -394,8 +439,10 @@ def job_fail(job_id: str, worker: str, reason: str, user_retryable: bool, permit
 @tool
 def job_release(job_id: str, worker: str, reason: str, permit: str | None = None) -> dict:
     """[worker] 일시적 실패. lease를 바로 반납해 재배송 때 누구든 곧바로 잡을 수 있게 한다. ACK는 안 함."""
-    _claims(permit, job_id)
-    with db() as con:
+    claims = _claims(permit, job_id)
+    with tx() as con:
+        if not _is_live(con, claims, job_id):
+            return ok(C.JobReleaseOut(released=False))
         cur = con.execute("UPDATE jobs SET state='sent', lease_until=NULL, fail_reason=?, updated_at=? "
                           "WHERE job_id=? AND lease_owner=? AND state='running'",
                           (reason, time.time(), job_id, worker))
@@ -444,7 +491,8 @@ def note_publish(idem_key: str, course: str, note: str, status: str, permit: str
     실제 설계의 발행 게이트(세대·출처 확인)는 여기서 한다."""
     claims = _claims(permit, idem_key)
     user = claims["u"] if claims else "anonymous"
-    with db() as con:
+    with tx() as con:
+        _require_live(con, claims, idem_key)          # lease를 잃은 이전 실행자의 발행을 막는다
         cur = con.execute("INSERT OR IGNORE INTO notes(idem_key, course, note, status, user_id) VALUES(?,?,?,?,?)",
                           (idem_key, course, note, status, user))
         _log(con, "note_publish", idem_key)

@@ -59,9 +59,11 @@
 
 ## 4. permit 토큰
 
-- 형식: `base64url({"j": job_id, "w": worker, "u": user_id, "e": 만료}).HMAC-SHA256 앞 32자`
+- 형식: `base64url({"j": job_id, "w": worker, "a": 시도 번호(실행 세대), "u": user_id, "e": 만료}).HMAC-SHA256 앞 32자`
 - `job_start`가 발급하고, worker는 이후 모든 도구 호출에 붙입니다 (`ctx.tool()`이 자동으로).
 - 서버는 서명·만료·job_id 일치를 확인하고, **사용자 ID를 permit에서 꺼내 씁니다.** 도구 인자로 사용자 ID를 받지 않습니다.
+- **쓰기 도구는 같은 트랜잭션 안에서 실행권을 다시 확인합니다**: 작업이 `running`이고, 소유자와 실행 세대(시도 번호)가 permit과 같아야 합니다.
+  서명은 "위조되지 않았다"만 증명하므로, lease를 잃은 이전 실행자나 이전 시도의 permit은 이 검사로 막힙니다 (2026-10-15 추가).
   실제 구현에서는 이 값으로 `SET LOCAL app.user_id = …` → RLS. (PoC에서는 `note_publish`가 permit의 사용자 ID로 저장)
 - 유효 시간: rt 5분, batch 30분 (`NOTREE_PERMIT_TTL_RT/_BATCH`). 시도할 때마다 새로 발급됩니다.
 - 비밀키: `NOTREE_PERMIT_SECRET` 환경변수. 배포 시 GitHub Actions secret / 서버 `.env`. 키를 바꾸면 진행 중 작업의 permit이 무효가 되므로 worker를 먼저 비우고 바꿉니다.

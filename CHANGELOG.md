@@ -11,6 +11,21 @@
 
 ## 2026-10-15
 
+### 실행 안정성 4건 수정 · (이번 커밋)
+자세히: [docs/changes/2026-10-15-execution-safety.md](docs/changes/2026-10-15-execution-safety.md)
+
+- 🐛 같은 worker가 자기 실행 중인 메시지를 다시 가져와 중복 실행하던 문제: heartbeat마다 Redis 방치 시간 초기화(`XCLAIM … JUSTID`),
+  `job_start`가 살아 있는 lease면 같은 worker도 거절, worker 내부 실행 중 목록
+- 🐛 완료 기록 실패 후에도 ACK해 작업이 버려지던 문제: 완료·실패 표시를 최대 3번 시도하고 **확정 응답일 때만 ACK**
+- 🐛 lease를 잃은 실행자의 permit으로 쓰기가 성공하던 문제: permit에 실행 세대(시도 번호), 쓰기 트랜잭션 안에서 소유자·세대를 DB와 대조
+- 🐛 슬롯이 꽉 찬 상태에서 종료 신호를 못 보던 문제: 슬롯 대기와 종료 신호를 함께 기다림
+- 🔧 `tests/test_robustness.py`의 xfail 표시 제거 → 6개 통과 (총 37개)
+- 🔧 문서: `worker-flow.md`(한 바퀴·죽거나 느릴 때·알게 된 것), `worker-structure.md`, `team-decisions.md` 4번, 도구 계약 설명
+- ⚠️ permit 형식에 `a`(실행 세대) 추가 → 이전 permit은 쓰기 도구에서 `permit_invalid`
+- ⚠️ `job_start`가 같은 worker라도 살아 있는 lease면 `leased`
+- ⚠️ `job_finish`·`job_fail`·`job_release`·`job_heartbeat`가 실행권(소유자·세대·running)이 없으면 `false`
+- 이제 `notree/worker/`를 팀 저장소로 옮겨도 되는 조건(위 네 가지)이 충족됨
+
 ### 실행 안정성 회귀 테스트 추가 (아직 수정 전) · `2c85706`
 외부 분석에서 지적된 네 가지 문제를 재현하는 테스트. 지금은 모두 실패하며, `xfail(strict=True)`로 표시해 둠.
 고치면 그 테스트의 표시를 지운다 (안 지우면 strict 때문에 실패).

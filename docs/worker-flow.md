@@ -66,18 +66,22 @@ sequenceDiagram
 ## 3. worker 한 바퀴
 
 ```
-while 안 멈췄으면:
+while 종료 신호가 없으면:
+  0) 빈 슬롯 대기 : 슬롯이 비거나 종료 신호가 오면 깨어남 (꽉 찬 채로 종료 신호를 놓치지 않음)
   1) XAUTOCLAIM   : ACK 없이 재배송 기준 넘게 방치된 메시지가 있으면 내 것으로 가져옴 (= 죽은 worker의 작업)
   2) XREADGROUP   : 없으면 새 메시지 대기
-  3) job_start    : ├ done / failed  → 이미 끝난 작업. XACK만 하고 넘어감
-                    ├ leased         → 다른 worker가 살아서 하는 중. 손대지 않음
-                    └ started        → lease + permit 획득
-  4) 핸들러        : (과목 노트) LangGraph 상태를 먼저 조회
+  3) 이미 이 worker가 실행 중인 job이면 손대지 않음
+  4) job_start    : ├ done / failed  → 이미 끝난 작업. XACK만 하고 넘어감
+                    ├ leased         → lease가 살아 있음(같은 worker라도). 손대지 않음
+                    └ started        → lease + permit(실행 세대 포함) 획득
+  5) 핸들러        : (과목 노트) LangGraph 상태를 먼저 조회
                     ├ 체크포인트 없음                → 처음부터 ainvoke(입력)
                     ├ 체크포인트 있고 남은 노드 있음   → ainvoke(None) = 이어하기
                     └ 그래프는 이미 끝남              → 마무리만
-                    실행 중에는 heartbeat마다 job_heartbeat
-  5) 결과별        : 성공 job_finish → XACK / 영구 실패·한도 초과·마감 초과 job_fail → XACK / 일시적 실패 job_release
+                    실행 중에는 heartbeat마다 job_heartbeat + Redis 방치 시간 초기화(XCLAIM JUSTID)
+  6) 결과별        : 성공 job_finish / 영구 실패·한도 초과·마감 초과 job_fail → **확정 응답을 받은 뒤에만** XACK
+                    일시적 실패 job_release (ACK 안 함)
+                    확정을 못 받으면(장애·실행권 없음) ACK 안 함 → 재배송으로 다시 처리
 ```
 
 코드: `notree/worker/loop.py`의 `Worker._next`, `Worker.process`, `notree/worker/handlers/course_update.py`.
@@ -89,7 +93,9 @@ while 안 멈췄으면:
 | **extract 도중 죽음** | ACK·heartbeat가 멈춤 → lease 만료 → 메시지가 재배송 기준 넘게 방치됨 → 다른 worker가 `XAUTOCLAIM` → `job_start` 성공 → 체크포인트에서 이어감 | 이미 끝난 extract는 다시 안 부름 |
 | **merge 도중 `kill -9`** | 위와 같음. 마지막 체크포인트가 "extract 끝, merge 남음"이라 merge부터 | 실제 SIGKILL로 확인 |
 | **발행 직후 죽음** (DB엔 저장됐는데 ACK 전) | 넘겨받은 worker가 publish를 다시 실행 → 같은 멱등키라 `note_publish`가 `duplicate: true` | 노트는 한 번만 저장 |
-| **느리지만 살아 있음** | 메시지가 오래 방치돼 다른 worker가 `XAUTOCLAIM`은 함. 하지만 `job_start`가 "lease 보유 중"(`leased`)으로 거절 | 원래 worker가 끝까지 처리 |
+| **느리지만 살아 있음** | heartbeat마다 Redis 방치 시간을 초기화하므로 재배송 대상이 되지 않음. 그래도 넘어가면 `job_start`가 `leased`로 거절 | 원래 worker가 끝까지 처리 (같은 worker가 자기 메시지를 다시 가져가는 것도 막음) |
+| **완료 기록 실패** | `job_finish`를 몇 번 다시 시도, 확정 못 받으면 ACK 안 함 → lease 만료 뒤 재배송 → 다시 실행(멱등) → 완료 | DB `running`인데 메시지만 사라지는 일이 없음 |
+| **lease를 잃은 실행자가 늦게 저장** | 쓰기 도구가 같은 트랜잭션에서 permit의 소유자·실행 세대를 DB와 대조 → `permit_invalid` | 넘겨받은 실행만 저장 가능 |
 | **일시적 오류** | lease 반납 후 재배송 → 시도 한도까지 재시도 | 한도 넘으면 실패 확정 (다시 시도 가능) |
 | **배정기가 허가 직후 죽음** | DB는 `reserved`인데 Redis 메시지 없음 → scheduler 주기 작업이 30초 뒤 다시 XADD | 실행됨 |
 
@@ -153,9 +159,11 @@ lease가 만료되고 재배송 기준(batch 90초)이 지난 뒤 4번이 이어
   heartbeat 코루틴이 못 돌아 lease가 만료되고, 살아 있는데도 작업을 빼앗긴다.
   LLM 호출은 비동기 클라이언트로 하거나, 동기 노드는 스레드에서 돌게 둬야 한다
   (LangGraph는 동기 노드를 스레드에서 돌려 주므로 이 PoC는 괜찮았음).
-- **`XAUTOCLAIM`은 lease와 상관없이 메시지 소유권을 옮긴다.** 그래서 느린 worker의 메시지를 다른 worker가 계속 가져갔다가
-  `job_start`에서 거절당하는 일이 재배송 기준마다 반복된다. 해는 없지만 로그가 생긴다.
-  ACK는 소유자와 상관없이 되므로 원래 worker가 끝내면 정상으로 정리된다.
+- **heartbeat는 DB만이 아니라 Redis도 건드려야 한다.** 처음에는 DB의 lease만 연장해서, 오래 걸리는 작업이 Redis 입장에서는
+  계속 '방치된 메시지'였다. 그 결과 다른 worker는 물론 **같은 worker도 자기 메시지를 다시 가져가 중복 실행**했다
+  (외부 분석으로 발견, 재현 시 한 작업이 3번 시작됨). 지금은 heartbeat마다 `XCLAIM … JUSTID`로 방치 시간을 0으로 되돌린다.
+- **"확정 전에는 ACK하지 않는다".** 완료 표시가 실패했는데 ACK하면 DB는 `running`, Redis에는 메시지가 없어 누구도 다시 처리하지 않는다.
+- **서명된 permit ≠ 지금의 실행권.** 서명은 위조가 아님만 증명한다. 실행권은 쓰기 순간 DB(소유자·실행 세대)와 대조해야 한다.
 - **lease 시각은 MCP 서버 시계 기준이다.** worker 시계가 틀려도 영향이 없다.
 - **fakeredis에서는 `BLOCK`이 이벤트 루프를 멈춘다.** 그래서 데모·테스트에서는 막지 않고 0.2초 간격으로 폴링한다.
   진짜 Redis에서는 `BLOCK 1000`을 쓴다.

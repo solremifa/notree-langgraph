@@ -24,7 +24,7 @@ Redis 없이 바로 됩니다 (fakeredis).
 uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초과·마감 초과·LangGraph 이어하기·누락 복구·되살리기·종료 처리
 uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
-uv run pytest -q                         # 31개
+uv run pytest -q                         # 37개
 ```
 
 진짜 Redis와 프로세스 분리로 (`docker compose up -d` 후 터미널 여러 개):

@@ -7,6 +7,7 @@
 
 - 이름: `영역_동사`, 소문자·밑줄 (OpenAI 함수 이름은 점을 허용하지 않음)
 - worker가 부르는 도구는 모두 `permit`을 받는다 (`job_start` 제외). 사용자 ID 등 permit으로 알 수 있는 값은 인자로 받지 않는다
+- 쓰기 도구는 같은 트랜잭션 안에서 permit의 실행권(작업이 running, 소유자·실행 세대 일치)을 확인한다. 없으면 `permit_invalid`
 - 쓰기 도구는 `idem_key`(= job_id), 삭제·취소 영향을 받는 쓰기는 `expected_generation`을 받는다
 - 응답: `{ok: true, data}` / `{ok: true, data, duplicate: true}` / `{ok: false, code, message, retryable}`
 - 바꾸는 규칙: 선택 필드 추가는 자유, 삭제·이름 변경·의미 변경은 호출하는 쪽·리뷰 담당과 합의 후
@@ -142,7 +143,7 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: worker · 정의: worker 담당
 
-실행 시작 + lease + permit 발급
+실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased
 
 입력
 
@@ -169,7 +170,7 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: worker · 정의: worker 담당 · permit 필요
 
-lease 연장
+lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false
 
 입력
 
@@ -189,7 +190,7 @@ lease 연장
 
 작업 제어 · 호출: worker · 정의: worker 담당 · permit 필요
 
-완료 표시 (뒤에 XACK)
+완료 표시. finished=true를 확인한 뒤에만 XACK
 
 입력
 
@@ -208,7 +209,7 @@ lease 연장
 
 작업 제어 · 호출: worker · 정의: worker 담당 · permit 필요
 
-실패 확정 (뒤에 XACK)
+실패 확정. failed=true를 확인한 뒤에만 XACK
 
 입력
 

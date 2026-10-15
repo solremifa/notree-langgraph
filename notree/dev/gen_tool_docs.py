@@ -76,6 +76,7 @@ def render() -> str:
         "",
         "- 이름: `영역_동사`, 소문자·밑줄 (OpenAI 함수 이름은 점을 허용하지 않음)",
         "- worker가 부르는 도구는 모두 `permit`을 받는다 (`job_start` 제외). 사용자 ID 등 permit으로 알 수 있는 값은 인자로 받지 않는다",
+        "- 쓰기 도구는 같은 트랜잭션 안에서 permit의 실행권(작업이 running, 소유자·실행 세대 일치)을 확인한다. 없으면 `permit_invalid`",
         "- 쓰기 도구는 `idem_key`(= job_id), 삭제·취소 영향을 받는 쓰기는 `expected_generation`을 받는다",
         "- 응답: `{ok: true, data}` / `{ok: true, data, duplicate: true}` / `{ok: false, code, message, retryable}`",
         "- 바꾸는 규칙: 선택 필드 추가는 자유, 삭제·이름 변경·의미 변경은 호출하는 쪽·리뷰 담당과 합의 후",

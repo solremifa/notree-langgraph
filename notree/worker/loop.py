@@ -3,16 +3,19 @@
     Worker(name, cfg, redis, mcp).run(stop_event)
 
 한 메시지의 처리 (process)
+  이미 이 worker가 실행 중인 job → 손대지 않음 (보조 방어)
   job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
-             ├─ leased                  → 손대지 않음 (다른 worker가 살아서 하는 중)
+             ├─ leased                  → 손대지 않음 (살아 있는 lease. 같은 worker라도)
              └─ started → Lease 안에서 핸들러 실행 (job_timeout과 마감 시각 중 짧은 쪽으로 제한)
-                      ├─ 성공            → job_finish → XACK
-                      ├─ FatalError      → job_fail(다시 시도 불가) → XACK
-                      ├─ 마감 시각 지남   → job_fail(다시 시도 가능) → XACK
+                      │   heartbeat마다 Redis 방치 시간도 초기화 → 실행 중인 메시지는 재배송되지 않음
+                      ├─ 성공            → job_finish가 finished=true로 **확정되면** XACK
+                      ├─ FatalError      → job_fail(다시 시도 불가)가 확정되면 XACK
+                      ├─ 마감 시각 지남   → job_fail(다시 시도 가능)가 확정되면 XACK
                       ├─ 그 밖의 실패     → 시도 < 한도: job_release (ACK 안 함 → claim_idle 뒤 재배송)
-                      │                    시도 = 한도: job_fail(다시 시도 가능) → XACK
+                      │                    시도 = 한도: job_fail(다시 시도 가능)가 확정되면 XACK
                       ├─ LeaseLost       → 아무것도 안 함 (이미 다른 worker 것)
                       └─ 종료 신호로 취소 → job_release (ACK 안 함 → 다른 worker가 곧 이어받음)
+  완료·실패 확정을 못 받으면(장애·실행권 없음) ACK하지 않는다 → 메시지가 남아 재배송으로 다시 처리된다.
 """
 import asyncio
 
@@ -24,6 +27,9 @@ from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
 from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
+
+
+CONFIRM_BACKOFF = (0.2, 0.5, 1.0)   # 완료·실패 표시 재시도 간격 (마지막 값은 쓰이지 않음)
 
 
 class DeadlinePassed(Exception):
@@ -44,6 +50,7 @@ class Worker:
         self.grace = S.SHUTDOWN_GRACE_SEC if shutdown_grace_sec is None else shutdown_grace_sec
         self.handlers = load_handlers()
         self.running: set[asyncio.Task] = set()
+        self.active_jobs: set[str] = set()        # 이 프로세스가 지금 실행 중인 job_id (중복 실행 보조 방어)
         self.dead = False                         # SimulatedDeath (시험·데모용 프로세스 죽음)
 
     # ── 메인 루프 ──
@@ -56,8 +63,10 @@ class Worker:
                      f"핸들러 {sorted(self.handlers)}")
         slots = asyncio.Semaphore(self.concurrency)
         while not stop.is_set() and not self.dead:
-            await slots.acquire()                         # 빈 자리가 있을 때만 메시지를 가져온다
+            if not await self._acquire_or_stop(slots, stop):   # 빈 자리가 나거나 종료 신호가 오거나
+                break
             if self.dead:
+                slots.release()
                 break
             try:
                 msg = None if stop.is_set() else await self._next()
@@ -84,6 +93,23 @@ class Worker:
             return "died"
         await self._drain()
         return "stopped"
+
+    @staticmethod
+    async def _acquire_or_stop(slots: asyncio.Semaphore, stop: asyncio.Event) -> bool:
+        """슬롯이 비면 True, 그 전에 종료 신호가 오면 False. 슬롯이 꽉 찬 채로 종료 신호를 못 보는 일을 막는다."""
+        if stop.is_set():
+            return False
+        acq = asyncio.ensure_future(slots.acquire())
+        stp = asyncio.ensure_future(stop.wait())
+        await asyncio.wait({acq, stp}, return_when=asyncio.FIRST_COMPLETED)
+        stp.cancel()
+        if acq.done() and not acq.cancelled():
+            if stop.is_set():                              # 동시에 끝났으면 종료가 우선. 받은 슬롯은 돌려준다
+                slots.release()
+                return False
+            return True
+        acq.cancel()
+        return False
 
     async def _ensure_group(self) -> None:
         try:
@@ -120,12 +146,18 @@ class Worker:
     # ── 메시지 하나 ──
     async def _guarded(self, msg_id: str, job_id: str, how: str) -> None:
         """process 바깥의 마지막 안전망. 여기까지 온 오류는 ACK 없이 두므로 재배송된다."""
+        if job_id in self.active_jobs:
+            log("skip", f"{job_id}: 이 worker가 이미 실행 중 → 손대지 않음")
+            return
+        self.active_jobs.add(job_id)
         try:
             await self.process(msg_id, job_id, how)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log("error", f"{job_id}: 처리 중 예외({type(e).__name__}: {e}) → ACK 안 함, 재배송 대기")
+        finally:
+            self.active_jobs.discard(job_id)
 
     async def process(self, msg_id: str, job_id: str, how: str) -> None:
         ACTOR.set(self.name)
@@ -155,7 +187,7 @@ class Worker:
                 if left <= 0:
                     raise DeadlinePassed()
                 timeout = min(timeout, left)
-            async with Lease(ctx):
+            async with Lease(ctx, touch=lambda: self._touch(msg_id)):
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")
@@ -182,21 +214,49 @@ class Worker:
                 await self._ctl(ctx, "job_release", reason=reason)
                 log("retry", f"{job_id}: {reason} → lease 반납, {self.cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
         else:
-            await self._ctl(ctx, "job_finish")
-            await self._ack(msg_id)
-            log("done", f"{job_id} 완료 → XACK")
+            confirmed = await self._confirm(ctx, "job_finish", "finished")
+            if confirmed:
+                await self._ack(msg_id)
+                log("done", f"{job_id} 완료 → XACK")
+            else:
+                log("done", f"{job_id}: 완료 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
 
     async def _fail(self, ctx: JobContext, msg_id: str, reason: str, *, user_retryable: bool) -> None:
-        await self._ctl(ctx, "job_fail", reason=reason, user_retryable=user_retryable)
-        await self._ack(msg_id)
-        log("fail", f"{ctx.job_id}: 실패 확정 ({reason}){' · 다시 시도 가능' if user_retryable else ''} → XACK")
+        confirmed = await self._confirm(ctx, "job_fail", "failed", reason=reason, user_retryable=user_retryable)
+        if confirmed:
+            await self._ack(msg_id)
+            log("fail", f"{ctx.job_id}: 실패 확정 ({reason}){' · 다시 시도 가능' if user_retryable else ''} → XACK")
+        else:
+            log("fail", f"{ctx.job_id}: 실패 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
+
+    async def _confirm(self, ctx: JobContext, name: str, flag: str, **args) -> bool | None:
+        """완료·실패 표시를 확정 응답까지 몇 번 시도한다.
+        True = 확정됨(ACK 해도 됨), False = 서버가 거부(실행권 없음), None = 끝내 응답을 못 받음."""
+        for i, wait in enumerate(CONFIRM_BACKOFF):
+            try:
+                res = await self.mcp.tool(name, permit=ctx.permit, job_id=ctx.job_id, worker=self.name, **args)
+                return bool(res.get(flag))
+            except Exception as e:
+                log("error", f"{ctx.job_id}: {name} 실패({type(e).__name__}: {e})"
+                             + (f" → {wait:g}초 뒤 다시" if i < len(CONFIRM_BACKOFF) - 1 else ""))
+                if i < len(CONFIRM_BACKOFF) - 1:
+                    await asyncio.sleep(wait)
+        return None
+
+    @staticmethod
+    def _why(confirmed: bool | None) -> str:
+        return "실행권 없음" if confirmed is False else "응답 없음"
 
     async def _ctl(self, ctx: JobContext, name: str, **args) -> None:
-        """루프 자신의 작업 제어 호출. 거절돼도 루프는 멈추지 않는다 (재배송·누락 복구가 뒤를 받친다)."""
+        """결과가 ACK에 영향을 주지 않는 제어 호출(job_release). 실패해도 루프는 멈추지 않는다."""
         try:
             await self.mcp.tool(name, permit=ctx.permit, job_id=ctx.job_id, worker=self.name, **args)
         except Exception as e:
             log("error", f"{ctx.job_id}: {name} 실패({type(e).__name__}: {e})")
+
+    async def _touch(self, msg_id: str) -> None:
+        """Redis 메시지의 방치 시간을 0으로 (소유자는 그대로 나). 살아 있는 작업이 재배송되지 않게 한다."""
+        await self.r.xclaim(self.cfg.stream, S.GROUP, self.name, 0, [msg_id], justid=True)
 
     async def _ack(self, msg_id: str) -> None:
         await self.r.xack(self.cfg.stream, S.GROUP, msg_id)
