@@ -1,7 +1,7 @@
 """내부 MCP 서버 클라이언트.
 
 worker가 바깥과 주고받는 통로는 Redis, OpenAI, 그리고 이 클라이언트뿐이다. DB 접속 정보는 모른다.
-url이 있으면 streamable HTTP(compose 배치), 없으면 저장소 루트의 mcp_server.py를 stdio 하위 프로세스로 띄운다(테스트용).
+url이 있으면 streamable HTTP(compose 배치), 없으면 notree/mcp_server/server.py를 stdio 하위 프로세스로 띄운다(테스트용).
 """
 import json
 import sys
@@ -15,7 +15,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from notree.contracts.envelope import ToolError, unwrap  # noqa: F401  (ToolError 재노출)
 
-SERVER = Path(__file__).resolve().parents[2] / "mcp_server.py"
+SERVER = Path(__file__).resolve().parents[1] / "mcp_server" / "server.py"
 
 
 class McpToolError(RuntimeError):
@@ -24,7 +24,7 @@ class McpToolError(RuntimeError):
 
 class McpClient:
     """내부 MCP 서버에 붙어 도구를 호출한다.
-    url이 있으면 streamable HTTP(실제 compose 배치와 같은 방식), 없으면 mcp_server.py를 stdio 하위 프로세스로 띄운다."""
+    url이 있으면 streamable HTTP(실제 compose 배치와 같은 방식), 없으면 notree/mcp_server/server.py를 stdio 하위 프로세스로 띄운다."""
 
     def __init__(self, env: dict[str, str] | None = None, url: str | None = None) -> None:
         self.env = env

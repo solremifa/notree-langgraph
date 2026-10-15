@@ -1,7 +1,7 @@
 # worker 구조 (notree/ 패키지)
 
-팀 저장소로 옮길 것을 전제로 만든 뼈대입니다. 저장소 루트의 평면 파일들(`run.py`, `worker.py`, `demo.py` …)은
-LangGraph·A안·인계 흐름을 확인하려고 만든 1차 PoC이고, **실제로 옮길 코드는 `notree/`** 입니다.
+팀 저장소로 옮길 것을 전제로 만든 뼈대입니다. 코드는 전부 `notree/` 패키지 안에 있습니다.
+(정리 전 1차 PoC — 루트의 `worker.py`, `demo.py`, `run.py` 등 — 은 `archive/poc-v1` 브랜치에 그대로 남아 있습니다)
 
 ```
 notree/
@@ -11,6 +11,10 @@ notree/
 ├─ contracts/             MCP 도구 계약 (팀 결정 8번) — MCP 서버와 worker가 같이 import
 │   ├─ envelope.py        공통 응답 형식 {ok, data} / {ok:false, code, message, retryable}, 오류 코드
 │   └─ tools.py           도구별 입력·출력 Pydantic 모델, 담당, 모델 노출 여부 (→ docs/tool-contracts.md 자동 생성)
+├─ mcp_server/            내부 MCP 서버 (DB를 소유하는 유일한 프로세스). python -m notree.mcp_server --http
+│   └─ server.py
+├─ graphs/
+│   └─ course_update/     과목 노트 그래프 (graph.py 노드·분기, state.py 상태, llm.py 가짜/OpenAI LLM)
 ├─ scheduler/
 │   ├─ allocator.py       의도 → 실행 허가 → XADD (작업 종류별 Stream). 실행하면 periodic도 같이 돎
 │   └─ periodic.py        누락 복구(멈춘 reserved/sent 다시 보내기), 체크포인트 정리
@@ -28,11 +32,14 @@ notree/
 │       ├─ qa.py              rt  — 스텁
 │       ├─ grading.py         rt  — 스텁
 │       └─ final_note.py      batch — 스텁
-└─ dev/
+└─ dev/                  개발·데모용 (운영 코드 아님)
+    ├─ demo.py            rt·batch worker + scheduler + 여러 시나리오를 한 번에
+    ├─ takeover.py        죽은 worker의 작업을 다른 worker가 이어받는 데모
+    ├─ graph_run.py       그래프만 따로 실행 (중단·이어하기·분기·Mermaid)
     ├─ enqueue.py         작업 하나 넣기 (api 흉내). --user, --deadline-in
     ├─ jobs.py            작업 조회 / 되살리기 (get, retry)
     ├─ gen_tool_docs.py   계약 → docs/tool-contracts.md
-    └─ demo.py            rt·batch worker + scheduler + 여러 시나리오를 한 번에
+    └─ devenv.py          데모용 MCP 서버·Redis 준비
 ```
 
 ## 작업 하나가 코드를 지나가는 길
@@ -90,7 +97,7 @@ async def live_summary(ctx: JobContext) -> None:
 
 1. `notree/worker/handlers/<이름>.py`를 만들고 `@handler("<kind>")` 함수를 쓴다
 2. `notree/worker/handlers/__init__.py`의 import 목록에 추가
-3. `mcp_server.py`의 `STREAM_OF`에 작업 종류 → Stream(rt/batch) 추가 (실제로는 api가 의도를 쓸 때 정함)
+3. `notree/mcp_server/server.py`의 `STREAM_OF`에 작업 종류 → Stream(rt/batch) 추가 (실제로는 api가 의도를 쓸 때 정함)
 4. 재시도 한도가 기본값과 다르면 `settings.KIND_MAX_ATTEMPTS`에 추가
 5. 쓰는 MCP 도구가 없으면 **먼저 `notree/contracts/tools.py`에 계약 추가** → `gen_tool_docs`로 문서 재생성 → 서버에 `@tool`로 구현.
    worker용 도구는 모두 `permit` 인자를 받는다 (테스트가 확인)
@@ -103,7 +110,7 @@ uv run python -m notree.dev.demo                 # 성공·Fatal·재시도·한
 uv run pytest -q tests/test_skeleton.py tests/test_decisions.py
 
 # 진짜 Redis + 프로세스 분리 (docker compose up -d 후, 터미널 여러 개)
-uv run mcp_server.py --http
+uv run python -m notree.mcp_server --http
 uv run python -m notree.scheduler.allocator
 uv run python -m notree.worker --stream rt --name A
 uv run python -m notree.worker --stream batch --name A
@@ -120,9 +127,8 @@ worker 창에서 Ctrl+C 한 번이면 진행 중인 작업을 끝내고 종료, 
 
 | 이 PoC | 팀 저장소 |
 |---|---|
-| `mcp_server.py` (SQLite, 도구 몇 개) | FastAPI 코드베이스의 mcp 프로세스. SQLAlchemy + PG + RLS. permit의 사용자 ID로 `SET LOCAL` |
+| `notree/mcp_server/` (SQLite) | FastAPI 코드베이스의 mcp 프로세스. SQLAlchemy + PG + RLS. permit의 사용자 ID로 `SET LOCAL` |
 | `allocator`가 MCP 도구로 의도를 읽음 | scheduler가 PG에 직접 (SKIP LOCKED, 동시 상한·예산) |
-| `course_update`가 루트의 `graph.py`를 import | 그래프를 `notree/worker/graphs/course_update.py` 같은 곳으로 이동 |
 | `note_publish`가 permit의 사용자 ID로 저장 (RLS 흉내) | MCP 서버가 permit의 사용자 ID로 `SET LOCAL app.user_id` → 진짜 RLS |
 | `contracts/tools.py`의 계획된 도구 12개 = 초안 | 담당자 PR로 필드 확정 후 서버 구현 |
 

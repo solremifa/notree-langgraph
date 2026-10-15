@@ -11,6 +11,34 @@
 
 ## 2026-10-15
 
+### 저장소 정리: 코드를 notree/ 안으로 · (이번 커밋)
+루트에 있던 1차 PoC 파일을 정리했습니다. 정리 전 상태는 `archive/poc-v1` 브랜치에 그대로 있습니다 (`git checkout archive/poc-v1`).
+
+- 🔧 `mcp_server.py` → `notree/mcp_server/server.py`
+- 🔧 `graph.py`, `state.py`, `llm.py` → `notree/graphs/course_update/`
+- 🔧 `run.py` → `notree/dev/graph_run.py`
+- 🗑 `worker.py`, `scheduler.py`, `api.py`, `demo.py`, `settings.py`, `mcp_saver.py`, `tests/test_worker.py` (`notree/`의 같은 역할 코드로 대체)
+- 🆕 `notree/dev/takeover.py`: 죽은 worker 인계 데모 (예전 `demo.py`가 하던 것)
+- 🆕 `tests/test_takeover.py`: 죽음 인계 · 발행 직후 죽음 · 느린 worker 보호 (예전 `test_worker.py`를 옮김)
+- 🆕 `SimulatedDeath`: 시험·데모용 worker 죽음. ACK·완료 표시·lease 반납 없이 worker가 끝남
+- 🆕 `notree/dev/devenv.py`: 데모용 MCP 서버·Redis 준비 공통 코드
+- 🔧 README를 새 구조에 맞게 다시 씀. `docs/worker-flow.md`, `worker-structure.md`, `team-decisions.md`의 경로·명령 갱신
+- 🔧 `CLAUDE.md`: "코드는 notree/ 안에" 규칙 추가
+- ⚠️ 실행 명령 변경
+
+  | 이전 | 이후 |
+  |---|---|
+  | `uv run demo.py` | `uv run python -m notree.dev.takeover` |
+  | `uv run run.py ...` | `uv run python -m notree.dev.graph_run ...` |
+  | `uv run mcp_server.py --http` | `uv run python -m notree.mcp_server --http` |
+  | `uv run scheduler.py` | `uv run python -m notree.scheduler.allocator` |
+  | `uv run worker.py --name A` | `uv run python -m notree.worker --stream batch --name A` |
+  | `uv run api.py ...` | `uv run python -m notree.dev.enqueue course_update sources=...` |
+  | `uv run mcp dev mcp_server.py` | `uv run mcp dev notree/mcp_server/server.py` |
+- ⚠️ import 경로 변경: `from graph import ...` → `from notree.graphs.course_update import ...`,
+  `from mcp_saver import ...` → `from notree.worker.checkpointer import ...` / `from notree.worker.mcp_client import McpClient`
+- 테스트 31개 (옮긴 3개 포함, 개수는 그대로)
+
 ### 업데이트 목록 추가 · `6d0de84`
 - 🆕 `CHANGELOG.md`: 이 목록. 앞으로 커밋마다 갱신
 - 🆕 `CLAUDE.md`: 변경 기록 규칙, uv·계약 문서·테스트 규칙

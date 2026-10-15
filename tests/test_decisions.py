@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import llm  # noqa: E402
+from notree.graphs.course_update import llm  # noqa: E402
 from notree.common import settings as S  # noqa: E402
 from notree.contracts.envelope import ToolError  # noqa: E402
 from notree.contracts.tools import NO_PERMIT, TOOLS  # noqa: E402
@@ -32,7 +32,7 @@ async def batch_job(e: Env, payload: dict) -> str:
 # ── 8번: 계약 ────────────────────────────────────────────────────
 def test_server_tools_match_contract():
     os.environ.setdefault("NOTREE_DB", "/tmp/notree-contract-test.db")
-    import mcp_server
+    from notree.mcp_server import server as mcp_server
 
     tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
     implemented = {n for n, s in TOOLS.items() if s.status == "implemented"}

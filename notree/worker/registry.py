@@ -36,6 +36,12 @@ class FatalError(Exception):
     """다시 해도 안 되는 실패."""
 
 
+class SimulatedDeath(BaseException):
+    """시험·데모 전용: worker 프로세스가 그 자리에서 죽은 것처럼 만든다.
+    루프는 ACK·완료 표시·lease 반납·heartbeat를 모두 멈추고 종료한다 → 다른 worker가 재배송으로 이어받는다.
+    (BaseException이라 핸들러의 except Exception에 걸리지 않음)"""
+
+
 class ToolUnavailable(RetryableError):
     """MCP 도구가 retryable=true로 거절 (locked, unavailable)."""
 

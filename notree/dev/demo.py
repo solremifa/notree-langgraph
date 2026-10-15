@@ -14,28 +14,19 @@
 import argparse
 import asyncio
 import dataclasses
-import os
 import shutil
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 from notree.common import settings as S
 from notree.common.log import ACTOR, log
+from notree.dev.devenv import mcp_server, redis_client
 from notree.scheduler.allocator import run_allocator
 from notree.scheduler.periodic import run_periodic
 from notree.worker.loop import Worker
-from notree.worker.mcp_client import SERVER, McpClient
+from notree.worker.mcp_client import McpClient
 
 OUT = Path("out")
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def banner(text: str) -> None:
@@ -54,24 +45,8 @@ async def main() -> None:
     shutil.rmtree(OUT, ignore_errors=True); OUT.mkdir()
     flag = OUT / "not-ready.flag"          # 되살리기 시나리오: 이 파일이 있는 동안 echo가 실패
     flag.write_text("x")
-    port = free_port()
-    url = f"http://127.0.0.1:{port}/mcp"
-    server = subprocess.Popen([sys.executable, str(SERVER), "--http"], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL,
-                              env={**os.environ, "NOTREE_MCP_PORT": str(port), "NOTREE_DB": str(OUT / "skel.db"),
-                                   "NOTREE_REQUIRE_PERMIT": "1"})
-    try:
-        for _ in range(50):
-            try:
-                socket.create_connection(("127.0.0.1", port), 0.2).close(); break
-            except OSError:
-                time.sleep(0.1)
-        if a.redis:
-            import redis.asyncio as aioredis
-            r, block = aioredis.from_url(a.redis, decode_responses=True), 1000
-        else:
-            import fakeredis
-            r, block = fakeredis.FakeAsyncRedis(decode_responses=True), 0
+    with mcp_server(OUT / "skel.db") as url:
+        r, block = redis_client(a.redis)
         await r.delete(rt.stream, batch.stream)
 
         async with McpClient(url=url) as m_api, McpClient(url=url) as m_s, McpClient(url=url) as m_p, \
@@ -153,8 +128,6 @@ async def main() -> None:
             print(f"  과목 노트: {note['note']!r}  user_id={note['user_id']} (permit에서 꺼냄)")
             for s in (rt.stream, batch.stream):
                 print(f"  {s}: ACK 안 된 메시지 {(await r.xpending(s, S.GROUP))['pending']}개")
-    finally:
-        server.terminate()
 
 
 if __name__ == "__main__":

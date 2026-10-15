@@ -97,7 +97,7 @@ def render() -> str:
     lines += ["", "## 구현된 도구", ""]
     for s in impl:
         lines += _section(s)
-    lines += ["## 계획된 도구", "", "담당자가 PR로 필드를 확정하고 `mcp_server.py`에 구현합니다.", ""]
+    lines += ["## 계획된 도구", "", "담당자가 PR로 필드를 확정하고 `notree/mcp_server/server.py`에 구현합니다.", ""]
     for s in plan:
         lines += _section(s)
     return "\n".join(lines).rstrip() + "\n"

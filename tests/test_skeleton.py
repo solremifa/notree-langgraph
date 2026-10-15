@@ -38,8 +38,8 @@ class Env:
                       if self.with_allocator else [])
         return self
 
-    def start_worker(self, cfg=RT, **kw):
-        w = Worker("t", cfg, self.r, self.m_w, block_ms=0, **kw)
+    def start_worker(self, cfg=RT, name="t", mcp=None, **kw):
+        w = Worker(name, cfg, self.r, mcp or self.m_w, block_ms=0, **kw)
         self.tasks.append(asyncio.create_task(w.run(self.stop)))
         return w
 

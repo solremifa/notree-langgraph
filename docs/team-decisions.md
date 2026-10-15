@@ -8,7 +8,7 @@
 | 1 | 재배송 주체 | worker가 `XAUTOCLAIM`으로 직접 회수. scheduler는 누락 복구(6번)만 | `notree/worker/loop.py` `_next` |
 | 2 | 시간 값 | rt 15/5/20초·제한 90초, batch 60/20/90초·제한 15분. 마감 시각(`deadline_at`) 지원 | `notree/common/settings.py`, `loop.py` |
 | 3 | 재시도·실패 | rt 2회, batch 3회, 실시간 요약 1회. 실패는 `failed` + 사유 + 다시 시도 가능 여부 | `settings.KIND_MAX_ATTEMPTS`, `loop.py` |
-| 4 | permit | HMAC 서명, 사용자 ID 포함. MCP가 꺼내 씀(인자로 받지 않음). 유효 rt 5분·batch 30분 | `mcp_server.py` `_issue_permit` |
+| 4 | permit | HMAC 서명, 사용자 ID 포함. MCP가 꺼내 씀(인자로 받지 않음). 유효 rt 5분·batch 30분 | `notree/mcp_server/server.py` `_issue_permit` |
 | 5 | 동시 실행 | 프로세스당 rt 4, batch 1 | `settings.RT/BATCH.concurrency` |
 | 6 | 배정기 누락 복구 | 10초마다, reserved 30초·sent 120초 넘게 멈춘 의도를 다시 XADD | `notree/scheduler/periodic.py` |
 | 7 | 다시 시도 | 같은 job을 되살림(체크포인트 유지). 영구 실패는 거절. 마감 있던 작업은 새 마감과 함께 | `job_retry` 도구 |
@@ -66,7 +66,7 @@
 - 유효 시간: rt 5분, batch 30분 (`NOTREE_PERMIT_TTL_RT/_BATCH`). 시도할 때마다 새로 발급됩니다.
 - 비밀키: `NOTREE_PERMIT_SECRET` 환경변수. 배포 시 GitHub Actions secret / 서버 `.env`. 키를 바꾸면 진행 중 작업의 permit이 무효가 되므로 worker를 먼저 비우고 바꿉니다.
 - 작업 종류별 도구 제한은 하지 않습니다 (도구 목록만 계약에 문서화). 필요해지면 permit claims에 범위를 추가합니다.
-- `NOTREE_REQUIRE_PERMIT=1`이면 permit 없는 worker 도구 호출을 거절합니다. 운영은 1, 루트의 PoC 스크립트(`run.py` 등)는 0.
+- `NOTREE_REQUIRE_PERMIT=1`이면 permit 없는 worker 도구 호출을 거절합니다. 운영은 1, 작업 밖에서 그래프만 돌리는 `notree.dev.graph_run`은 0.
 
 ## 5. 동시 실행 수
 

@@ -8,6 +8,8 @@
 - 결정이 바뀌거나 파일이 많이 바뀌는 큰 변경은 `docs/changes/YYYY-MM-DD-<주제>.md`에 자세히 쓰고 CHANGELOG에서 링크한다.
 
 ## 규칙
+- 코드는 모두 `notree/` 패키지 안에 둔다. 루트에는 설정·문서 파일만 (README, CHANGELOG, CLAUDE.md, pyproject.toml, uv.lock, docker-compose.yml).
+  데모·개발용 스크립트는 `notree/dev/`, 실행은 `uv run python -m notree.<모듈>`.
 - 패키지·실행은 uv: `uv sync`, `uv run ...`, 의존성 추가는 `uv add`. `uv.lock`도 커밋.
 - MCP 도구를 추가·변경하면 `notree/contracts/tools.py`를 먼저 고치고 `uv run python -m notree.dev.gen_tool_docs`로 문서 재생성.
 - 커밋 전 `uv run pytest -q` 통과 확인.

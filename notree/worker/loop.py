@@ -23,7 +23,7 @@ from notree.common.log import ACTOR, log
 from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
-from notree.worker.registry import FatalError, JobContext, load_handlers
+from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
 
 
 class DeadlinePassed(Exception):
@@ -44,17 +44,21 @@ class Worker:
         self.grace = S.SHUTDOWN_GRACE_SEC if shutdown_grace_sec is None else shutdown_grace_sec
         self.handlers = load_handlers()
         self.running: set[asyncio.Task] = set()
+        self.dead = False                         # SimulatedDeath (시험·데모용 프로세스 죽음)
 
     # ── 메인 루프 ──
-    async def run(self, stop: asyncio.Event) -> None:
+    async def run(self, stop: asyncio.Event) -> str:
+        """정상 종료면 "stopped", SimulatedDeath면 "died"."""
         ACTOR.set(self.name)
         await self._ensure_group()
         log("start", f"stream={self.cfg.stream} 동시 {self.concurrency}개 · lease {self.cfg.lease_sec:g}s · "
                      f"재배송 {self.cfg.claim_idle_ms / 1000:g}s · 한도 {self.cfg.max_attempts}회 · "
                      f"핸들러 {sorted(self.handlers)}")
         slots = asyncio.Semaphore(self.concurrency)
-        while not stop.is_set():
+        while not stop.is_set() and not self.dead:
             await slots.acquire()                         # 빈 자리가 있을 때만 메시지를 가져온다
+            if self.dead:
+                break
             try:
                 msg = None if stop.is_set() else await self._next()
             except Exception as e:                        # Redis·네트워크 일시 장애: 루프는 죽지 않는다
@@ -62,6 +66,9 @@ class Worker:
                 log("error", f"메시지 가져오기 실패({type(e).__name__}: {e}) → 1초 뒤 재시도")
                 await asyncio.sleep(1)
                 continue
+            if msg is not None and self.dead:             # 가져온 사이에 죽었으면 손대지 않는다 (재배송됨)
+                slots.release()
+                break
             if msg is None:
                 slots.release()
                 if not self.block_ms:
@@ -70,7 +77,13 @@ class Worker:
             t = asyncio.create_task(self._guarded(*msg))
             self.running.add(t)
             t.add_done_callback(lambda t: (self.running.discard(t), slots.release()))
+        if self.dead:
+            for t in self.running:                        # 죽은 프로세스는 아무것도 정리하지 않는다
+                t.cancel()
+            log("💀", "worker 프로세스 죽음 (ACK·완료 표시·lease 반납·heartbeat 없음)")
+            return "died"
         await self._drain()
+        return "stopped"
 
     async def _ensure_group(self) -> None:
         try:
@@ -146,9 +159,13 @@ class Worker:
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")
+        except SimulatedDeath as e:
+            self.dead = True
+            log("💀", f"{job_id}: {e}")
         except asyncio.CancelledError:
-            await self._ctl(ctx, "job_release", reason="shutdown")
-            log("job", f"{job_id}: 종료로 중단 → lease 반납")
+            if not self.dead:
+                await self._ctl(ctx, "job_release", reason="shutdown")
+                log("job", f"{job_id}: 종료로 중단 → lease 반납")
             raise
         except DeadlinePassed:
             await self._fail(ctx, msg_id, "마감 시각 지남", user_retryable=True)

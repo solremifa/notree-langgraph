@@ -14,9 +14,9 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from llm import get_llm
-from notree.common.log import ACTOR, log  # noqa: F401  (ACTOR는 기존 import 경로 호환)
-from state import CourseUpdateState, ExtractInput
+from notree.common.log import log
+from notree.graphs.course_update.llm import get_llm
+from notree.graphs.course_update.state import CourseUpdateState, ExtractInput
 
 MAX_MERGE = 2
 

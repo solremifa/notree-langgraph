@@ -9,9 +9,9 @@
   - 체크포인트는 LangGraph가 직렬화한 바이트를 base64로 받아 그대로 저장한다 (서버는 LangGraph를 몰라도 됨).
 
 실행
-  stdio : run.py·테스트가 하위 프로세스로 자동으로 띄운다
-  HTTP  : uv run mcp_server.py --http   (compose의 내부 mcp 컨테이너 역할, 기본 127.0.0.1:8765/mcp)
-  확인  : uv run mcp dev mcp_server.py
+  stdio : 테스트·notree.dev.graph_run이 하위 프로세스로 자동으로 띄운다
+  HTTP  : uv run python -m notree.mcp_server --http   (compose의 내부 mcp 컨테이너 역할, 기본 127.0.0.1:8765/mcp)
+  확인  : uv run mcp dev notree/mcp_server/server.py
 
 환경변수
   NOTREE_DB                  DB 파일 (기본 out/notree.db)
@@ -33,7 +33,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))   # notree 패키지 import (stdio로 띄워질 때)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # 저장소 루트 (파일 경로로 직접 띄워질 때 notree import)
 from notree.contracts import tools as C  # noqa: E402
 from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
 
@@ -471,5 +471,10 @@ def tool_stats(thread_id: str) -> dict:
 
 _init_db()
 
-if __name__ == "__main__":
+
+def main() -> None:
     mcp.run("streamable-http" if "--http" in sys.argv else "stdio")
+
+
+if __name__ == "__main__":
+    main()

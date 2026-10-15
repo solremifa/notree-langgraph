@@ -13,9 +13,10 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import llm  # noqa: E402
-from graph import FileNoteStore, build_graph  # noqa: E402
-from mcp_saver import McpCheckpointSaver, McpClient, McpNoteStore  # noqa: E402
+from notree.graphs.course_update import FileNoteStore, build_graph  # noqa: E402
+from notree.graphs.course_update import llm  # noqa: E402
+from notree.worker.checkpointer import McpCheckpointSaver, McpNoteStore  # noqa: E402
+from notree.worker.mcp_client import McpClient  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

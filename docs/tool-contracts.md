@@ -483,7 +483,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 
 ## 계획된 도구
 
-담당자가 PR로 필드를 확정하고 `mcp_server.py`에 구현합니다.
+담당자가 PR로 필드를 확정하고 `notree/mcp_server/server.py`에 구현합니다.
 
 ### `transcript_range` (계획)
 

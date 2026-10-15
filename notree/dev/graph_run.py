@@ -1,4 +1,12 @@
-"""실행기.  uv run run.py --help"""
+"""과목 노트 그래프만 따로 돌려 보는 실행기 (Redis·worker 없이).
+
+    uv run python -m notree.dev.graph_run                         # 정상 경로
+    uv run python -m notree.dev.graph_run --sloppy once           # validate 실패 → merge 재시도
+    uv run python -m notree.dev.graph_run --thread op1 --crash-at extract:world
+    uv run python -m notree.dev.graph_run --thread op1 --resume   # 체크포인트에서 이어감
+    uv run python -m notree.dev.graph_run --graph                 # Mermaid
+    uv run python -m notree.dev.graph_run --help
+"""
 import argparse
 import asyncio
 import os
@@ -7,8 +15,7 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import llm
-from graph import build_graph
+from notree.graphs.course_update import build_graph, llm
 
 OUT = Path("out")
 
@@ -19,7 +26,8 @@ async def open_backend(kind: str):
     OUT.mkdir(exist_ok=True)
     if kind == "mcp":
         # A안: worker는 DB를 열지 않는다. MCP 서버 프로세스만 out/notree.db를 연다.
-        from mcp_saver import McpCheckpointSaver, McpClient, McpNoteStore
+        from notree.worker.checkpointer import McpCheckpointSaver, McpNoteStore
+        from notree.worker.mcp_client import McpClient
         env = {**os.environ, "NOTREE_DB": str((OUT / "notree.db").resolve())}
         async with McpClient(env=env) as client:
             yield McpCheckpointSaver(client), McpNoteStore(client), client
@@ -87,7 +95,7 @@ async def main() -> None:
         except RuntimeError as e:
             snap = await app.aget_state(config)
             print(f"\n✖ {e}\n  남은 노드={list(snap.next)}  저장된 extract={len(snap.values.get('extracts', []))}개")
-            print(f"  이어서 실행: uv run run.py --saver {a.saver} --thread {thread} --resume")
+            print(f"  이어서 실행: uv run python -m notree.dev.graph_run --saver {a.saver} --thread {thread} --resume")
             return
         finally:
             print(f"  LLM 호출 {len(llm.CALLS)}회: {llm.CALLS}")
