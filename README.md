@@ -25,7 +25,7 @@ uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초
 uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
 uv run python -m notree.dev.qa_run       # Q&A 근거 탐색 그래프 (feat/qa-graph 실험)
-uv run pytest -q                         # 71개
+uv run pytest -q                         # 77개
 ```
 
 진짜 Redis와 프로세스 분리로 (`docker compose up -d` 후 터미널 여러 개):
@@ -33,7 +33,8 @@ uv run pytest -q                         # 71개
 ```powershell
 uv run python -m notree.mcp_server --http
 uv run python -m notree.scheduler.allocator
-uv run python -m notree.worker --stream rt --name A
+uv run python -m notree.worker --stream qa --name A      # Q&A·채점
+uv run python -m notree.worker --stream rt --name A      # 실시간 요약
 uv run python -m notree.worker --stream batch --name A
 uv run python -m notree.dev.enqueue course_update sources=hello,big,world
 uv run python -m notree.dev.jobs get <job_id>

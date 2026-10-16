@@ -19,7 +19,7 @@ SHUTDOWN_GRACE_SEC = _f("NOTREE_SHUTDOWN_GRACE_SEC", 30)  # 종료 신호 후 �
 
 @dataclass(frozen=True)
 class StreamConfig:
-    key: str               # "rt" | "batch"
+    key: str               # "qa" | "rt" | "batch"
     stream: str            # Redis Stream 이름
     lease_sec: float       # 이 시간 동안 heartbeat가 없으면 '죽었다'고 본다
     heartbeat_sec: float   # lease 연장 주기
@@ -42,10 +42,22 @@ def _cfg(key: str, stream: str, lease: float, claim_idle: float, attempts: int, 
     )
 
 
+# 레인 = Stream + 그 Stream만 읽는 worker 슬롯. 레인끼리는 서로의 대기열에 막히지 않는다.
+#   qa    : 사용자가 답을 기다리는 작업 (Q&A 90초 약속·채점). 실시간 요약에 밀리지 않게 따로 둔다
+#   rt    : 실시간 요약 (녹음 중 계속 생김. 늦어도 다음 요약이 덮음)
+#   batch : 길어도 되는 작업 (최종 노트·과목 노트)
 #                key      stream          lease  claim  시도  제한   동시
-RT = _cfg("rt", "notree:rt", 15, 20, 2, 90, 4)          # 화면 앞에서 기다리는 작업: Q&A(90초 약속)·실시간 요약·채점
-BATCH = _cfg("batch", "notree:batch", 60, 90, 3, 900, 1)  # 길어도 되는 작업: 최종 노트·과목 노트
-STREAMS = {"rt": RT, "batch": BATCH}
+QA = _cfg("qa", "notree:qa", 15, 20, 2, 90, 4)
+RT = _cfg("rt", "notree:rt", 15, 20, 2, 90, 4)
+BATCH = _cfg("batch", "notree:batch", 60, 90, 3, 900, 1)
+STREAMS = {"qa": QA, "rt": RT, "batch": BATCH}
+
+# 빌려 쓰기: 레인 → (빌려 올 레인, 빌려 쓸 수 있는 최대 슬롯 수).
+# 자기 대기열이 비었을 때만 남의 작업을 가져오고, 빌려 쓰는 슬롯은 이 수를 넘지 않는다.
+# → 나머지 (동시 수 - 빌린 수)개는 언제나 자기 레인 몫으로 비어 있다. 0이면 고정 (기본).
+BORROW: dict[str, tuple[str, int]] = {
+    "qa": ("rt", int(_f("NOTREE_QA_BORROW_SLOTS", 0))),
+}
 
 # 작업 종류별 시도 한도 (팀 결정 3번). 없으면 Stream 기본값(rt 2, batch 3)
 KIND_MAX_ATTEMPTS: dict[str, int] = {

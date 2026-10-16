@@ -17,7 +17,7 @@
   NOTREE_DB                  DB 파일 (기본 out/notree.db)
   NOTREE_REQUIRE_PERMIT=1    permit 없는 worker 도구 호출 거절 (기본 0: PoC 스크립트 호환)
   NOTREE_PERMIT_SECRET       permit 서명 키
-  NOTREE_PERMIT_TTL_RT / _BATCH   permit 유효 시간 (기본 300 / 1800초, 팀 결정 4번)
+  NOTREE_PERMIT_TTL_RT / _BATCH   permit 유효 시간 (기본 300 / 1800초, 팀 결정 4번). qa 레인은 RT 값을 쓴다
 """
 import base64
 import functools
@@ -44,9 +44,9 @@ DB.parent.mkdir(parents=True, exist_ok=True)
 mcp = FastMCP("notree-internal", log_level="WARNING",
               host=os.getenv("NOTREE_MCP_HOST", "127.0.0.1"), port=int(os.getenv("NOTREE_MCP_PORT", "8765")))
 
-# 작업 종류 → Stream. rt = 사용자가 화면 앞에서 기다리는 짧은 작업, batch = 길어도 되는 작업
+# 작업 종류 → Stream(레인). qa = 사용자가 답을 기다리는 작업, rt = 실시간 요약, batch = 길어도 되는 작업
 STREAM_OF = {
-    "live_summary": "notree:rt", "qa": "notree:rt", "grading": "notree:rt",
+    "qa": "notree:qa", "grading": "notree:qa", "live_summary": "notree:rt",
     "final_note": "notree:batch", "course_update": "notree:batch",
 }
 
@@ -159,7 +159,8 @@ def tool(fn):
 # 시도 번호(attempts)는 재시도 한도용이라 사용자 재시도(job_retry) 때 0으로 돌아간다. 실행권 확인은 되돌아가지 않는 실행 세대(x)로 한다.
 # 서명은 '위조되지 않았다'만 증명한다. '지금도 실행권이 있다'는 쓰기 트랜잭션 안에서 _require_live()로 DB와 대조한다.
 PERMIT_SECRET = os.getenv("NOTREE_PERMIT_SECRET", "dev-only-secret").encode()
-PERMIT_TTL = {"notree:rt": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
+PERMIT_TTL = {"notree:qa": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
+              "notree:rt": float(os.getenv("NOTREE_PERMIT_TTL_RT", "300")),
               "notree:batch": float(os.getenv("NOTREE_PERMIT_TTL_BATCH", "1800"))}
 REQUIRE_PERMIT = os.getenv("NOTREE_REQUIRE_PERMIT", "0") == "1"
 

@@ -16,6 +16,11 @@
                       ├─ LeaseLost       → 아무것도 안 함 (이미 다른 worker 것)
                       └─ 종료 신호로 취소 → job_release (ACK 안 함 → 다른 worker가 곧 이어받음)
   완료·실패 확정을 못 받으면(장애·실행권 없음) ACK하지 않는다 → 메시지가 남아 재배송으로 다시 처리된다.
+
+빌려 쓰기 (borrow, borrow_slots)
+  자기 Stream에 회수할 것도 새것도 없을 때만 borrow Stream의 메시지를 가져온다.
+  빌린 작업은 동시에 borrow_slots개까지만 → 나머지 슬롯은 언제나 자기 레인 몫으로 남는다.
+  빌린 작업의 lease·재배송·시도 한도·ACK는 원래 레인(borrow)의 설정을 따른다.
 """
 import asyncio
 
@@ -30,6 +35,7 @@ from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_
 
 
 CONFIRM_BACKOFF = (0.2, 0.5, 1.0)   # 완료·실패 표시 재시도 간격 (마지막 값은 쓰이지 않음)
+BORROW_POLL_MS = 200                # 빌려 쓸 수 있을 때 자기 Stream을 기다리는 최대 시간 (그 뒤 빌릴 것을 다시 본다)
 
 
 class DeadlinePassed(Exception):
@@ -39,7 +45,8 @@ class DeadlinePassed(Exception):
 class Worker:
     def __init__(self, name: str, cfg: StreamConfig, redis, mcp: McpClient, *,
                  concurrency: int | None = None, block_ms: int = 1000, extras: dict | None = None,
-                 shutdown_grace_sec: float | None = None) -> None:
+                 shutdown_grace_sec: float | None = None,
+                 borrow: StreamConfig | None = None, borrow_slots: int = 0) -> None:
         self.name = f"{cfg.key}-{name}"          # consumer 이름 = lease 소유자 이름
         self.cfg = cfg
         self.r = redis
@@ -52,6 +59,9 @@ class Worker:
         self.running: set[asyncio.Task] = set()
         self.active_jobs: set[str] = set()        # 이 프로세스가 지금 실행 중인 job_id (중복 실행 보조 방어)
         self.dead = False                         # SimulatedDeath (시험·데모용 프로세스 죽음)
+        self.borrow = borrow if borrow_slots > 0 else None
+        self.borrow_slots = min(borrow_slots, self.concurrency - 1) if self.borrow else 0   # 자기 몫 최소 1개
+        self.borrowed = 0                         # 지금 실행 중인 빌린 작업 수
 
     # ── 메인 루프 ──
     async def run(self, stop: asyncio.Event) -> str:
@@ -60,7 +70,8 @@ class Worker:
         await self._ensure_group()
         log("start", f"stream={self.cfg.stream} 동시 {self.concurrency}개 · lease {self.cfg.lease_sec:g}s · "
                      f"재배송 {self.cfg.claim_idle_ms / 1000:g}s · 한도 {self.cfg.max_attempts}회 · "
-                     f"핸들러 {sorted(self.handlers)}")
+                     f"핸들러 {sorted(self.handlers)}"
+                     + (f" · {self.borrow.stream}에서 최대 {self.borrow_slots}개 빌려 씀" if self.borrow else ""))
         slots = asyncio.Semaphore(self.concurrency)
         while not stop.is_set() and not self.dead:
             if not await self._acquire_or_stop(slots, stop):   # 빈 자리가 나거나 종료 신호가 오거나
@@ -83,9 +94,12 @@ class Worker:
                 if not self.block_ms:
                     await asyncio.sleep(0.2)
                 continue
+            borrowed = msg[3] is not self.cfg
+            if borrowed:
+                self.borrowed += 1
             t = asyncio.create_task(self._guarded(*msg))
             self.running.add(t)
-            t.add_done_callback(lambda t: (self.running.discard(t), slots.release()))
+            t.add_done_callback(lambda t, b=borrowed: self._done(t, slots, b))
         if self.dead:
             for t in self.running:                        # 죽은 프로세스는 아무것도 정리하지 않는다
                 t.cancel()
@@ -93,6 +107,12 @@ class Worker:
             return "died"
         await self._drain()
         return "stopped"
+
+    def _done(self, t: asyncio.Task, slots: asyncio.Semaphore, borrowed: bool) -> None:
+        self.running.discard(t)
+        if borrowed:
+            self.borrowed -= 1
+        slots.release()
 
     @staticmethod
     async def _acquire_or_stop(slots: asyncio.Semaphore, stop: asyncio.Event) -> bool:
@@ -112,25 +132,42 @@ class Worker:
         return False
 
     async def _ensure_group(self) -> None:
-        try:
-            await self.r.xgroup_create(self.cfg.stream, S.GROUP, id="0", mkstream=True)
-        except ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
+        for cfg in filter(None, (self.cfg, self.borrow)):
+            try:
+                await self.r.xgroup_create(cfg.stream, S.GROUP, id="0", mkstream=True)
+            except ResponseError as e:
+                if "BUSYGROUP" not in str(e):
+                    raise
 
     async def _next(self):
-        """(msg_id, job_id, how) 또는 None. 방치된 메시지 회수가 새 메시지보다 먼저다."""
-        _, claimed, _ = await self.r.xautoclaim(self.cfg.stream, S.GROUP, self.name,
-                                                min_idle_time=self.cfg.claim_idle_ms, start_id="0-0", count=1)
-        if claimed:
-            msg_id, fields = claimed[0]
-            return msg_id, fields["job_id"], "재배송"
-        res = await self.r.xreadgroup(S.GROUP, self.name, {self.cfg.stream: ">"}, count=1,
-                                      block=self.block_ms or None)
+        """(msg_id, job_id, how, cfg) 또는 None. 방치된 메시지 회수가 새 메시지보다, 자기 레인이 빌린 레인보다 먼저다."""
+        if m := await self._claim(self.cfg):
+            return m
+        if not (self.borrow and self.borrowed < self.borrow_slots):
+            return await self._read(self.cfg, self.block_ms or None)
+        if m := await self._read(self.cfg, None):
+            return m
+        if m := await self._claim(self.borrow) or await self._read(self.borrow, None):
+            return m
+        return await self._read(self.cfg, min(self.block_ms, BORROW_POLL_MS)) if self.block_ms else None
+
+    def _how(self, cfg: StreamConfig, how: str) -> str:
+        return how if cfg is self.cfg else f"빌림·{how}"
+
+    async def _claim(self, cfg: StreamConfig):
+        _, claimed, _ = await self.r.xautoclaim(cfg.stream, S.GROUP, self.name,
+                                                min_idle_time=cfg.claim_idle_ms, start_id="0-0", count=1)
+        if not claimed:
+            return None
+        msg_id, fields = claimed[0]
+        return msg_id, fields["job_id"], self._how(cfg, "재배송"), cfg
+
+    async def _read(self, cfg: StreamConfig, block: int | None):
+        res = await self.r.xreadgroup(S.GROUP, self.name, {cfg.stream: ">"}, count=1, block=block)
         if not res:
             return None
         msg_id, fields = res[0][1][0]
-        return msg_id, fields["job_id"], "신규"
+        return msg_id, fields["job_id"], self._how(cfg, "신규"), cfg
 
     async def _drain(self) -> None:
         if self.running:
@@ -144,14 +181,14 @@ class Worker:
         log("stop", "종료")
 
     # ── 메시지 하나 ──
-    async def _guarded(self, msg_id: str, job_id: str, how: str) -> None:
+    async def _guarded(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig) -> None:
         """process 바깥의 마지막 안전망. 여기까지 온 오류는 ACK 없이 두므로 재배송된다."""
         if job_id in self.active_jobs:
             log("skip", f"{job_id}: 이 worker가 이미 실행 중 → 손대지 않음")
             return
         self.active_jobs.add(job_id)
         try:
-            await self.process(msg_id, job_id, how)
+            await self.process(msg_id, job_id, how, cfg)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -159,11 +196,12 @@ class Worker:
         finally:
             self.active_jobs.discard(job_id)
 
-    async def process(self, msg_id: str, job_id: str, how: str) -> None:
+    async def process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig | None = None) -> None:
         ACTOR.set(self.name)
-        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=self.cfg.lease_sec)
+        cfg = cfg or self.cfg                     # 이 메시지가 온 레인의 설정 (빌린 작업이면 빌려 온 레인)
+        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec)
         if st["status"] in ("done", "failed", "unknown"):
-            await self._ack(msg_id)
+            await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이미 {st['status']} → ACK만")
             return
         if st["status"] == "leased":
@@ -172,8 +210,8 @@ class Worker:
 
         kind = st["kind"]
         ctx = JobContext(job_id=job_id, kind=kind, payload=st["payload"], attempt=st["attempt"],
-                         permit=st["permit"], worker=self.name, cfg=self.cfg, mcp=self.mcp,
-                         max_attempts=S.max_attempts_for(kind, self.cfg),
+                         permit=st["permit"], worker=self.name, cfg=cfg, mcp=self.mcp,
+                         max_attempts=S.max_attempts_for(kind, cfg),
                          deadline_at=st["payload"].get("deadline_at"), extras=self.extras)
         fn = self.handlers.get(kind)
         left = ctx.time_left()
@@ -182,12 +220,12 @@ class Worker:
         try:
             if fn is None:
                 raise FatalError(f"핸들러 없음: {kind}")
-            timeout = self.cfg.job_timeout_sec
+            timeout = cfg.job_timeout_sec
             if left is not None:
                 if left <= 0:
                     raise DeadlinePassed()
                 timeout = min(timeout, left)
-            async with Lease(ctx, touch=lambda: self._touch(msg_id)):
+            async with Lease(ctx, touch=lambda: self._touch(msg_id, cfg)):
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")
@@ -212,11 +250,11 @@ class Worker:
                 await self._fail(ctx, msg_id, f"시도 한도 초과 ({reason})", user_retryable=True)
             else:
                 await self._ctl(ctx, "job_release", reason=reason)
-                log("retry", f"{job_id}: {reason} → lease 반납, {self.cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
+                log("retry", f"{job_id}: {reason} → lease 반납, {cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
         else:
             confirmed = await self._confirm(ctx, "job_finish", "finished")
             if confirmed:
-                await self._ack(msg_id)
+                await self._ack(msg_id, cfg)
                 log("done", f"{job_id} 완료 → XACK")
             else:
                 log("done", f"{job_id}: 완료 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
@@ -224,7 +262,7 @@ class Worker:
     async def _fail(self, ctx: JobContext, msg_id: str, reason: str, *, user_retryable: bool) -> None:
         confirmed = await self._confirm(ctx, "job_fail", "failed", reason=reason, user_retryable=user_retryable)
         if confirmed:
-            await self._ack(msg_id)
+            await self._ack(msg_id, ctx.cfg)
             log("fail", f"{ctx.job_id}: 실패 확정 ({reason}){' · 다시 시도 가능' if user_retryable else ''} → XACK")
         else:
             log("fail", f"{ctx.job_id}: 실패 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
@@ -254,10 +292,10 @@ class Worker:
         except Exception as e:
             log("error", f"{ctx.job_id}: {name} 실패({type(e).__name__}: {e})")
 
-    async def _touch(self, msg_id: str) -> None:
+    async def _touch(self, msg_id: str, cfg: StreamConfig) -> None:
         """Redis 메시지의 방치 시간을 0으로 (소유자는 그대로 나). 살아 있는 작업이 재배송되지 않게 한다."""
-        await self.r.xclaim(self.cfg.stream, S.GROUP, self.name, 0, [msg_id], justid=True)
+        await self.r.xclaim(cfg.stream, S.GROUP, self.name, 0, [msg_id], justid=True)
 
-    async def _ack(self, msg_id: str) -> None:
-        await self.r.xack(self.cfg.stream, S.GROUP, msg_id)
+    async def _ack(self, msg_id: str, cfg: StreamConfig) -> None:
+        await self.r.xack(cfg.stream, S.GROUP, msg_id)
 

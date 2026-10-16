@@ -11,8 +11,8 @@
 | 내부 MCP 서버 | `notree/mcp_server/` | DB를 혼자 소유. 작업·체크포인트·발행 도구 제공 | 직접 |
 | api | (흉내: `notree/dev/enqueue.py`) | 사용자 요청을 받아 **의도(intent)** 만 기록 | MCP 경유 ※ |
 | scheduler | `notree/scheduler/` | 배정기: 의도 → 실행 허가 → Redis에 `job_id`만 넣음. 주기 작업: 누락 복구·체크포인트 정리 | MCP 경유 ※ |
-| worker-rt / worker-batch | `notree/worker/` | Redis에서 받아 핸들러 실행, 체크포인트 저장, 발행, ACK | **MCP만** |
-| Redis 7 | — | `notree:rt`, `notree:batch` Stream, consumer group `workers` | — |
+| worker-qa / worker-rt / worker-batch | `notree/worker/` | Redis에서 받아 핸들러 실행, 체크포인트 저장, 발행, ACK | **MCP만** |
+| Redis 7 | — | `notree:qa`(Q&A·채점), `notree:rt`(실시간 요약), `notree:batch` Stream, consumer group `workers` | — |
 
 ※ 실제 설계에서 api와 scheduler는 PG에 직접 붙습니다. 이 PoC는 DB를 MCP 서버 하나에 모아 두어서 MCP 도구로 흉내 냈습니다.
 **worker가 DB에 직접 붙지 않는다**는 원칙만은 설계서 그대로입니다.

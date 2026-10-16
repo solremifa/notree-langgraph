@@ -9,6 +9,18 @@
 
 ---
 
+## 2026-10-16
+
+### 레인 분리: Q&A·채점 전용 qa 레인 + 빌려 쓰기 · (이번 커밋)
+자세히: [docs/changes/2026-10-16-lanes.md](docs/changes/2026-10-16-lanes.md) (브랜치 `feat/lanes`)
+
+- 🆕 `qa` 레인(`notree:qa`): Q&A·채점이 실시간 요약 뒤에 줄 서지 않게 분리 (PG 실측에서 Q&A 56초의 원인)
+- 🆕 빌려 쓰기: `--borrow-slots N` / `NOTREE_QA_BORROW_SLOTS` — qa가 비면 rt 작업을 N개까지. 기본 0(고정)
+- 🆕 `notree/dev/lane_bench.py`: 한 대기열 / 고정 / 빌려 쓰기를 실제 worker·Redis로 비교
+- 🔧 worker는 메시지가 온 레인의 설정으로 lease·재배송·ACK (`process`, `_ack`, `_touch`에 `cfg` 인자)
+- ⚠️ `qa`, `grading` 작업이 `notree:rt` → `notree:qa`로 감 → **qa worker를 따로 띄워야 함** (`--stream qa`)
+- 테스트 71 → 77개
+
 ## 2026-10-15
 
 ### Q&A 결과 계약: 문장 정제, notice_code, sources · `7b8bae4`
