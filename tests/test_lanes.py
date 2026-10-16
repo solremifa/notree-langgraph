@@ -104,3 +104,70 @@ def test_borrow_slots_never_take_the_last_slot():
     w = Worker("x", w_cfg, None, None, borrow=RT, borrow_slots=5)
     assert w.borrow_slots == 1
     assert Worker("x", w_cfg, None, None, borrow=RT, borrow_slots=0).borrow is None
+
+
+def _flood_pending(db, n: int, stream: str = "notree:rt") -> None:
+    """요약 의도 n개를 대기 상태로 직접 넣는다 (MCP로 하나씩 만들면 느려서)."""
+    import json
+    import sqlite3
+    now = time.time() - 60
+    con = sqlite3.connect(db, timeout=10)
+    con.executemany("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    [(f"flood-{i}", "live_summary", json.dumps({}), stream, "pending", now + i * 1e-3, now, "u")
+                     for i in range(n)])
+    con.commit()
+    con.close()
+
+
+async def _time_until_sent(e, job_id, limit: float) -> float | None:
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if (await e.row(job_id))["state"] != "pending":
+            return time.time() - t0
+        await asyncio.sleep(0.05)
+    return None
+
+
+def test_allocator_does_not_queue_qa_behind_summary_backlog(tmp_path):
+    """요약 2,000개가 대기 중이어도 Q&A 의도는 다음 바퀴에 배정된다 (리뷰 재현: 이전에는 201번째 묶음, 약 100초)."""
+    from notree.scheduler.allocator import run_allocator
+
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            _flood_pending(e.db, 2000)
+            q = (await e.api.tool("job_create", kind="qa", payload={}, user_id="u"))["job_id"]
+            e.tasks.append(asyncio.create_task(run_allocator(e.r, e.m_s, e.stop, interval=0.5)))
+            took = await _time_until_sent(e, q, 3)
+            assert took is not None and took < 1.0, took
+            assert (await e.row(q))["state"] == "sent"
+    run(t())
+
+
+def test_mixed_allocator_shows_the_old_delay(tmp_path):
+    """비교: 레인 구분 없이(lanes=()) 고르면 Q&A가 요약 뒤에 줄 선다."""
+    from notree.scheduler.allocator import run_allocator
+
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            _flood_pending(e.db, 2000)
+            q = (await e.api.tool("job_create", kind="qa", payload={}, user_id="u"))["job_id"]
+            e.tasks.append(asyncio.create_task(run_allocator(e.r, e.m_s, e.stop, interval=0.5, lanes=())))
+            assert await _time_until_sent(e, q, 1.5) is None
+    run(t())
+
+
+def test_allocator_quota_per_round(tmp_path):
+    """한 바퀴에 레인마다 몫만큼, 우선순위 순서로. 한 주기 상한을 넘지 않는다."""
+    from notree.scheduler.allocator import allocate_once
+
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            _flood_pending(e.db, 30, "notree:rt")
+            for i in range(3):
+                await e.api.tool("job_create", kind="qa", payload={}, user_id="u")
+            sent = await allocate_once(e.r, e.m_s, lanes=(("qa", 2), ("rt", 5)), max_per_tick=12)
+            assert sent == 12
+            assert await e.r.xlen("notree:qa") == 3       # qa는 2 + 1 (두 번째 바퀴)
+            assert await e.r.xlen("notree:rt") == 9
+    run(t())

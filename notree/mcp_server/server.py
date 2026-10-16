@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS notes(
   idem_key TEXT PRIMARY KEY, course TEXT, note TEXT, status TEXT);
 CREATE TABLE IF NOT EXISTS tool_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT, thread_id TEXT);
+CREATE INDEX IF NOT EXISTS jobs_pending_lane ON jobs(state, stream, created);
 """
 # 나중에 추가된 컬럼 (이전 버전 DB 호환)
 ADDED_COLUMNS = [
@@ -341,11 +342,16 @@ def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None
 
 
 @tool
-def job_reserve_pending(limit: int = 10) -> dict:
-    """[scheduler 배정기] 대기 중인 의도 → 실행 허가(reserved). 동시 상한·예산 검사가 들어갈 자리."""
+def job_reserve_pending(limit: int = 10, stream: str | None = None) -> dict:
+    """[scheduler 배정기] 대기 중인 의도 → 실행 허가(reserved). 동시 상한·예산 검사가 들어갈 자리.
+    stream을 주면 그 레인만 고른다. 어떤 레인을 얼마나 먼저 고를지는 배정기(애플리케이션)가 정한다."""
     with db() as con:
-        rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' ORDER BY created LIMIT ?",
-                           (limit,)).fetchall()
+        if stream is None:
+            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' ORDER BY created LIMIT ?",
+                               (limit,)).fetchall()
+        else:
+            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' AND stream=? "
+                               "ORDER BY created LIMIT ?", (stream, limit)).fetchall()
         for r in rows:
             _set(con, r["job_id"], state="reserved")
             _log(con, "job_reserve_pending", r["job_id"])

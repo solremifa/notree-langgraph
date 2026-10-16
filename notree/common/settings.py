@@ -59,6 +59,17 @@ BORROW: dict[str, tuple[str, int]] = {
     "qa": ("rt", int(_f("NOTREE_QA_BORROW_SLOTS", 0))),
 }
 
+# 배정기: 레인별로 따로 고른다 (한 레인이 밀려도 다른 레인의 의도가 그 뒤에 줄 서지 않게).
+# 한 바퀴에 레인마다 최대 몫만큼, 앞 레인부터. 어느 레인이든 몫을 다 채웠으면 쉬지 않고 다음 바퀴.
+# 한 주기에 ALLOC_MAX_PER_TICK개를 넘기면 쉬었다 간다 (MCP·DB를 한 번에 몰아치지 않게).
+ALLOC_LANES: tuple[tuple[str, int], ...] = (           # (레인, 한 바퀴 몫). 순서 = 우선순위
+    ("qa", int(_f("NOTREE_ALLOC_QA", 10))),
+    ("rt", int(_f("NOTREE_ALLOC_RT", 10))),
+    ("batch", int(_f("NOTREE_ALLOC_BATCH", 5))),
+)
+ALLOC_INTERVAL_SEC = _f("NOTREE_ALLOC_INTERVAL_SEC", 0.5)
+ALLOC_MAX_PER_TICK = int(_f("NOTREE_ALLOC_MAX_PER_TICK", 200))
+
 # 작업 종류별 시도 한도 (팀 결정 3번). 없으면 Stream 기본값(rt 2, batch 3)
 KIND_MAX_ATTEMPTS: dict[str, int] = {
     "live_summary": 1,          # 곧 다음 요약이 오므로 재시도 가치가 낮다

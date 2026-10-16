@@ -11,6 +11,16 @@
 
 ## 2026-10-16
 
+### 레인 리뷰 반영: 배정 단계 레인 분리, 벤치마크 집계 · (이번 커밋)
+자세히: [docs/changes/2026-10-16-lanes.md](docs/changes/2026-10-16-lanes.md) "리뷰 반영" (브랜치 `feat/lanes`)
+
+- 🐛 배정기가 모든 레인을 생성 순서로 골라 요약 2,000개 뒤 Q&A가 약 100초 늦게 나가던 문제 → 레인별 몫으로 배정 (`settings.ALLOC_LANES`)
+- 🆕 `job_reserve_pending`에 선택 인자 `stream` (레인별 조회). `jobs(state, stream, created)` 인덱스
+- 🐛 `lane_bench` 처리량에 측정 종료 뒤 끝난 작업이 들어가던 문제 → 구간 안 완료만, 남은 대기열·시작 못 한 작업 함께 보고
+- 🆕 `lane_bench --alloc mixed,lanes --burst N`: 실제 배정기 코드까지 포함해 측정. `--seed`
+- 🔧 측정 표 전부 다시 잼 (시드 3개). 처음 표는 폐기
+- 테스트 77 → 80개
+
 ### 레인 분리: Q&A·채점 전용 qa 레인 + 빌려 쓰기 · `1f4a5cc`
 자세히: [docs/changes/2026-10-16-lanes.md](docs/changes/2026-10-16-lanes.md) (브랜치 `feat/lanes`)
 
@@ -20,6 +30,7 @@
 - 🔧 worker는 메시지가 온 레인의 설정으로 lease·재배송·ACK (`process`, `_ack`, `_touch`에 `cfg` 인자)
 - ⚠️ `qa`, `grading` 작업이 `notree:rt` → `notree:qa`로 감 → **qa worker를 따로 띄워야 함** (`--stream qa`)
 - 테스트 71 → 77개
+- 측정 표는 집계 오류가 있어 위 항목에서 다시 잼
 
 ## 2026-10-15
 

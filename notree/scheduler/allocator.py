@@ -2,9 +2,14 @@
 
     uv run python -m notree.scheduler.allocator      (주기 작업 periodic.py도 같이 돈다)
 
-실제 설계에서는 PG에 직접 붙어 SKIP LOCKED로 의도를 고르고, 사용자·과목 동시 상한과 예산을 확인한다.
-이 PoC는 같은 일을 MCP 서버의 job_reserve_pending / job_mark_sent 도구로 흉내 낸다.
-작업 종류별 Stream(rt/batch)은 의도에 기록된 stream 값을 따른다.
+DB에는 "이 레인의 대기 의도를 생성 순서로 N개 고르고 허가로 바꾼다"(job_reserve_pending stream=…)만 맡기고,
+어느 레인을 얼마나 먼저 고를지는 여기서 정한다 (settings.ALLOC_LANES).
+
+한 주기
+  바퀴마다 qa → rt → batch 순으로 레인별 몫만큼 고름
+  어느 레인이든 몫을 다 채웠으면(더 남았을 수 있음) 쉬지 않고 다음 바퀴, 한 주기 최대 ALLOC_MAX_PER_TICK개
+  → rt에 요약 2,000개가 쌓여 있어도 qa 의도는 다음 바퀴(수 ms~수십 ms) 안에 나간다
+lanes=()이면 레인 구분 없이 생성 순서로 고른다 (레인 분리 전 방식, 비교용).
 """
 import asyncio
 
@@ -15,15 +20,43 @@ from notree.common.log import ACTOR, log
 from notree.worker.mcp_client import McpClient
 
 
-async def run_allocator(r, mcp: McpClient, stop: asyncio.Event | None = None, interval: float = 0.5) -> None:
+async def _send(r, mcp: McpClient, j: dict) -> None:
+    msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
+    await mcp.tool("job_mark_sent", job_id=j["job_id"])
+    log("allocator", f"{j['job_id']} [{j['kind']}] 허가 → XADD {j['stream']} {msg_id}")
+
+
+async def allocate_once(r, mcp: McpClient, lanes=S.ALLOC_LANES, max_per_tick: int = S.ALLOC_MAX_PER_TICK) -> int:
+    """한 주기 분량을 배정하고 보낸 수를 돌려준다."""
+    if not lanes:                                        # 레인 구분 없음 (비교용)
+        jobs = (await mcp.tool("job_reserve_pending", limit=10))["jobs"]
+        for j in jobs:
+            await _send(r, mcp, j)
+        return len(jobs)
+    sent = 0
+    while sent < max_per_tick:
+        more = False
+        for key, quota in lanes:
+            n = min(quota, max_per_tick - sent)
+            if n <= 0:
+                break
+            jobs = (await mcp.tool("job_reserve_pending", limit=n, stream=S.STREAMS[key].stream))["jobs"]
+            for j in jobs:
+                await _send(r, mcp, j)
+            sent += len(jobs)
+            more |= len(jobs) == n
+        if not more:
+            break
+    return sent
+
+
+async def run_allocator(r, mcp: McpClient, stop: asyncio.Event | None = None,
+                        interval: float = S.ALLOC_INTERVAL_SEC, lanes=S.ALLOC_LANES) -> None:
     ACTOR.set("scheduler")
     stop = stop or asyncio.Event()
     while not stop.is_set():
         try:
-            for j in (await mcp.tool("job_reserve_pending", limit=10))["jobs"]:
-                msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
-                await mcp.tool("job_mark_sent", job_id=j["job_id"])
-                log("allocator", f"{j['job_id']} [{j['kind']}] 허가 → XADD {j['stream']} {msg_id}")
+            await allocate_once(r, mcp, lanes)
         except Exception as e:  # 한 번 실패해도 배정기는 죽지 않는다.
             # 허가(reserved) 뒤 XADD 전에 실패하면 그 의도는 reserved에 머문다 → periodic.resend_stale이 다시 보냄
             log("error", f"배정 실패({type(e).__name__}: {e}) → 다음 주기에 재시도")

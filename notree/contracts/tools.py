@@ -33,6 +33,7 @@ class JobCreateOut(BaseModel):
 
 class JobReservePendingIn(BaseModel):
     limit: int = 10
+    stream: str | None = Field(None, description="이 레인(Stream)의 의도만 고른다. 생략하면 모든 레인을 생성 순서로 (레인 분리 전 방식)")
 
 
 class ReservedJob(BaseModel):
@@ -435,7 +436,7 @@ LEAD = "worker 담당"
 TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     # 작업 제어
     ToolSpec("job_create", JobCreateIn, JobCreateOut, API, "control", LEAD, summary="의도(intent) 기록. 실제로는 api가 PG에 직접"),
-    ToolSpec("job_reserve_pending", JobReservePendingIn, JobListOut, SCH, "control", LEAD, summary="대기 의도 → 실행 허가"),
+    ToolSpec("job_reserve_pending", JobReservePendingIn, JobListOut, SCH, "control", LEAD, summary="대기 의도 → 실행 허가. stream을 주면 그 레인만 (배정기가 레인별로 부름)"),
     ToolSpec("job_mark_sent", JobIdIn, JobMarkSentOut, SCH, "control", LEAD, summary="XADD 후 전송 완료 표시"),
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
