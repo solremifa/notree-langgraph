@@ -1,14 +1,22 @@
 """Q&A 근거 탐색 그래프.
 
-    START → understand ─(관련 없음)──────────────────────────────────────────┐
-                └→ search_note ─(충분)────────────────────────────────────→ answer → verify ─(통과)→ save → END
-                       ├(부족)→ search_transcript ─(충분)─────────────────→   ▲         │
-                       │              ├(부족)→ search_web ───────────────→   │         ├(인용 문제·재시도 남음)→ answer
-                       │              └(시간 없음)→ skip_web ──────────────→   │         └(답할 수 없음·남은 출처·시간)→ 다음 search_*
-                       └(시간 없음)→ skip_transcript ──────────────────────→   ┘
+    START → understand ─(관련 없음)──────────────────────────────────────────────────┐
+                └→ search_note ─(충분)────────────────────────────────────────────→ answer → verify ─(통과)→ save → END
+                       ├(부족)→ search_transcript ─(충분)─────────────────────────→   ▲         │
+                       │        (노트로 고른 강의 2개)  ├(우선 결과 < EXPAND_MIN)→ search_transcript_all ┐ ├(인용 문제·재시도 남음)→ answer
+                       │                              ├(부족)→ search_web ──────→   │  (과목 전체)    │ └(답할 수 없음·남은 출처·시간)→ 다음 search_*
+                       │                              └(시간 없음)→ skip_web ────→   │ ←──(충분/부족·웹)┘
+                       └(시간 없음)→ skip_transcript ──────────────────────────────→   ┘
 
 규칙
 - 검색을 멈추는 기준: 최고 점수 ≥ ENOUGH_SCORE
+- 전사는 두 단계 (2026-10-17, 실제 강의 7개·질문 33개로 정한 잠정값. docs/measurements/2026-10-17-pg-search):
+  · search_transcript: 노트 결과의 강의별 최고 점수로 PRIORITY_LECTURES(2)개 강의를 골라 그 안에서만. 노트 결과에 강의가 없으면 과목 전체
+  · 우선 결과의 최고 점수 < EXPAND_MIN(0.3)이면 바로 search_transcript_all(과목 전체)
+  · EXPAND_MIN 이상(충분 기준 미만)이면 웹으로 가지 않고 먼저 답한다. LLM이 "근거가 더 필요"하다고 하면
+    남은 시간·LLM 호출 예산 안에서 다음 출처로 search_transcript_all → 웹
+  · 노트 결과에 강의 정보가 없어 과목 전체로 찾은 경우는 예전과 같음 (부족하면 웹)
+  · 확장 기준(EXPAND_MIN)과 충분 기준(ENOUGH_SCORE)은 다른 판단. 최종 답변 가능 여부는 점수가 아니라 LLM이 판단 (정확성 보장은 아님)
 - LLM에게 주는 근거: 점수 ≥ EVIDENCE_MIN인 것 (멈춤 기준보다 낮게. 애매한 점수의 정답 근거도 LLM이 판단하게)
 - 점수가 높아도 LLM이 "답할 수 없음"(needs_more_evidence)이라고 하면, 남은 출처와 시간이 있을 때 다음 출처를 찾는다
 - 웹은 단계도 요청도 최대 1번 (장애가 나도 다시 요청하지 않음). LLM 호출은 실행 전체에서 MAX_LLM_CALLS번까지
@@ -41,6 +49,8 @@ from notree.graphs.qa.retriever import SearchForbidden, SearchUnavailable
 from notree.graphs.qa.state import HitDict, QAState
 
 ENOUGH_SCORE = 0.6       # 이 이상이면 더 찾지 않음
+EXPAND_MIN = 0.3         # 우선 강의 전사의 최고 점수가 이 미만이면 과목 전체 전사로 바로 넓힘 (잠정)
+PRIORITY_LECTURES = 2    # 노트 결과로 고르는 전사 우선 강의 수 (잠정)
 EVIDENCE_MIN = 0.3       # 이 이상이면 LLM에게 근거로 줌
 MAX_EVIDENCE = 5
 TRANSCRIPT_MIN_SEC = 10.0
@@ -55,9 +65,9 @@ MIN_ANSWER_SEC = 3.0
 
 INSUFFICIENT_TEXT = "근거를 확인할 수 있는 답을 만들지 못했습니다. 질문을 조금 더 구체적으로 해 주세요."
 TIMEOUT_TEXT = "시간 안에 답을 만들지 못했습니다. 잠시 뒤 다시 물어봐 주세요."
-SOURCES = ("note", "transcript", "web")
-MIN_SEC = {"note": 0.0, "transcript": TRANSCRIPT_MIN_SEC, "web": WEB_MIN_SEC}
-SEARCH_RETRIES = {"note": 1, "transcript": 1, "web": 0}   # 장애 때 다시 요청하는 횟수. 웹은 요청 비용 때문에 0
+SOURCES = ("note", "transcript", "transcript_all", "web")
+MIN_SEC = {"note": 0.0, "transcript": TRANSCRIPT_MIN_SEC, "transcript_all": TRANSCRIPT_MIN_SEC, "web": WEB_MIN_SEC}
+SEARCH_RETRIES = {"note": 1, "transcript": 1, "transcript_all": 1, "web": 0}   # 장애 때 다시 요청하는 횟수. 웹은 요청 비용 때문에 0
 
 
 class QAFatal(Exception):
@@ -84,8 +94,23 @@ def enough(hits: list[HitDict]) -> bool:
 
 
 def evidence(hits: list[HitDict]) -> list[HitDict]:
-    """답변에 넘길 근거: EVIDENCE_MIN 이상, 점수 순, 최대 MAX_EVIDENCE개."""
-    return sorted((h for h in hits if h["score"] >= EVIDENCE_MIN), key=lambda h: -h["score"])[:MAX_EVIDENCE]
+    """답변에 넘길 근거: EVIDENCE_MIN 이상, 점수 순, 최대 MAX_EVIDENCE개. 같은 ID는 한 번만 (단계마다 다시 찾은 경우).
+    검색 단계의 순서(우선 강의 먼저)는 여기서 유지되지 않는다 — 점수순으로 다시 고른다 (측정으로 확인할 정책)."""
+    by_id: dict[str, HitDict] = {}
+    for h in hits:
+        if h["score"] >= EVIDENCE_MIN and (h["id"] not in by_id or h["score"] > by_id[h["id"]]["score"]):
+            by_id[h["id"]] = h
+    return sorted(by_id.values(), key=lambda h: -h["score"])[:MAX_EVIDENCE]
+
+
+def priority_lectures(hits: list[HitDict]) -> list[str]:
+    """노트 결과에서 강의별 최고 점수가 높은 순으로 PRIORITY_LECTURES개."""
+    best_by: dict[str, float] = {}
+    for h in hits:
+        lec = h.get("lecture_id")
+        if h["source"] == "note" and lec:
+            best_by[lec] = max(best_by.get(lec, 0.0), h["score"])
+    return sorted(best_by, key=lambda k: -best_by[k])[:PRIORITY_LECTURES]
 
 
 def label_for(related: bool, cited: list[HitDict]) -> str:
@@ -174,6 +199,15 @@ def _search(source: str):
     async def node(state: QAState, config: RunnableConfig) -> dict:
         retriever, notes, attempted = _cfg(config)["retriever"], [], False
         reset = {"answer_attempts": 0, "verify_problem": "", "needs_more": False}
+        kind, extra, scope = source, {}, None
+        if source == "transcript":                 # 노트로 고른 강의 안에서 먼저
+            scope = priority_lectures(state.get("hits", [])) or None
+            extra = {"transcript_lectures": scope or []}
+            done = [source] if scope else [source, "transcript_all"]     # 과목 전체로 찾았으면 확장 단계는 필요 없음
+        elif source == "transcript_all":           # 과목 전체 (우선 강의에서 찾은 것과 겹치면 evidence가 하나로 합침)
+            kind, done = "transcript", [source]
+        else:
+            done = [source]
         for i in range(1 + SEARCH_RETRIES[source]):
             limit = min(SEARCH_TIMEOUT_SEC, time_left(config) - ANSWER_RESERVE_SEC)
             if limit <= 0:
@@ -181,14 +215,16 @@ def _search(source: str):
                 break
             attempted = True
             try:
-                hits = await asyncio.wait_for(retriever.search(source, state.get("keywords", [])), timeout=limit)
-                return {"hits": hits, "searched": [source], "queried": [source], "skipped": notes, **reset}
+                call = (retriever.search(kind, state.get("keywords", []), lecture_ids=scope) if scope
+                        else retriever.search(kind, state.get("keywords", [])))
+                hits = await asyncio.wait_for(call, timeout=limit)
+                return {"hits": hits, "searched": done, "queried": [source], "skipped": notes, **reset, **extra}
             except (SearchUnavailable, TimeoutError) as e:
                 why = "시간 초과" if isinstance(e, TimeoutError) else f"일시 장애: {e}"
                 notes.append(f"{source}: {why} → {'다시 시도' if i < SEARCH_RETRIES[source] else '건너뜀'}")
             except SearchForbidden as e:
                 raise QAFatal(f"{source} 검색 불가: {e}") from e
-        return {"hits": [], "searched": [source], "queried": [source] if attempted else [], "skipped": notes, **reset}
+        return {"hits": [], "searched": done, "queried": [source] if attempted else [], "skipped": notes, **reset, **extra}
     node.__name__ = f"search_{source}"
     return node
 
@@ -276,6 +312,21 @@ def after_notes(state: QAState, config: RunnableConfig) -> str:
 
 
 def after_transcript(state: QAState, config: RunnableConfig) -> str:
+    hits = state.get("hits", [])
+    if enough(hits):
+        return "answer"
+    if state.get("transcript_lectures"):           # 강의 우선으로 찾은 경우
+        lecs = set(state["transcript_lectures"])
+        top = best([h for h in hits if h.get("lecture_id") in lecs], ("transcript",))
+        if top is None or top["score"] < EXPAND_MIN:
+            if next_source(state, config) == "transcript_all":
+                return "search_transcript_all"     # 우선 강의에서 거의 못 찾음 → 바로 과목 전체
+        else:
+            return "answer"                        # 관련 근거는 있음 → 답해 보고, LLM이 부족하다고 하면 과목 전체 → 웹
+    return "search_web" if next_source(state, config) == "web" else "skip_web"
+
+
+def after_transcript_all(state: QAState, config: RunnableConfig) -> str:
     if enough(state.get("hits", [])):
         return "answer"
     return "search_web" if next_source(state, config) == "web" else "skip_web"
@@ -316,11 +367,12 @@ def build_qa_graph():
     g.add_edge(START, "understand")
     g.add_conditional_edges("understand", after_understand, ["search_note", "answer"])
     g.add_conditional_edges("search_note", after_notes, ["answer", "search_transcript", "skip_transcript"])
-    g.add_conditional_edges("search_transcript", after_transcript, ["answer", "search_web", "skip_web"])
+    g.add_conditional_edges("search_transcript", after_transcript, ["answer", "search_transcript_all", "search_web", "skip_web"])
+    g.add_conditional_edges("search_transcript_all", after_transcript_all, ["answer", "search_web", "skip_web"])
     g.add_edge("skip_transcript", "answer")
     g.add_edge("skip_web", "answer")
     g.add_edge("search_web", "answer")
     g.add_edge("answer", "verify")
-    g.add_conditional_edges("verify", after_verify, ["answer", "save", "search_transcript", "search_web"])
+    g.add_conditional_edges("verify", after_verify, ["answer", "save", "search_transcript", "search_transcript_all", "search_web"])
     g.add_edge("save", END)
     return g.compile()

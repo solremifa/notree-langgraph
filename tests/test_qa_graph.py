@@ -364,3 +364,65 @@ def test_sources_hold_only_cited_hits_and_notice_code_is_set():
     assert out2["notice_code"] == "not_found" and out2["sources"] == [] and out2["sentences"] == []
     out3, _ = run_with("스택은 어떤 구조야?", ScriptedRetriever({"note": [LIFO]}), deadline_in=-1)
     assert out3["notice_code"] == "timeout"
+
+
+# ── 전사 우선 검색 (노트로 고른 강의 2개) → 과목 전체 확장 (2026-10-17) ──
+LEC_CORPUS = {
+    "note": [("n1", "표준화는 평균과 표준편차로 척도를 맞춘다", "L1"),
+             ("n2", "표준화 통계는 train에서 계산한다", "L2"),
+             ("n3", "스택은 LIFO 구조", "L3")],
+    "transcript": [("t1", "표준화 할 때 평균을 빼고 표준편차로 나눕니다", "L1"),
+                   ("t2", "오늘은 여기까지", "L2"),
+                   ("t9", "표준화 평균 표준편차 다시 정리하면 이렇습니다", "L9")],
+}
+
+
+class _MLLLM(FakeQALLM):
+    """가짜 LLM의 '관련성' 단어 목록은 자료구조뿐이라, 이 시험에서는 항상 관련 있음 + 정해진 검색어."""
+
+    async def understand(self, question, course):
+        from notree.graphs.qa.llm import Understanding
+        self.calls.append("understand")
+        return Understanding(related=True, keywords=["표준화", "평균", "차이", "예시"])   # 노트 최고 0.5 < 0.6 → 전사까지
+
+
+def _run_lec(question, corpus=LEC_CORPUS, **kw):
+    ret = FakeRetriever(corpus)
+    llm = _MLLLM(**kw)
+    cfg = {"configurable": {"llm": llm, "retriever": ret}}
+    return asyncio.run(build_qa_graph().ainvoke({"question": question, "course": "ML"}, cfg)), ret, llm
+
+
+def test_transcript_is_searched_in_lectures_picked_from_notes():
+    """노트 결과의 강의(L1 0.5점, L2 0.25점) 안에서 먼저 찾는다. 노트 최고 0.5(<0.6)라 전사까지 감."""
+    out, ret, _ = _run_lec("표준화 평균 차이 뭐야", cite_min=0.3)
+    assert ret.calls[:2] == ["note", "transcript"] and ret.scopes[1] == ["L1", "L2"]
+    assert out["transcript_lectures"] == ["L1", "L2"]
+    assert all(h.get("lecture_id") for h in out["hits"])                    # 강의 ID가 끝까지 남음
+
+
+def test_low_priority_score_expands_to_whole_course_immediately():
+    """우선 강의 전사의 최고 점수가 0.3 미만 → 답하기 전에 과목 전체로 넓힌다."""
+    corpus = {**LEC_CORPUS, "transcript": [("t2", "오늘은 여기까지", "L2"),
+                                            ("t9", "표준화 평균 표준편차 다시 정리", "L9")]}
+    out, ret, _ = _run_lec("표준화 평균 차이 뭐야", corpus=corpus, cite_min=0.3)
+    assert ret.calls[:3] == ["note", "transcript", "transcript"] and ret.scopes[2] is None
+    assert "transcript_all" in out["searched"] and "t9" in {h["id"] for h in out["hits"]}
+
+
+def test_decent_priority_score_answers_first_and_expands_only_if_llm_asks():
+    """우선 결과가 0.3 이상이면 웹·과목 전체로 가지 않고 먼저 답한다.
+    LLM이 근거가 더 필요하다고 하면 과목 전체 → 웹 순으로 (예산 안에서)."""
+    out, ret, _ = _run_lec("표준화 평균 차이 뭐야", cite_min=0.3)       # t1 0.5점, 답이 됨
+    assert ret.calls == ["note", "transcript"] and out["status"] == "completed"
+    out, ret, llm = _run_lec("표준화 평균 차이 뭐야", cite_min=0.9)     # 답이 안 됨 → 근거 더 필요
+    assert ret.calls[:3] == ["note", "transcript", "transcript"] and ret.scopes[2] is None
+    assert llm.calls.count("answer#1") >= 2                                  # 넓힐 때마다 다시 답함 (예산 안에서)
+
+
+def test_evidence_keeps_one_copy_per_id():
+    from notree.graphs.qa.graph import evidence
+    hs = [{"id": "t1", "source": "transcript", "text": "a", "score": 0.5, "ref": "t1"},
+          {"id": "t1", "source": "transcript", "text": "a", "score": 0.7, "ref": "t1"},
+          {"id": "n1", "source": "note", "text": "b", "score": 0.6, "ref": "n1"}]
+    assert [(h["id"], h["score"]) for h in evidence(hs)] == [("t1", 0.7), ("n1", 0.6)]

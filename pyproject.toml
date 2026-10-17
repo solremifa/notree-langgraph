@@ -11,6 +11,7 @@ dependencies = [
     "redis>=5",                           # worker·scheduler의 Redis Streams 클라이언트
     "fakeredis>=2.20",                    # demo.py에서 Redis 없이 돌릴 때
     "openai>=1.40",                       # --llm openai
+    "psycopg[binary]>=3.2",
 ]
 
 [dependency-groups]

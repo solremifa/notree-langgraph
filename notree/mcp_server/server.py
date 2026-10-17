@@ -36,6 +36,8 @@ from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # 저장소 루트 (파일 경로로 직접 띄워질 때 notree import)
 from notree.common.settings import KIND_DEADLINE_SEC  # noqa: E402
+
+QA_SEARCH = os.getenv("NOTREE_QA_SEARCH", "sqlite")      # sqlite: PoC 키워드 일치 / pg: PostgreSQL pg_trgm (pg_search.py)
 from notree.contracts import tools as C  # noqa: E402
 from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
 
@@ -567,6 +569,12 @@ def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) ->
                 raise ValueError(f"source: {d['source']}")
             con.execute("INSERT OR REPLACE INTO qa_docs VALUES(?,?,?,?,?,?,?)",
                         (course_id, d["source"], d["id"], user_id, d.get("lecture_id"), d["text"], d.get("ref") or d["id"]))
+    if QA_SEARCH == "pg":                 # 노트·전사는 PG에도 (웹 문서는 가짜 web_search용으로 SQLite에만)
+        from notree.mcp_server import pg_search
+        try:
+            pg_search.upsert_docs(user_id, course_id, docs)
+        except Exception as e:            # dev 도구: SQLite 쪽은 이미 들어갔으므로 다시 부르면 됨 (덮어씀)
+            raise Reject(ErrorCode.UNAVAILABLE, f"검색 DB: {type(e).__name__}") from e
     return ok(C.QaSeedOut(inserted=len(docs)))
 
 
@@ -607,8 +615,16 @@ def qa_search(question_id: str, source: str, keywords: list[str], limit: int = 3
     if source not in ("note", "transcript"):
         raise ValueError(f"source: {source} (웹은 web_search)")
     with db() as con:
-        q, _ = _qa_question(con, question_id, permit)
+        q, _ = _qa_question(con, question_id, permit)         # 사용자·과목 범위와 삭제된 질문은 여기서 확인
         _log(con, "qa_search", q["job_id"])
+        if QA_SEARCH == "pg":
+            from notree.mcp_server import pg_search
+            try:
+                found = pg_search.search(q["user_id"], q["course_id"], source, keywords, limit, lecture_ids)
+            except Exception as e:                            # 연결 실패 등은 일시 장애 → 그래프가 다시/다음 출처
+                raise Reject(ErrorCode.UNAVAILABLE, f"검색 DB: {type(e).__name__}") from e
+            return ok(C.QaSearchOut(hits=[C.QaHit(id=h["id"], source=source, text=h["text"], score=h["score"], ref=h["ref"],
+                                                  lecture_id=h["lecture_id"]) for h in found]))
         sql, args = "SELECT * FROM qa_docs WHERE course_id=? AND user_id=? AND source=?", [q["course_id"], q["user_id"], source]
         if lecture_ids:
             sql += f" AND lecture_id IN ({','.join('?' * len(lecture_ids))})"

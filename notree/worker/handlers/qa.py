@@ -46,14 +46,16 @@ class McpRetriever:
         self.qid = question_id
         self.calls: list[str] = []
 
-    async def search(self, source: Source, keywords: list[str], limit: int = 3) -> list[HitDict]:
-        self.calls.append(source)
+    async def search(self, source: Source, keywords: list[str], limit: int = 3,
+                     lecture_ids: list[str] | None = None) -> list[HitDict]:
+        self.calls.append(source if not lecture_ids else f"{source}@{len(lecture_ids)}강의")
         try:
             if source == "web":
                 res = await self.ctx.tool("web_search", question_id=self.qid, query=" ".join(keywords), limit=limit)
                 return [Hit(r["id"], "web", r["snippet"], r["score"], r["url"]) for r in res["results"]]
-            res = await self.ctx.tool("qa_search", question_id=self.qid, source=source, keywords=keywords, limit=limit)
-            return [Hit(h["id"], h["source"], h["text"], h["score"], h["ref"]) for h in res["hits"]]
+            args = {"lecture_ids": lecture_ids} if lecture_ids else {}
+            res = await self.ctx.tool("qa_search", question_id=self.qid, source=source, keywords=keywords, limit=limit, **args)
+            return [Hit(h["id"], h["source"], h["text"], h["score"], h["ref"], h.get("lecture_id")) for h in res["hits"]]
         except ToolRejected as e:
             raise SearchForbidden(f"{e.code}: {e}") from e
         except ToolUnavailable as e:

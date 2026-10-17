@@ -20,30 +20,40 @@ class SearchForbidden(Exception):
 class Hit(dict):
     """HitDict 생성 도우미."""
 
-    def __init__(self, id: str, source: Source, text: str, score: float, ref: str = "") -> None:
+    def __init__(self, id: str, source: Source, text: str, score: float, ref: str = "", lecture_id: str | None = None) -> None:
         super().__init__(id=id, source=source, text=text, score=round(score, 3), ref=ref or id)
+        if lecture_id:
+            self["lecture_id"] = lecture_id
 
 
 class Retriever(Protocol):
-    async def search(self, source: Source, keywords: list[str], limit: int = 3) -> list[HitDict]: ...
+    """lecture_ids를 주면 그 강의들 안에서만 (전사 우선 검색). 그래프는 범위가 있을 때만 이 인자를 넘긴다."""
+    async def search(self, source: Source, keywords: list[str], limit: int = 3,
+                     lecture_ids: list[str] | None = None) -> list[HitDict]: ...
 
 
 @dataclass
 class FakeRetriever:
     """출처별 문서 목록에서 '검색어가 몇 개 들어 있나'로 점수를 매긴다."""
 
-    docs: dict[str, list[tuple[str, str]]]                      # source → [(id, text)]
+    docs: dict[str, list[tuple]]                                # source → [(id, text)] 또는 [(id, text, 강의)]
     calls: list[str] = field(default_factory=list)
+    scopes: list = field(default_factory=list)                 # 호출마다 lecture_ids (None = 과목 전체)
 
-    async def search(self, source: Source, keywords: list[str], limit: int = 3) -> list[HitDict]:
+    async def search(self, source: Source, keywords: list[str], limit: int = 3,
+                     lecture_ids: list[str] | None = None) -> list[HitDict]:
         self.calls.append(source)
+        self.scopes.append(lecture_ids)
         if not keywords:
             return []
         hits = []
-        for doc_id, text in self.docs.get(source, []):
+        for doc_id, text, *lec in self.docs.get(source, []):
+            lecture = lec[0] if lec else None
+            if lecture_ids and lecture not in lecture_ids:
+                continue
             found = sum(1 for k in keywords if k.lower() in text.lower())
             if found:
-                hits.append(Hit(doc_id, source, text, found / len(keywords)))
+                hits.append(Hit(doc_id, source, text, found / len(keywords), lecture_id=lecture))
         return sorted(hits, key=lambda h: -h["score"])[:limit]
 
 
