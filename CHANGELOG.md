@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### 진행 상황 문서, 실제 Redis 실행 기록 · (이번 커밋)
+### 진행 상황 문서, 실제 Redis 실행 기록 · `bcf7d1d`
 - 🆕 `docs/status.md`: "PoC 구현·테스트 완료"와 운영 검증을 구분, Q&A는 "정책 흐름 구현, 실제 검색·LLM·worker 통합 전", Q&A 안의 통합 순서, 과목노트 실제 병합을 개발 목록에
 - 🆕 `docs/measurements/2026-10-17-real-redis/`: 실제 Redis + 프로세스 분리 실행 기록 (Windows 정상 경로, Linux 정상 경로 + worker 인계 90초 뒤 체크포인트에서 재개). 원본 로그 포함
 - 🔧 README 문서 목록
