@@ -74,7 +74,33 @@ def test_no_search_when_only_answer_time_is_left():
     out, llm, ret, _ = run("스택 오버플로는 왜 생겨?", deadline_in=5)
     assert ret.calls == []                                   # 검색하면 답변할 시간이 없음
     assert any("검색 중단" in s for s in out["skipped"])
-    assert out["status"] == "근거 부족" and llm.calls == ["answer#1"]
+    # 검색을 하나도 못 했으면 "자료에 없다"(근거 부족)가 아니라 시간 초과 (2026-10-17 결정)
+    assert out["status"] == "시간 초과" and out["notice_code"] == "timeout" and llm.calls == ["answer#1"]
+    assert out["queried"] == []
+
+
+def test_searched_something_then_ran_out_stays_insufficient():
+    """일부라도 실제로 찾았으면 기존대로 근거 부족 (전사는 찾고 웹은 시간 부족)."""
+    out, _, ret, _ = run("힙 정렬의 시간 복잡도는?", deadline_in=15)
+    assert ret.calls == ["note", "transcript"] and out["status"] == "근거 부족"
+
+
+def test_spaced_keywords_are_split_into_words():
+    """실측: gpt-4o-mini가 ['스택', '큐', '데이터 구조', 'LIFO']를 내서 '데이터 구조'가 아무 데도 안 맞고
+    n2(큐)가 0.25점이 돼 LLM에게 전달되지 않았음 → 단어로 나누면 n2가 근거로 들어간다."""
+    from notree.graphs.qa.graph import split_keywords
+    from notree.graphs.qa.llm import Understanding
+    assert split_keywords(["스택", "데이터 구조", "구조"]) == ["스택", "데이터", "구조"]
+
+    class SpacedLLM(FakeQALLM):
+        async def understand(self, question, course):
+            return Understanding(related=True, keywords=["스택", "큐", "데이터 구조", "LIFO"])
+
+    cfg = {"configurable": {"llm": SpacedLLM(cite_min=0.3), "retriever": FakeRetriever(sample_corpus())}}
+    out = asyncio.run(build_qa_graph().ainvoke({"question": "스택과 큐는 어떻게 다르고 각각 언제 써?"}, cfg))
+    assert out["keywords"] == ["스택", "큐", "데이터", "구조", "LIFO"]
+    scores = {h["id"]: h["score"] for h in out["hits"]}
+    assert scores["n1"] == 0.6 and scores["n2"] == 0.4             # 0.4 ≥ EVIDENCE_MIN(0.3) → LLM에게 전달
 
 
 def test_nothing_found_anywhere():

@@ -17,7 +17,8 @@
 - 인용 ID가 받은 근거에 없으면 1번 다시 답하고, 그래도 틀리면 본문을 버리고 정해진 "근거 부족" 안내문으로 저장
 - 라벨(어디서 왔나)은 실제로 인용한 근거의 출처로: 관련 없음 → 일반 지식, 강의 근거 → 강의, 웹만 → 웹, 인용 없음 → 근거 부족
 - 상태(얼마나 답했나)는 라벨과 따로: completed / 부분 답변(인용은 있으나 LLM이 근거가 더 필요하다고 함) /
-  근거 부족(과목 질문인데 인용 없음 → 본문은 정해진 안내문) / 시간 초과
+  근거 부족(과목 질문인데 인용 없음 → 본문은 정해진 안내문) / 시간 초과(답변 시간 초과, 또는 시간이 없어 검색을 하나도 못 함)
+- LLM이 낸 검색어에 띄어쓰기가 있으면 단어로 나눈다 (split_keywords)
 - 검색 장애: SearchUnavailable·타임아웃 → 노트·전사는 시간이 되면 1번 다시, 웹은 다시 안 함. 안 되면 다음 출처 /
   SearchForbidden → QAFatal로 멈춤
 - 시간 예산 (deadline_at 기준)
@@ -154,28 +155,40 @@ async def understand(state: QAState, config: RunnableConfig) -> dict:
         note = []
     except TimeoutError:
         u, note = fallback, ["understand: LLM 시간 초과 → 단어 추출로 대신"]
-    return {"related": u.related, "keywords": u.keywords, "answer_attempts": 0, "llm_calls": calls + 1,
+    return {"related": u.related, "keywords": split_keywords(u.keywords), "answer_attempts": 0, "llm_calls": calls + 1,
             "skipped": note}
+
+
+def split_keywords(keywords: list[str]) -> list[str]:
+    """LLM이 '데이터 구조'처럼 띄어쓰기 있는 구를 내도 단어로 나눈다 (프롬프트로 시켜도 섞여 나옴, 2026-10-17 실측).
+    구 하나가 통째로 어디에도 안 맞으면 그 검색어 몫만큼 모든 근거의 점수가 깎인다."""
+    out: list[str] = []
+    for k in keywords:
+        for w in str(k).split():
+            if w and w not in out:
+                out.append(w)
+    return out
 
 
 def _search(source: str):
     async def node(state: QAState, config: RunnableConfig) -> dict:
-        retriever, notes = _cfg(config)["retriever"], []
+        retriever, notes, attempted = _cfg(config)["retriever"], [], False
         reset = {"answer_attempts": 0, "verify_problem": "", "needs_more": False}
         for i in range(1 + SEARCH_RETRIES[source]):
             limit = min(SEARCH_TIMEOUT_SEC, time_left(config) - ANSWER_RESERVE_SEC)
             if limit <= 0:
                 notes.append(f"{source}: 답변할 시간을 남기려고 검색 중단")
                 break
+            attempted = True
             try:
                 hits = await asyncio.wait_for(retriever.search(source, state.get("keywords", [])), timeout=limit)
-                return {"hits": hits, "searched": [source], "skipped": notes, **reset}
+                return {"hits": hits, "searched": [source], "queried": [source], "skipped": notes, **reset}
             except (SearchUnavailable, TimeoutError) as e:
                 why = "시간 초과" if isinstance(e, TimeoutError) else f"일시 장애: {e}"
                 notes.append(f"{source}: {why} → {'다시 시도' if i < SEARCH_RETRIES[source] else '건너뜀'}")
             except SearchForbidden as e:
                 raise QAFatal(f"{source} 검색 불가: {e}") from e
-        return {"hits": [], "searched": [source], "skipped": notes, **reset}
+        return {"hits": [], "searched": [source], "queried": [source] if attempted else [], "skipped": notes, **reset}
     node.__name__ = f"search_{source}"
     return node
 
@@ -232,6 +245,9 @@ async def save(state: QAState, config: RunnableConfig) -> dict:
         notice, out["status"] = "timeout", "시간 초과"
     elif state.get("verify_problem"):          # 재시도까지 실패 → 틀린 본문은 버리고 정해진 안내문으로
         notice, out["status"] = "insufficient", "근거 부족"
+    elif state.get("related") and not state.get("citations") and not state.get("queried"):
+        # 시간이 없어 검색을 하나도 못 했다 → "자료에 없다"(근거 부족)가 아니라 시간 초과로 알린다 (2026-10-17 결정)
+        notice, out["status"] = "timeout", "시간 초과"
     elif state.get("related") and not state.get("citations"):
         # 과목 질문인데 인용이 하나도 없음 → LLM 본문(근거 없이 지어냈을 수 있음)은 버리고 안내문만
         notice, out["status"] = "not_found", "근거 부족"

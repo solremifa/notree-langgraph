@@ -36,8 +36,8 @@ CASES = [
      "cite": set(), "note": "자료구조 질문이지만 말뭉치에 근거 없음. 관련 없음으로 판단하면 일반 지식"},
     {"id": "partial", "q": "스택과 큐는 어떻게 다르고 각각 언제 써?", "label": {"강의"}, "status": {"completed", "부분 답변"},
      "cite": {"n1", "n2"}, "note": "차이는 노트(n1·n2), 쓰임은 일부만(t2)"},
-    {"id": "tight_deadline", "q": "스택 오버플로는 왜 생겨?", "label": {"근거 부족", "강의"}, "status": {"시간 초과", "completed", "근거 부족"},
-     "cite": set(), "deadline": 4, "note": "마감 4초: 검색·질문 이해를 건너뛰고 LLM에 2초만 줌"},
+    {"id": "tight_deadline", "q": "스택 오버플로는 왜 생겨?", "label": {"근거 부족"}, "status": {"시간 초과"},
+     "cite": set(), "deadline": 4, "note": "마감 4초: 질문 이해·검색을 못 함 → 시간 초과 (2026-10-17 결정. 전에는 근거 부족)"},
 ]
 MARKER = re.compile(r"\[\^?[A-Za-z]+\d+\]")
 

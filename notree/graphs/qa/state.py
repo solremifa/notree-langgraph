@@ -20,7 +20,8 @@ class QAState(TypedDict, total=False):
     related: bool                                      # 질문이 이 과목 노트와 관련 있는가
     keywords: list[str]                                # understand가 만든 검색어
     hits: Annotated[list[HitDict], operator.add]       # 지금까지 찾은 근거 (단계마다 덧붙임)
-    searched: Annotated[list[str], operator.add]       # 검색한 곳 (note / transcript / web)
+    searched: Annotated[list[str], operator.add]       # 검색 단계를 지난 곳 (note / transcript / web). 시간 때문에 못 찾았어도 들어감
+    queried: Annotated[list[str], operator.add]        # 실제로 검색 요청을 한 곳 (시간이 없어 요청조차 못 했으면 빠짐)
     skipped: Annotated[list[str], operator.add]        # 건너뛴 단계와 이유
     answer: str                                        # 화면용 본문. 문장 + [ID] 표시를 코드가 만든다
     sentences: list[dict]                              # LLM이 낸 문장별 {text, citations}
