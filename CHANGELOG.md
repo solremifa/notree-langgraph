@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### Q&A worker 통합 1·2단계: 도구 계약 + 가짜 도구로 연결 · (이번 커밋)
+### Q&A worker 통합 1·2단계: 도구 계약 + 가짜 도구로 연결 · `769129e`
 자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) (브랜치 `feat/qa-worker`)
 
 - 🆕 Q&A 도구: `qa_ask`(api, 질문 + 작업 의도 한 트랜잭션), `qa_context`, `qa_search`, `web_search`, `qa_complete`(멱등·세대·실행권 확인), `qa_get`·`qa_delete`(api), `qa_seed`(dev). PoC는 SQLite + 키워드 일치 점수
