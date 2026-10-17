@@ -1,0 +1,3 @@
+  [16:25:09.632] scheduler  allocator     op-70ebd7e2 [course_update] 허가 → XADD notree:batch 1792221909611-0
+  [16:25:13.263] scheduler  allocator     op-616cf525 [course_update] 허가 → XADD notree:batch 1792221913251-0
+  [16:25:46.834] scheduler  allocator     op-db9b2c42 [course_update] 허가 → XADD notree:batch 1792221946826-0

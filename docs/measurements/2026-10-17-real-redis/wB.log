@@ -1,0 +1,17 @@
+  [16:25:06.530] batch-B    start         stream=notree:batch 동시 1개 · lease 60s · 재배송 90s · 한도 3회 · 핸들러 ['course_update', 'echo', 'final_note', 'grading', 'live_summary', 'qa']
+  [16:25:13.281] batch-B    job           신규 op-616cf525 [course_update] 시도 1/3
+  [16:25:13.357] batch-B    snapshot      출처 강의 고정: ['hello', 'big', 'world']  (실제: 출처 버전·기준 노트 버전 고정 + 편집 잠금)
+  [16:25:13.370] batch-B    extract       'hello' → 'HELLO'
+  [16:25:13.370] batch-B    extract       'big' → 'BIG'
+  [16:25:13.374] batch-B    extract       'world' → 'WORLD'
+  [16:25:13.401] batch-B    merge         1차 병합 → 'HELLO BIG WORLD!'
+  [16:25:13.412] batch-B    validate      통과
+  [16:25:13.430] batch-B    publish       새 버전 저장: 'HELLO BIG WORLD!' [완료]
+  [16:25:13.447] batch-B    done          op-616cf525 완료 → XACK
+  [16:27:17.379] batch-B    job           재배송 op-db9b2c42 [course_update] 시도 2/3
+  [16:27:17.392] batch-B    graph         체크포인트에서 이어감: 남은 노드=['extract'] 끝난 extract=['hello', 'big']
+  [16:27:17.400] batch-B    extract       'world' → 'WORLD'
+  [16:27:17.410] batch-B    merge         1차 병합 → 'HELLO BIG WORLD!'
+  [16:27:17.424] batch-B    validate      통과
+  [16:27:17.442] batch-B    publish       새 버전 저장: 'HELLO BIG WORLD!' [완료]
+  [16:27:17.460] batch-B    done          op-db9b2c42 완료 → XACK

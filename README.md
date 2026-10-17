@@ -64,9 +64,11 @@ tests/
 | 문서 | 내용 |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | 업데이트 목록 (무엇이 바뀌었는지, 고쳐야 할 것) |
+| [docs/status.md](docs/status.md) | 진행 상황: 구현·테스트된 것, 뼈대만 있는 것, 개발 순서 |
 | [docs/worker-structure.md](docs/worker-structure.md) | 코드 구조, 핸들러 규약, 새 핸들러 추가 방법 |
 | [docs/worker-flow.md](docs/worker-flow.md) | 작업 하나가 흘러가는 순서, 죽거나 느릴 때 |
-| [docs/team-decisions.md](docs/team-decisions.md) | 팀 결정 사항 (2026-10-15 확정) |
+| [docs/team-decisions.md](docs/team-decisions.md) | 팀 결정 사항 (2026-10-15 확정, 10-17 추가) |
+| [docs/measurements/](docs/measurements/) | 측정·실행 기록 원본과 재현 방법 |
 | [docs/tool-contracts.md](docs/tool-contracts.md) | MCP 도구 계약 (자동 생성) |
 | [docs/changes/](docs/changes/) | 큰 변경의 자세한 설명 |
 

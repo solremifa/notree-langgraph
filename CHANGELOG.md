@@ -11,6 +11,11 @@
 
 ## 2026-10-17
 
+### 진행 상황 문서, 실제 Redis 실행 기록 · (이번 커밋)
+- 🆕 `docs/status.md`: "PoC 구현·테스트 완료"와 운영 검증을 구분, Q&A는 "정책 흐름 구현, 실제 검색·LLM·worker 통합 전", Q&A 안의 통합 순서, 과목노트 실제 병합을 개발 목록에
+- 🆕 `docs/measurements/2026-10-17-real-redis/`: 실제 Redis + 프로세스 분리 실행 기록 (Windows 정상 경로, Linux 정상 경로 + worker 인계 90초 뒤 체크포인트에서 재개). 원본 로그 포함
+- 🔧 README 문서 목록
+
 ### 실행 정책 확정, 결정 문서 정리, 측정 자료 보존 · `991b8c2`
 - 🔧 작업 종류별 실행 정책 (팀 결정 2·3번): Q&A·채점 요청부터 전체 90초 안에서 최초 포함 3회, final_note 시도당 5분·총 3회, course_update 시도당 10분·총 3회 (`settings.KIND_MAX_ATTEMPTS`, `KIND_JOB_TIMEOUT_SEC`, `KIND_DEADLINE_SEC`)
 - 🆕 Q&A·채점 작업에 `deadline_at`이 없으면 `job_create`가 요청 시각 + 90초로 넣음. `job_retry`는 새 마감을 안 주면 지금 + 90초
