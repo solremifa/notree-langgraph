@@ -98,3 +98,63 @@ def test_pg_unreachable_is_retryable_unavailable(tmp_path):
                 await m.tool("qa_search", question_id=q["question_id"], source="note", keywords=["표준화"])
             assert ex.value.code == "unavailable" and ex.value.retryable
     run(t())
+
+
+def test_slow_pg_does_not_block_writes_and_is_cut_off(tmp_path):
+    """PG 검색이 느릴 때(테이블 잠금으로 재현): ① 다른 SQLite 쓰기(별도 연결)와 같은 서버의 job_heartbeat가 기다리지 않고,
+    ② 검색은 statement_timeout으로 끊겨 '다시 시도 가능'으로 끝난다."""
+    import sqlite3
+    import time
+
+    import psycopg
+
+    async def t():
+        env = {**(await _setup(tmp_path)), "NOTREE_PG_QA_STATEMENT_TIMEOUT_MS": "1500"}
+        async with McpClient(env=env) as m:
+            await m.tool("qa_seed", user_id="A", course_id="cA", course_name="ML", docs=DOCS_A)
+            q = await m.tool("qa_ask", user_id="A", course_id="cA", question="표준화?")
+            with psycopg.connect(TEST_DSN) as locker:                   # 트랜잭션을 연 채 테이블 잠금 → 검색 SELECT가 막힘
+                locker.execute("LOCK TABLE qa_search_docs IN ACCESS EXCLUSIVE MODE")
+                t0 = time.perf_counter()
+                search = asyncio.create_task(m.tool("qa_search", question_id=q["question_id"], source="note",
+                                                    keywords=["표준화"]))
+                await asyncio.sleep(0.4)                                  # 검색이 PG에서 기다리는 중
+                assert not search.done()
+                hb0 = time.perf_counter()                                 # ① 같은 서버의 다른 도구 (SQLite 쓰기 포함)
+                await asyncio.wait_for(m.tool("job_heartbeat", job_id=q["job_id"], worker="w", lease_sec=30), 1.0)
+                assert time.perf_counter() - hb0 < 0.5
+                con = sqlite3.connect(env["NOTREE_DB"], timeout=0.2)     # ① 별도 연결의 SQLite 쓰기
+                con.execute("INSERT INTO tool_log(tool, thread_id) VALUES('probe','x')")
+                con.commit()
+                con.close()
+                with pytest.raises(ToolError) as ex:                      # ② statement_timeout으로 끊김
+                    await asyncio.wait_for(search, 5)
+                assert ex.value.code == "unavailable" and ex.value.retryable
+                assert time.perf_counter() - t0 < 4
+    run(t())
+
+
+def test_pg_connect_hang_is_cut_off(tmp_path):
+    """연결은 받는데 응답하지 않는 PG(네트워크 정체 흉내): connect_timeout(2초)으로 끊겨 '다시 시도 가능'."""
+    import socket
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)                                     # accept도 응답도 안 함
+    port = srv.getsockname()[1]
+
+    async def t():
+        env = await _setup(tmp_path, dsn=f"postgresql://postgres@127.0.0.1:{port}/none")
+        async with McpClient(env=env) as m:
+            await m.tool("qa_seed", user_id="A", course_id="cA", course_name="ML", docs=[])
+            q = await m.tool("qa_ask", user_id="A", course_id="cA", question="표준화?")
+            t0 = time.perf_counter()
+            with pytest.raises(ToolError) as ex:
+                await asyncio.wait_for(m.tool("qa_search", question_id=q["question_id"], source="note",
+                                              keywords=["표준화"]), 8)
+            assert ex.value.code == "unavailable" and time.perf_counter() - t0 < 5
+    try:
+        run(t())
+    finally:
+        srv.close()

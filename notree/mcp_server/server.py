@@ -19,17 +19,19 @@
   NOTREE_PERMIT_SECRET       permit 서명 키
   NOTREE_PERMIT_TTL_RT / _BATCH   permit 유효 시간 (기본 300 / 1800초, 팀 결정 4번). qa 레인은 RT 값을 쓴다
 """
+import asyncio
 import base64
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import sqlite3
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -143,18 +145,39 @@ class Reject(Exception):
         self.code = code
 
 
+def _as_error(e: Exception) -> dict | None:
+    if isinstance(e, Reject):
+        return err(e.code, str(e))
+    if isinstance(e, sqlite3.OperationalError):
+        return err(ErrorCode.UNAVAILABLE, f"DB: {e}")
+    if isinstance(e, (ValueError, KeyError, TypeError)):
+        return err(ErrorCode.INVALID_ARGS, f"{type(e).__name__}: {e}")
+    return None
+
+
 def guarded(fn):
-    """도구 안에서 난 예외를 공통 거절 형식으로 바꾼다. (FastMCP는 functools.wraps로 원래 시그니처를 읽는다)"""
+    """도구 안에서 난 예외를 공통 거절 형식으로 바꾼다. (FastMCP는 functools.wraps로 원래 시그니처를 읽는다)
+    FastMCP는 동기 도구를 이벤트 루프에서 바로 실행한다 → 바깥(PG 등)을 기다리는 도구는 async로 쓰고
+    기다리는 부분을 스레드로 넘긴다 (qa_search). 그러지 않으면 그동안 서버의 다른 도구(heartbeat 포함)가 모두 멈춘다."""
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def awrapper(*a, **k):
+            try:
+                return await fn(*a, **k)
+            except Exception as e:
+                if (r := _as_error(e)) is None:
+                    raise
+                return r
+        return awrapper
+
     @functools.wraps(fn)
     def wrapper(*a, **k):
         try:
             return fn(*a, **k)
-        except Reject as e:
-            return err(e.code, str(e))
-        except sqlite3.OperationalError as e:
-            return err(ErrorCode.UNAVAILABLE, f"DB: {e}")
-        except (ValueError, KeyError, TypeError) as e:
-            return err(ErrorCode.INVALID_ARGS, f"{type(e).__name__}: {e}")
+        except Exception as e:
+            if (r := _as_error(e)) is None:
+                raise
+            return r
     return wrapper
 
 
@@ -609,22 +632,27 @@ def qa_context(question_id: str, permit: str | None = None) -> dict:
 
 
 @tool
-def qa_search(question_id: str, source: str, keywords: list[str], limit: int = 3,
-              lecture_ids: list[str] | None = None, permit: str | None = None) -> dict:
+async def qa_search(question_id: str, source: str, keywords: list[str], limit: int = 3,
+                    lecture_ids: list[str] | None = None, permit: str | None = None) -> dict:
     """[worker] 노트·전사 근거 검색 (읽기). 범위는 질문의 사용자·과목."""
     if source not in ("note", "transcript"):
         raise ValueError(f"source: {source} (웹은 web_search)")
-    with db() as con:
+    # 1) 질문 확인·호출 기록은 짧은 SQLite 트랜잭션으로 끝낸다 (커밋·닫기). 쓰기 잠금을 쥔 채 PG를 기다리면
+    #    다른 작업의 heartbeat·job_finish가 막힌다. 검색 뒤에 질문이 지워져도 괜찮다: 저장(qa_complete)이
+    #    세대·삭제·실행권을 다시 확인한다.
+    with closing(db()) as con, con:
         q, _ = _qa_question(con, question_id, permit)         # 사용자·과목 범위와 삭제된 질문은 여기서 확인
         _log(con, "qa_search", q["job_id"])
-        if QA_SEARCH == "pg":
-            from notree.mcp_server import pg_search
-            try:
-                found = pg_search.search(q["user_id"], q["course_id"], source, keywords, limit, lecture_ids)
-            except Exception as e:                            # 연결 실패 등은 일시 장애 → 그래프가 다시/다음 출처
-                raise Reject(ErrorCode.UNAVAILABLE, f"검색 DB: {type(e).__name__}") from e
-            return ok(C.QaSearchOut(hits=[C.QaHit(id=h["id"], source=source, text=h["text"], score=h["score"], ref=h["ref"],
-                                                  lecture_id=h["lecture_id"]) for h in found]))
+    if QA_SEARCH == "pg":
+        from notree.mcp_server import pg_search
+        try:                                                  # 2) PG는 스레드에서 (이벤트 루프를 막지 않게)
+            found = await asyncio.to_thread(pg_search.search, q["user_id"], q["course_id"], source, keywords, limit,
+                                            lecture_ids)
+        except Exception as e:                                # 연결 실패·시간 제한 등은 일시 장애 → 그래프가 다시/다음 출처
+            raise Reject(ErrorCode.UNAVAILABLE, f"검색 DB: {type(e).__name__}") from e
+        return ok(C.QaSearchOut(hits=[C.QaHit(id=h["id"], source=source, text=h["text"], score=h["score"], ref=h["ref"],
+                                              lecture_id=h["lecture_id"]) for h in found]))
+    with closing(db()) as con:
         sql, args = "SELECT * FROM qa_docs WHERE course_id=? AND user_id=? AND source=?", [q["course_id"], q["user_id"], source]
         if lecture_ids:
             sql += f" AND lecture_id IN ({','.join('?' * len(lecture_ids))})"

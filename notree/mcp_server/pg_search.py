@@ -17,6 +17,10 @@ import os
 import psycopg
 
 DSN = os.getenv("NOTREE_PG_QA_DSN", "postgresql://postgres@127.0.0.1:55432/notree_qa")
+# 시간 제한 (잠정). 그래프의 검색 대기(SEARCH_TIMEOUT_SEC 8초)보다 짧게 둬서, 그래프가 기다리기를 그만둔 뒤에도
+# 서버 쪽 연결·쿼리가 계속 도는 일이 없게 한다. statement_timeout은 잠금 대기도 포함한다.
+CONNECT_TIMEOUT_SEC = int(os.getenv("NOTREE_PG_QA_CONNECT_TIMEOUT_SEC", "2"))       # libpq 최소 2초
+STATEMENT_TIMEOUT_MS = int(os.getenv("NOTREE_PG_QA_STATEMENT_TIMEOUT_MS", "5000"))
 
 SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -32,7 +36,8 @@ KW_MEAN = "(SELECT avg(word_similarity(k, text))::float8 FROM unnest(%(kw)s::tex
 
 
 def connect():
-    return psycopg.connect(DSN, autocommit=True)
+    return psycopg.connect(DSN, autocommit=True, connect_timeout=CONNECT_TIMEOUT_SEC,
+                           options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}")
 
 
 def ensure_schema(con) -> None:

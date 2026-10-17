@@ -11,6 +11,15 @@
 
 ## 2026-10-17
 
+### PG 검색이 느릴 때 서버·SQLite가 막히지 않게 · (이번 커밋)
+자세히: [docs/changes/2026-10-17-qa-pg-search.md](docs/changes/2026-10-17-qa-pg-search.md#pg가-느릴-때-리뷰-반영) (브랜치 `feat/qa-pg-search`)
+
+- 🐛 `qa_search`가 SQLite 쓰기 트랜잭션(호출 기록)을 연 채 PG를 기다려 다른 쓰기가 `database is locked` → 기록을 커밋한 뒤 PG 조회
+- 🐛 FastMCP가 동기 도구를 이벤트 루프에서 실행해, PG를 기다리는 동안 같은 서버의 heartbeat 등 모든 도구가 멈춤 → `qa_search`를 async로, PG 호출은 스레드로
+- 🆕 PG `connect_timeout` 2초·`statement_timeout` 5초 (`NOTREE_PG_QA_CONNECT_TIMEOUT_SEC`, `NOTREE_PG_QA_STATEMENT_TIMEOUT_MS`), 넘으면 unavailable
+- 🔧 `guarded`가 async 도구도 감쌈
+- 테스트 109 → 111개 (느린 PG, 응답 없는 PG)
+
 ### Q&A 검색 PG 어댑터, 전사 우선 검색 단계, 전달 근거 평가 · `49cb758`
 자세히: [docs/changes/2026-10-17-qa-pg-search.md](docs/changes/2026-10-17-qa-pg-search.md) (브랜치 `feat/qa-pg-search`)
 
