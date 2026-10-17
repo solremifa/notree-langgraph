@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### PG 검색이 느릴 때 서버·SQLite가 막히지 않게 · (이번 커밋)
+### PG 검색이 느릴 때 서버·SQLite가 막히지 않게 · `9dfa49c`
 자세히: [docs/changes/2026-10-17-qa-pg-search.md](docs/changes/2026-10-17-qa-pg-search.md#pg가-느릴-때-리뷰-반영) (브랜치 `feat/qa-pg-search`)
 
 - 🐛 `qa_search`가 SQLite 쓰기 트랜잭션(호출 기록)을 연 채 PG를 기다려 다른 쓰기가 `database is locked` → 기록을 커밋한 뒤 PG 조회
