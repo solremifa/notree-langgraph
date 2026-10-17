@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### 실제 강의 자료로 PG 검색 1차 평가 · (이번 커밋)
+### 실제 강의 자료로 PG 검색 1차 평가 · `7d1672d`
 자세히: [docs/measurements/2026-10-17-pg-search/README.md](docs/measurements/2026-10-17-pg-search/README.md) (브랜치 `feat/qa-pg-search`)
 
 - 🆕 `notree.dev.lecture_import`: Notree 강의 노트 내보내기(.md) → 노트(최종 노트·실시간 요약 구간)·전사(청크) 문서
