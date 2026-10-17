@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### 실행 정책 확정, 결정 문서 정리, 측정 자료 보존 · (이번 커밋)
+### 실행 정책 확정, 결정 문서 정리, 측정 자료 보존 · `991b8c2`
 - 🔧 작업 종류별 실행 정책 (팀 결정 2·3번): Q&A·채점 요청부터 전체 90초 안에서 최초 포함 3회, final_note 시도당 5분·총 3회, course_update 시도당 10분·총 3회 (`settings.KIND_MAX_ATTEMPTS`, `KIND_JOB_TIMEOUT_SEC`, `KIND_DEADLINE_SEC`)
 - 🆕 Q&A·채점 작업에 `deadline_at`이 없으면 `job_create`가 요청 시각 + 90초로 넣음. `job_retry`는 새 마감을 안 주면 지금 + 90초
 - 🐛 `job_heartbeat`가 호출 집계(`tool_stats`)에 빠져 있던 문제
