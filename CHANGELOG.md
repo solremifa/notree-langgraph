@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### Q&A 실제 Redis 재검증, 잠정 계약 표시, OpenAI 품질 측정 도구 · (이번 커밋)
+### Q&A 실제 Redis 재검증, 잠정 계약 표시, OpenAI 품질 측정 도구 · `46227ee`
 - 🆕 실제 Redis + 별도 프로세스 재검증: 정상 Q&A, 답변 완료 후 삭제, 저장 커밋 후 응답 유실(재배송 20초 뒤 LLM 재호출 없이 `done`) — `docs/measurements/2026-10-17-real-redis/` 4절, 원본 로그
 - 🆕 `notree.dev.qa_fault_worker`: 실제 프로세스에서 qa_complete 응답 유실을 일부러 내는 시험용 worker
 - 🆕 `notree.dev.qa_ask --delete-after`
