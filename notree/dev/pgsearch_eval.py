@@ -16,6 +16,7 @@ DB: NOTREE_PG_QA_DSN (기본 postgresql://postgres@127.0.0.1:55432/notree_qa). p
   course   : 과목 전체 전사
   top2     : 노트 검색 상위 결과로 강의 2개를 고르고 그 전사만
   expand   : top2에서 최고 점수가 --enough 미만이면 과목 전체를 더 찾아 합침 (우선 검색 2개 + 부족 시 확장)
+             --expand-mode merge(점수순으로 섞음) | append(우선 강의 상위 3개 뒤에 덧붙임)
 정답: 질문의 gold {강의: [청크]} 중 하나라도 찾으면 맞음. 노트는 실시간 요약 구간(s청크), 전사는 t청크로 비교한다.
 """
 import argparse
@@ -75,7 +76,7 @@ def first_rank(hits: list[dict], gold: dict) -> int | None:
     return next((i + 1 for i, h in enumerate(hits) if is_gold(h, gold)), None)
 
 
-async def evaluate(con, qs: list[dict], score: str, enough: float, kw_override: dict) -> list[dict]:
+async def evaluate(con, qs: list[dict], score: str, enough: float, kw_override: dict, mode: str = "merge") -> list[dict]:
     out = []
     for item in qs:
         kw = kw_override.get(item["id"]) or keywords_of(item["q"])
@@ -98,7 +99,11 @@ async def evaluate(con, qs: list[dict], score: str, enough: float, kw_override: 
             expanded = True
             more = await search(con, score, item["course"], "transcript", kw, item["q"], 5)
             seen = {h["doc_id"] for h in top2_hits}
-            exp_hits = sorted(top2_hits + [h for h in more if h["doc_id"] not in seen], key=lambda h: -(h["s"] or 0))[:5]
+            extra = [h for h in more if h["doc_id"] not in seen]
+            if mode == "append":       # 우선 강의 결과를 앞에 두고, 과목 전체에서 새로 찾은 것을 뒤에 덧붙임
+                exp_hits = (top2_hits[:3] + extra)[:5] if top2_hits else extra[:5]
+            else:                      # merge: 점수순으로 섞음
+                exp_hits = sorted(top2_hits + extra, key=lambda h: -(h["s"] or 0))[:5]
         t_top2 = time.perf_counter() - t2
 
         g = item["gold"]
@@ -137,6 +142,8 @@ async def main() -> None:
     ap.add_argument("--questions", default="data/qa_questions.json")
     ap.add_argument("--scores", default="kw_mean,kw_hit,question")
     ap.add_argument("--enough", type=float, default=0.6, help="우선 검색에서 이 점수 미만이면 과목 전체로 확장")
+    ap.add_argument("--expand-mode", choices=["merge", "append"], default="merge",
+                    help="merge: 점수순으로 섞음 / append: 우선 강의 상위 3개 뒤에 과목 전체 결과를 덧붙임")
     ap.add_argument("--keywords", default="", help="질문 id → 검색어 목록 JSON (LLM 검색어로 다시 볼 때)")
     ap.add_argument("--out", default="")
     ap.add_argument("--verbose", action="store_true")
@@ -146,7 +153,7 @@ async def main() -> None:
         print(f"적재: {await load(con, a.docs)}개")
     qs = json.load(open(a.questions, encoding="utf-8"))["questions"]
     kw_override = json.load(open(a.keywords, encoding="utf-8")) if a.keywords else {}
-    by_score = {s: await evaluate(con, qs, s, a.enough, kw_override) for s in a.scores.split(",")}
+    by_score = {s: await evaluate(con, qs, s, a.enough, kw_override, a.expand_mode) for s in a.scores.split(",")}
     print(f"질문 {sum(1 for q in qs if q['gold'])}개 (+ 범위 밖 {sum(1 for q in qs if not q['gold'])}개) · 확장 기준 {a.enough}\n")
     print(report(by_score))
     for score, rows in by_score.items():

@@ -11,6 +11,11 @@
 
 ## 2026-10-17
 
+### PG 검색 2차 평가: LLM 검색어, 확장 덧붙이기 · (이번 커밋)
+- 🆕 `pgsearch_eval --expand-mode append`: 확장 결과를 섞지 않고 우선 강의 결과 뒤에 덧붙임
+- 🔧 측정 기록 2차: LLM 검색어 + kw_mean으로 전사 과목@3 67% → 82%, 우선2 85%, 확장(기준 0.3) 88%. 노트와 함께 보면 33개 중 32개
+- 결론: kw_mean + 노트 먼저 → 강의 2개 우선 전사 → 기준 0.3 미만이면 과목 전체 덧붙임
+
 ### 실제 강의 자료로 PG 검색 1차 평가 · `7d1672d`
 자세히: [docs/measurements/2026-10-17-pg-search/README.md](docs/measurements/2026-10-17-pg-search/README.md) (브랜치 `feat/qa-pg-search`)
 
