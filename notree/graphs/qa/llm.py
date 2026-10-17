@@ -10,6 +10,7 @@ LLM이 하는 일은 두 가지뿐이다.
 import asyncio
 import json
 import os
+import time
 import re
 
 from pydantic import BaseModel, Field
@@ -99,14 +100,22 @@ class OpenAIQALLM:
         self.client = AsyncOpenAI()
         self.model = os.getenv("NOTREE_MODEL", "gpt-4o-mini")
         self.calls: list[str] = []
+        self.usage: list[dict] = []          # 호출마다 {kind, seconds, prompt_tokens, completion_tokens} (지연·비용 측정용)
 
     async def _json(self, prompt: str) -> dict:
+        t0 = time.perf_counter()
         r = await self.client.chat.completions.create(
             model=self.model, temperature=0, response_format={"type": "json_object"},
             # JSON 모드는 메시지 어딘가에 'json'이라는 단어가 없으면 400. 프롬프트와 상관없이 항상 넣는다
             messages=[{"role": "system", "content": "Respond with a single JSON object only."},
                       {"role": "user", "content": prompt}],
         )
+        u = getattr(r, "usage", None)
+        if not hasattr(self, "usage"):          # __init__ 없이 만든 경우 (테스트의 가짜 클라이언트)
+            self.usage = []
+        self.usage.append({"kind": self.calls[-1] if self.calls else "", "seconds": round(time.perf_counter() - t0, 3),
+                           "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                           "completion_tokens": getattr(u, "completion_tokens", 0) or 0})
         return json.loads(r.choices[0].message.content or "{}")
 
     async def understand(self, question: str, course: str) -> Understanding:

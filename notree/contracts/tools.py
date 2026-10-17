@@ -341,6 +341,7 @@ class LectureNotePublishOut(BaseModel):
 
 
 # ── Q&A (2026-10-17: 그래프 notree/graphs/qa의 검색 인터페이스·결과 형식에 맞춤) ──
+# **잠정 계약**: 계약 담당(T5) 확인 전이다. 화면·API가 확정 계약으로 의존하기 전에 확인받고, 바뀌면 이 표시를 지운다.
 # 흐름: api qa_ask(질문 + 작업 의도를 한 트랜잭션) → worker qa_context → qa_search·web_search(그래프가 여러 번)
 #       → qa_complete(멱등, 세대 확인) → api qa_get(화면 조회). 노트 반영 제안·사용자 승인은 첫 통합에서 뺌.
 QaStatus = Literal["completed", "부분 답변", "근거 부족", "시간 초과"]
@@ -569,18 +570,18 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("lecture_note_publish", LectureNotePublishIn, LectureNotePublishOut, W, "write", "T3·T4", "", False,
              "planned", "강의 최종 노트 발행 (완료/부분 완료)"),
     ToolSpec("qa_ask", QaAskIn, QaAskOut, API, "write", "T5", "T3·T4",
-             summary="질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)"),
+             summary="[잠정 · T5 확인 전] 질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)"),
     ToolSpec("qa_context", QaContextIn, QaContextOut, W, "read", "T5", "T3·T4",
-             summary="질문·과목·강의 목록·세대. 사용자는 permit에서"),
+             summary="[잠정 · T5 확인 전] 질문·과목·강의 목록·세대. 사용자는 permit에서"),
     ToolSpec("qa_search", QaSearchIn, QaSearchOut, W, "read", "T5", "T3·T4",
-             summary="노트·전사 근거 검색. PoC는 키워드 일치 점수, 실제는 pg_trgm(Read)"),
+             summary="[잠정 · T5 확인 전] 노트·전사 근거 검색. PoC는 키워드 일치 점수, 실제는 pg_trgm(Read)"),
     ToolSpec("web_search", WebSearchIn, WebSearchOut, W, "external", "T5", "",
-             summary="웹 검색 1회. PoC는 시드한 web 문서에서 찾는 가짜 (실제 공급자 미정)"),
+             summary="[잠정 · T5 확인 전] 웹 검색 1회. PoC는 시드한 web 문서에서 찾는 가짜 (실제 공급자 미정)"),
     ToolSpec("qa_complete", QaCompleteIn, QaCompleteOut, W, "write", "T5", "T3·T4",
-             summary="답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만"),
-    ToolSpec("qa_get", QaGetIn, QaGetOut, API, "read", "T5", "T3·T4", summary="화면 조회: 질문 상태와 저장된 답변"),
+             summary="[잠정 · T5 확인 전] 답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만"),
+    ToolSpec("qa_get", QaGetIn, QaGetOut, API, "read", "T5", "T3·T4", summary="[잠정 · T5 확인 전] 화면 조회: 질문 상태와 저장된 답변"),
     ToolSpec("qa_delete", QaDeleteIn, QaDeleteOut, API, "write", "T5", "T3·T4",
-             summary="질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)"),
+             summary="[잠정 · T5 확인 전] 질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)"),
     ToolSpec("qa_seed", QaSeedIn, QaSeedOut, DEV, "dev", "T5", summary="PoC 검색용 노트·전사·웹 문서 넣기"),
     ToolSpec("grade_context", GradeContextIn, GradeContextOut, W, "read", "T5", "", False, "planned",
              "채점용 문제·루브릭·답안·근거"),

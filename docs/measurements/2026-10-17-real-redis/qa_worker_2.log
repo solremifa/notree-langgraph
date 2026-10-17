@@ -1,0 +1,7 @@
+  [17:21:44.741] qa-A       start         stream=notree:qa 동시 4개 · lease 15s · 재배송 20s · 기본 한도 2회(종류별 설정 우선) · 핸들러 ['course_update', 'echo', 'final_note', 'grading', 'live_summary', 'qa']
+  [17:21:48.995] qa-A       job           신규 op-42496472 [qa] 시도 1/3 · 마감까지 90초
+  [17:21:49.047] qa-A       qa            q-7328d002: completed [웹] 검색=['note', 'transcript', 'web'] 인용=['w1'] → a-76a39236
+  [17:21:49.058] qa-A       done          op-42496472 완료 → XACK
+  [17:21:50.540] qa-A       job           신규 op-6e332abd [qa] 시도 1/3 · 마감까지 90초
+  [17:21:50.560] qa-A       qa            q-36dd78c7: completed [강의] 검색=['note'] 인용=['n1'] → a-ad0387a0
+  [17:21:50.565] qa-A       done          op-6e332abd 완료 → XACK

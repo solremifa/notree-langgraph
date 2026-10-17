@@ -11,6 +11,15 @@
 
 ## 2026-10-17
 
+### Q&A 실제 Redis 재검증, 잠정 계약 표시, OpenAI 품질 측정 도구 · (이번 커밋)
+- 🆕 실제 Redis + 별도 프로세스 재검증: 정상 Q&A, 답변 완료 후 삭제, 저장 커밋 후 응답 유실(재배송 20초 뒤 LLM 재호출 없이 `done`) — `docs/measurements/2026-10-17-real-redis/` 4절, 원본 로그
+- 🆕 `notree.dev.qa_fault_worker`: 실제 프로세스에서 qa_complete 응답 유실을 일부러 내는 시험용 worker
+- 🆕 `notree.dev.qa_ask --delete-after`
+- 🆕 `notree.dev.qa_eval`: 가짜 검색 + 실제 LLM으로 사례 7개(노트·전사·웹·관련 없음·근거 없음·부분 답변·마감 4초) 판정, 지연·토큰·비용 추정. 실제 검색 품질은 측정 대상 아님
+- 🔧 `OpenAIQALLM`이 호출마다 지연·토큰 기록 (`usage`)
+- 🔧 Q&A 도구 계약에 "[잠정 · T5 확인 전]" 표시 (`docs/tool-contracts.md`), `docs/status.md`는 "가짜 검색·LLM을 사용한 Q&A 통합 PoC"로
+- 테스트 95 → 97개
+
 ### Q&A worker 통합 main 머지, 진행 상황 갱신 · `b88aba0`
 - 🔧 `feat/qa-worker`를 main에 머지 (`68a46e7`까지). Q&A 도구 계약은 T5 확인 전 반영 — 확인 결과에 따라 바뀔 수 있음
 - 🔧 `docs/status.md`: 테스트 수 95개, Q&A 통합 1단계(계약, T5 확인 대기)·2단계(가짜 도구로 연결) 상태

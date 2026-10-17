@@ -85,6 +85,19 @@ uv run python -m notree.dev.qa_ask "스택 오버플로는 왜 생겨?"
 
 세 작업 모두 `done`, 등록부터 저장까지 각각 2초 안쪽 (가짜 LLM).
 
+## 4. Q&A 리뷰 반영 재검증 — Linux (`feat/qa-verify`, main `4de297b` 기준)
+
+같은 환경(redis-server 7.0.15, 별도 프로세스, 기본 설정: qa lease 15초·재배송 20초). 검색·LLM은 가짜입니다.
+원본 로그: `qa_fault_worker.log`(장애 주입 worker), `qa_worker_2.log`(일반 qa worker).
+
+| 시나리오 | 방법 | 결과 |
+|---|---|---|
+| 저장 커밋 후 응답 유실 | `uv run python -m notree.dev.qa_fault_worker --lose-complete-response 1` (qa_complete를 서버에 전달한 뒤 응답만 버림) + `qa_ask "스택 오버플로는 왜 생겨?"` | 17:20:57 저장 후 응답 유실 → lease 반납 → **17:21:18 재배송(20초)** → `이 작업의 답이 이미 저장돼 있음 → 그래프 건너뛰고 완료` → `done`, 시도 2. **LLM 호출은 첫 시도의 2번(understand, answer)뿐**, 재시도에서는 0번. 화면 조회는 첫 저장 직후부터 답을 받음 |
+| 정상 Q&A | 일반 qa worker + `qa_ask "힙 정렬의 시간 복잡도는?"` | `[웹 · completed]` w1 인용, 검색 note → transcript → web, `done` |
+| 답변 완료 후 삭제 | `qa_ask "스택은 어떤 구조야?" --delete-after` | 답 저장(n1) → 삭제 → 다시 조회 `{"found": true, "question": null, "state": "deleted", "answer": null}`. DB 행: 질문·답변 컬럼 모두 NULL, 세대 1 → 2 |
+
+저장된 답의 `citations`: `q-82ad8bf4` → `["t1"]`, `q-7328d002` → `["w1"]` (서버가 문장별 인용에서 생성).
+
 ## 확인하지 않은 것
 
 - PostgreSQL (MCP 서버 DB는 SQLite), 실제 업무 데이터, 실제 LLM

@@ -2,6 +2,7 @@
 
     uv run python -m notree.dev.qa_ask "스택 오버플로는 왜 생겨?"
     uv run python -m notree.dev.qa_ask "힙 정렬의 시간 복잡도는?" --user u-123 --course c-ds
+    uv run python -m notree.dev.qa_ask "스택은 어떤 구조야?" --delete-after      # 답 저장 → 삭제 → 다시 조회
 
 MCP 서버(--http)·배정기·qa worker(--stream qa)가 떠 있어야 한다. 처음 쓰는 과목이면 데모 말뭉치(자료구조)를 넣는다.
 """
@@ -23,6 +24,7 @@ async def main() -> None:
     p.add_argument("--user", default="demo-user")
     p.add_argument("--course", default="c-ds")
     p.add_argument("--wait", type=float, default=100, help="최대 기다리는 초")
+    p.add_argument("--delete-after", action="store_true", help="답이 저장된 뒤 질문을 지우고 다시 조회")
     a = p.parse_args()
     async with McpClient(url=S.MCP_URL) as mcp:
         docs = [{"source": s, "id": i, "text": t, "lecture_id": LECTURE.get(i)}
@@ -44,7 +46,12 @@ async def main() -> None:
                 print(f"   [^{s['id']}] {s['source']}: {s['text']}")
         else:
             print(f"답 없음: 작업 {job['state']} {job.get('fail_reason') or ''}")
-        print(json.dumps(got, ensure_ascii=False, indent=2) if got.get("answer") else "")
+        if a.delete_after:
+            d = await mcp.tool("qa_delete", question_id=q["question_id"], user_id=a.user)
+            after = await mcp.tool("qa_get", question_id=q["question_id"], user_id=a.user)
+            print(f"삭제 {d['deleted']} → 다시 조회: {json.dumps(after, ensure_ascii=False)}")
+        else:
+            print(json.dumps(got, ensure_ascii=False, indent=2) if got.get("answer") else "")
 
 
 if __name__ == "__main__":
