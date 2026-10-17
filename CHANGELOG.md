@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### Q&A 검색 PG 어댑터, 전사 우선 검색 단계, 전달 근거 평가 · (이번 커밋)
+### Q&A 검색 PG 어댑터, 전사 우선 검색 단계, 전달 근거 평가 · `49cb758`
 자세히: [docs/changes/2026-10-17-qa-pg-search.md](docs/changes/2026-10-17-qa-pg-search.md) (브랜치 `feat/qa-pg-search`)
 
 - 🆕 `NOTREE_QA_SEARCH=pg`: `qa_search`·`qa_seed`가 PostgreSQL(pg_trgm, kw_mean) 사용. 사용자·과목·삭제 범위, 출처·강의 ID 보존, 연결 실패는 unavailable
