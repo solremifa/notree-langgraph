@@ -11,6 +11,16 @@
 
 ## 2026-10-17
 
+### 실제 강의 자료로 PG 검색 1차 평가 · (이번 커밋)
+자세히: [docs/measurements/2026-10-17-pg-search/README.md](docs/measurements/2026-10-17-pg-search/README.md) (브랜치 `feat/qa-pg-search`)
+
+- 🆕 `notree.dev.lecture_import`: Notree 강의 노트 내보내기(.md) → 노트(최종 노트·실시간 요약 구간)·전사(청크) 문서
+- 🆕 `notree.dev.pgsearch_eval`: pg_trgm 점수 3종 × 범위(과목 전체 / 강의 2개 우선 / 우선+확장) 정답률·지연
+- 🆕 `notree.dev.qa_keywords`: 질문 목록의 검색어를 실제 LLM으로 뽑아 저장 (PG 없이 실행)
+- 🔧 `.gitignore`에 `data/` — 실제 강의 원문은 공개 저장소에 올리지 않음 (집계만 기록)
+- 결과: 노트@3 82~94%, 전사@3 58~79%, 강의 고르기@2 91~100%. 확장 기준 0.6은 pg_trgm 점수에 비해 높아 손해 → 재조정 필요
+- 테스트 101 → 102개
+
 ### Q&A 평가 기준 정정: 모델 원본 검사 분리, 사례별 기대 상태 하나로 · `5a98cdb`
 - 🐛 `qa_eval`의 인용 표시 검사가 정제 후 문장만 봐서 모델이 지시를 어겨도 통과하던 문제 → `model_no_markers`(LLM 원본)와 `delivered_no_markers`(정제 후)로 분리. 원본은 jsonl `raw_answers`
 - 🔧 기대 상태를 사례마다 하나로: `not_found`는 근거 부족만, `partial`은 부분 답변만 (3차 결과는 새 기준으로도 통과)
