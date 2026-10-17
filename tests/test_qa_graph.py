@@ -136,6 +136,8 @@ def test_openai_requests_always_mention_json():
     assert out["citations"] == ["n1"]
     assert out["answer"] == "스택은 LIFO다 [^n1]"         # LLM이 본문에 넣은 [n1]은 지우고 코드가 [^n1]을 붙임
     assert len(sent) == 2 and all("json" in _json.dumps(m, ensure_ascii=False).lower() for m in sent)
+    # 여러 부분으로 된 질문에서 한 부분만 답하고 멈추지 않게 (실제 gpt-4o-mini 측정, 2026-10-17)
+    assert "빠짐없이" in sent[1][-1]["content"] and "부분마다" in sent[1][-1]["content"]
 
 
 def test_borderline_evidence_reaches_llm_and_labels_by_citation():

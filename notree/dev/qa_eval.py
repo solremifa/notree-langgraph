@@ -70,6 +70,9 @@ async def run_case(graph, case: dict, llm_kind: str) -> dict:
     usage = getattr(llm, "usage", [])
     out = {"case": case["id"], "question": case["q"], "seconds": round(secs, 2), "error": err,
            "status": final.get("status"), "label": final.get("label"), "citations": final.get("citations", []),
+           "keywords": final.get("keywords", []),
+           "hits": [{"id": h["id"], "source": h["source"], "score": h["score"]} for h in final.get("hits", [])],
+           "sentences": final.get("sentences") or [],
            "searched": final.get("searched", []), "skipped": final.get("skipped", []), "answer": final.get("answer"),
            "llm_calls": len(getattr(llm, "calls", [])), "llm": usage,
            "prompt_tokens": sum(u["prompt_tokens"] for u in usage),
@@ -105,6 +108,7 @@ async def main() -> None:
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--cases", default="", help="쉼표로 사례 id만 골라서")
     p.add_argument("--out", default="", help="원본 결과 jsonl")
+    p.add_argument("--verbose", action="store_true", help="통과한 사례도 검색어·근거·문장 출력")
     p.add_argument("--price-in", type=float, default=None, help="입력 100만 토큰당 달러")
     p.add_argument("--price-out", type=float, default=None, help="출력 100만 토큰당 달러")
     a = p.parse_args()
@@ -116,8 +120,12 @@ async def main() -> None:
             r = await run_case(graph, c, a.llm)
             r["round"] = i + 1
             rows.append(r)
-            print(f"  {r['case']:<15} {'통과' if r['ok'] else '실패'}  {r['status']} [{r['label']}] {r['seconds']}s  {r['answer']!r:.80}"
-                  + (f"  오류: {r['error']}" if r["error"] else ""))
+            print(f"  {r['case']:<15} {'통과' if r['ok'] else '실패'}  {r['status']} [{r['label']}] {r['seconds']}s  "
+                  f"인용={r['citations']}" + (f"  오류: {r['error']}" if r["error"] else ""))
+            if not r["ok"] or a.verbose:                 # 실패하면 원인을 볼 수 있게 전부
+                print(f"      검색어={r['keywords']}  근거={[(h['id'], h['score']) for h in r['hits']]}")
+                for s in r["sentences"]:
+                    print(f"      - {s.get('text')}  {s.get('citations')}")
     print()
     print(summarize(rows, a.price_in, a.price_out))
     if a.out:

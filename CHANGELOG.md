@@ -11,6 +11,11 @@
 
 ## 2026-10-17
 
+### Q&A 실제 OpenAI 1차 측정, 여러 부분 질문 프롬프트 보완 · (이번 커밋)
+- 🆕 `docs/measurements/2026-10-17-openai-qa/`: gpt-4o-mini 3회 반복, 21건 중 18건 통과, 질문당 1.5~3.5초. 형식·인용 오류 0
+- 🐛 여러 부분으로 된 질문("A와 B의 차이, 각각 언제")에서 한 부분만 답하고 멈추던 문제 → 답변 프롬프트에 "부분마다 따져서 답할 수 있는 부분은 빠짐없이" 추가
+- 🔧 `qa_eval`: 인용 목록 출력, 실패한 사례는 검색어·근거 점수·문장별 인용 출력(`--verbose`면 전부), jsonl에 `keywords`·`hits`·`sentences`
+
 ### Q&A 실제 Redis 재검증, 잠정 계약 표시, OpenAI 품질 측정 도구 · `46227ee`
 - 🆕 실제 Redis + 별도 프로세스 재검증: 정상 Q&A, 답변 완료 후 삭제, 저장 커밋 후 응답 유실(재배송 20초 뒤 LLM 재호출 없이 `done`) — `docs/measurements/2026-10-17-real-redis/` 4절, 원본 로그
 - 🆕 `notree.dev.qa_fault_worker`: 실제 프로세스에서 qa_complete 응답 유실을 일부러 내는 시험용 worker
