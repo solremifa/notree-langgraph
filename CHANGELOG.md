@@ -11,7 +11,7 @@
 
 ## 2026-10-17
 
-### Q&A worker 리뷰 반영: 삭제 후 조회 차단, citations, 저장 응답 유실 후 재실행 · (이번 커밋)
+### Q&A worker 리뷰 반영: 삭제 후 조회 차단, citations, 저장 응답 유실 후 재실행 · `df4d495`
 자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) "리뷰 반영" (브랜치 `feat/qa-worker`)
 
 - 🐛 삭제된 질문의 질문·답변·출처 원문이 `qa_get`으로 조회되던 문제 → `qa_delete`가 복사본까지 지우고, 조회는 `state=deleted`만
