@@ -6,7 +6,9 @@
 
 무엇을 보나
   - 주어진 근거로 답하는 능력: 문장별 JSON 형식, 인용이 받은 근거 안에 있는지, 기대한 근거를 인용했는지,
-    라벨·결과 상태(completed / 부분 답변 / 근거 부족 / 시간 초과)가 사례의 기대와 맞는지, 문장에 인용 표시를 직접 썼는지
+    라벨·결과 상태(completed / 부분 답변 / 근거 부족 / 시간 초과)가 사례의 기대와 맞는지 (사례마다 기대 상태는 하나)
+  - 인용 표시: 모델이 문장에 직접 썼는지(model_no_markers, 정제 전 원본)와 사용자 본문이 깨끗한지(delivered_no_markers, 정제 후)를 따로
+  - 통과율은 정해진 사례 7개를 반복한 자동 검사 결과다. 일반적인 답변 정확도를 뜻하지 않는다
   - 시간: 질문 하나 전체, LLM 호출별 지연
   - 비용: LLM 호출 수, 입력·출력 토큰 (--price-*를 주면 달러 추정)
 무엇을 못 보나
@@ -32,17 +34,19 @@ CASES = [
     {"id": "transcript", "q": "스택 오버플로는 왜 생겨?", "label": {"강의"}, "status": {"completed"}, "cite": {"t1"}},
     {"id": "web", "q": "힙 정렬의 시간 복잡도는?", "label": {"웹"}, "status": {"completed"}, "cite": {"w1"}},
     {"id": "unrelated", "q": "오늘 점심 뭐 먹지?", "label": {"일반 지식"}, "status": {"completed"}, "cite": set()},
-    {"id": "not_found", "q": "AVL 트리의 회전은 언제 해?", "label": {"근거 부족", "일반 지식"}, "status": {"근거 부족", "completed"},
-     "cite": set(), "note": "자료구조 질문이지만 말뭉치에 근거 없음. 관련 없음으로 판단하면 일반 지식"},
-    {"id": "partial", "q": "스택과 큐는 어떻게 다르고 각각 언제 써?", "label": {"강의"}, "status": {"completed", "부분 답변"},
-     "cite": {"n1", "n2"}, "note": "차이는 노트(n1·n2), 쓰임은 일부만(t2)"},
+    {"id": "not_found", "q": "AVL 트리의 회전은 언제 해?", "label": {"근거 부족"}, "status": {"근거 부족"},
+     "cite": set(), "note": "자료구조 질문인데 말뭉치에 근거 없음 → 근거 부족 (일반 지식으로 답하면 실패)"},
+    {"id": "partial", "q": "스택과 큐는 어떻게 다르고 각각 언제 써?", "label": {"강의"}, "status": {"부분 답변"},
+     "cite": {"n1", "n2"}, "note": "차이는 노트(n1·n2), '스택을 언제 쓰나'는 근거 없음 → 부분 답변 (completed면 실패)"},
     {"id": "tight_deadline", "q": "스택 오버플로는 왜 생겨?", "label": {"근거 부족"}, "status": {"시간 초과"},
      "cite": set(), "deadline": 4, "note": "마감 4초: 질문 이해·검색을 못 함 → 시간 초과 (2026-10-17 결정. 전에는 근거 부족)"},
 ]
 MARKER = re.compile(r"\[\^?[A-Za-z]+\d+\]")
 
 
-def judge(case: dict, final: dict) -> dict:
+def judge(case: dict, final: dict, raw_answers: list[list[dict]] | None = None) -> dict:
+    """final은 그래프가 정제한 결과, raw_answers는 LLM이 낸 원본(답변 시도마다 문장 목록).
+    인용 표시는 둘을 따로 본다: 모델이 지시를 지켰나(model_no_markers, 원본) / 사용자에게 가는 본문이 깨끗한가(delivered_no_markers, 정제 후)."""
     hit_ids = {h["id"] for h in final.get("hits", [])}
     cites = final.get("citations", [])
     sentences = final.get("sentences") or []
@@ -51,13 +55,33 @@ def judge(case: dict, final: dict) -> dict:
         "status": final.get("status") in case["status"],
         "cites_in_evidence": all(c in hit_ids for c in cites),
         "expected_cited": case["cite"] <= set(cites),
-        "no_inline_markers": not any(MARKER.search(s.get("text", "")) for s in sentences),
+        "delivered_no_markers": not any(MARKER.search(s.get("text", "")) for s in sentences),
     }
+    if raw_answers is not None:
+        checks["model_no_markers"] = not any(MARKER.search(s.get("text", "")) for a in raw_answers for s in a)
     return {"ok": all(checks.values()), "checks": checks}
 
 
-async def run_case(graph, case: dict, llm_kind: str) -> dict:
-    llm = get_qa_llm(llm_kind)
+class RecordingLLM:
+    """LLM을 감싸 answer()의 원본 문장(정제 전)을 남긴다. 나머지 속성(calls, usage)은 그대로 넘긴다."""
+
+    def __init__(self, inner) -> None:
+        self.inner, self.raw = inner, []
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def understand(self, *a, **k):
+        return await self.inner.understand(*a, **k)
+
+    async def answer(self, *a, **k):
+        ans = await self.inner.answer(*a, **k)
+        self.raw.append([s.model_dump() for s in ans.sentences])
+        return ans
+
+
+async def run_case(graph, case: dict, llm_kind: str, llm=None) -> dict:
+    llm = RecordingLLM(llm or get_qa_llm(llm_kind))
     deadline = time.time() + case.get("deadline", 90)
     cfg = {"configurable": {"llm": llm, "retriever": FakeRetriever(sample_corpus()), "deadline_at": deadline}}
     t0 = time.perf_counter()
@@ -77,7 +101,8 @@ async def run_case(graph, case: dict, llm_kind: str) -> dict:
            "llm_calls": len(getattr(llm, "calls", [])), "llm": usage,
            "prompt_tokens": sum(u["prompt_tokens"] for u in usage),
            "completion_tokens": sum(u["completion_tokens"] for u in usage)}
-    out.update(judge(case, final) if not err else {"ok": False, "checks": {"error": False}})
+    out["raw_answers"] = llm.raw
+    out.update(judge(case, final, llm.raw) if not err else {"ok": False, "checks": {"error": False}})
     return out
 
 
