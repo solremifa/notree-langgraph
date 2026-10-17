@@ -11,6 +11,10 @@
 
 ## 2026-10-17
 
+### Q&A worker 통합 main 머지, 진행 상황 갱신 · (이번 커밋)
+- 🔧 `feat/qa-worker`를 main에 머지 (`68a46e7`까지). Q&A 도구 계약은 T5 확인 전 반영 — 확인 결과에 따라 바뀔 수 있음
+- 🔧 `docs/status.md`: 테스트 수 95개, Q&A 통합 1단계(계약, T5 확인 대기)·2단계(가짜 도구로 연결) 상태
+
 ### Q&A worker 리뷰 반영: 삭제 후 조회 차단, citations, 저장 응답 유실 후 재실행 · `df4d495`
 자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) "리뷰 반영" (브랜치 `feat/qa-worker`)
 
