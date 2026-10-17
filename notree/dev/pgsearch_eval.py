@@ -68,6 +68,17 @@ async def search(con, score: str, course: str, source: str, kw: list[str], q: st
     return [dict(r) for r in await con.fetch(sql, *args)]
 
 
+async def gold_scores(con, score: str, item: dict, kw: list[str]) -> list[dict]:
+    """지정한 정답 구간 전부의 점수 (순위와 무관). 검색 상위에 못 든 정답도 포함한다."""
+    ids = [f"{lec}:{p}{c}" for lec, cs in item["gold"].items() for c in cs for p in ("s", "t")]
+    if not ids:
+        return []
+    rows = await con.fetch(f"SELECT doc_id, source, {SCORES[score]} AS s FROM qa_docs "
+                           "WHERE doc_id = ANY($1::text[]) AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL",
+                           ids, kw, item["q"])
+    return [{"doc_id": r["doc_id"], "source": r["source"], "s": r["s"] or 0.0} for r in rows]
+
+
 def is_gold(hit: dict, gold: dict) -> bool:
     return hit["chunk"] is not None and hit["chunk"] in gold.get(hit["lecture_id"], [])
 
@@ -97,17 +108,22 @@ async def evaluate(con, qs: list[dict], score: str, enough: float, kw_override: 
         exp_hits = top2_hits
         if not top2_hits or (top2_hits[0]["s"] or 0) < enough:
             expanded = True
-            more = await search(con, score, item["course"], "transcript", kw, item["q"], 5)
+            more = await search(con, score, item["course"], "transcript", kw, item["q"], 6)
             seen = {h["doc_id"] for h in top2_hits}
             extra = [h for h in more if h["doc_id"] not in seen]
-            if mode == "append":       # 우선 강의 결과를 앞에 두고, 과목 전체에서 새로 찾은 것을 뒤에 덧붙임
-                exp_hits = (top2_hits[:3] + extra)[:5] if top2_hits else extra[:5]
+            if mode == "append":       # 우선 강의 상위 3개를 앞에 두고 과목 전체의 새 결과를 뒤에 → 확장분은 빨라야 4위
+                exp_hits = (top2_hits[:3] + extra)[:6] if top2_hits else extra[:6]
             else:                      # merge: 점수순으로 섞음
-                exp_hits = sorted(top2_hits + extra, key=lambda h: -(h["s"] or 0))[:5]
+                exp_hits = sorted(top2_hits + extra, key=lambda h: -(h["s"] or 0))[:6]
         t_top2 = time.perf_counter() - t2
 
         g = item["gold"]
+        gs = await gold_scores(con, score, item, kw)
+        best_t = max((x["s"] for x in gs if x["source"] == "transcript"), default=None)
+        best_n = max((x["s"] for x in gs if x["source"] == "note"), default=None)
         out.append({
+            "expand_mode": mode, "enough": enough,
+            "gold_best_transcript": best_t, "gold_best_note": best_n, "gold_all": gs,
             "id": item["id"], "q": item["q"], "keywords": kw, "score": score, "negative": not g,
             "note_rank": first_rank(notes, g), "note_top_score": notes[0]["s"] if notes else None,
             "lecture_at2": bool(set(top2) & set(g)) if g else None, "top2": top2,
@@ -120,18 +136,24 @@ async def evaluate(con, qs: list[dict], score: str, enough: float, kw_override: 
     return out
 
 
+def frac_below(rows, key, th):
+    rs = [r for r in rows if not r["negative"] and r[key] is not None]
+    return sum(1 for r in rs if r[key] < th) / len(rs) if rs else 0.0
+
+
 def at(rows, key, k):
     rs = [r for r in rows if not r["negative"]]
     return sum(1 for r in rs if r[key] is not None and r[key] <= k) / len(rs)
 
 
 def report(rows_by_score: dict[str, list[dict]]) -> str:
-    lines = [f"{'점수 방식':<10}{'노트@3':>8}{'강의@2':>8}{'전사 과목@3':>12}{'우선2@3':>9}{'우선2+확장@3':>13}{'과목@5':>8}{'확장 비율':>9}"]
+    lines = [f"{'점수 방식':<10}{'노트@3':>8}{'강의@2':>8}{'과목@3':>8}{'우선2@3':>9}{'최종@3':>8}{'최종@5':>8}{'최종@6':>8}{'확장':>6}"]
     for score, rows in rows_by_score.items():
         rs = [r for r in rows if not r["negative"]]
         lec = sum(1 for r in rs if r["lecture_at2"]) / len(rs)
-        lines.append(f"{score:<10}{at(rows, 'note_rank', 3):>8.0%}{lec:>8.0%}{at(rows, 'course_rank', 3):>12.0%}{at(rows, 'top2_rank', 3):>9.0%}"
-                     f"{at(rows, 'expand_rank', 3):>13.0%}{at(rows, 'course_rank', 5):>8.0%}{sum(r['expanded'] for r in rs) / len(rs):>9.0%}")
+        lines.append(f"{score:<10}{at(rows, 'note_rank', 3):>8.0%}{lec:>8.0%}{at(rows, 'course_rank', 3):>8.0%}{at(rows, 'top2_rank', 3):>9.0%}"
+                     f"{at(rows, 'expand_rank', 3):>8.0%}{at(rows, 'expand_rank', 5):>8.0%}{at(rows, 'expand_rank', 6):>8.0%}"
+                     f"{sum(r['expanded'] for r in rs) / len(rs):>6.0%}")
     return "\n".join(lines)
 
 
@@ -154,15 +176,23 @@ async def main() -> None:
     qs = json.load(open(a.questions, encoding="utf-8"))["questions"]
     kw_override = json.load(open(a.keywords, encoding="utf-8")) if a.keywords else {}
     by_score = {s: await evaluate(con, qs, s, a.enough, kw_override, a.expand_mode) for s in a.scores.split(",")}
-    print(f"질문 {sum(1 for q in qs if q['gold'])}개 (+ 범위 밖 {sum(1 for q in qs if not q['gold'])}개) · 확장 기준 {a.enough}\n")
+    print(f"질문 {sum(1 for q in qs if q['gold'])}개 (+ 범위 밖 {sum(1 for q in qs if not q['gold'])}개) · 확장 기준 {a.enough} · "
+          f"확장 방식 {a.expand_mode} · 검색어 {'LLM(' + a.keywords + ')' if a.keywords else '단어 추출'}\n"
+          "최종 = 우선 강의 2개 전사 + (기준 미만이면) 과목 전체 확장, @3·@5·@6 = 정답이 그 순위 안\n")
     print(report(by_score))
     for score, rows in by_score.items():
         rs = [r for r in rows if not r["negative"]]
-        gs = [r["gold_score"] for r in rs if r["gold_score"] is not None]
         neg = [r["course_top_score"] for r in rows if r["negative"]]
         ms = [sum(r["ms"].values()) for r in rows]
-        print(f"\n[{score}] 정답 근거 점수 중앙 {statistics.median(gs):.2f} (최소 {min(gs):.2f}) · 범위 밖 질문의 최고 점수 {neg} · "
-              f"질문당 검색 {statistics.median(ms):.1f}ms")
+        bt = [r["gold_best_transcript"] for r in rs if r["gold_best_transcript"] is not None]
+        bn = [r["gold_best_note"] for r in rs if r["gold_best_note"] is not None]
+        allg = [x["s"] for r in rs for x in r["gold_all"]]
+        print(f"\n[{score}] 정답 구간 점수(순위 무관) — 질문별 최고: 전사 중앙 {statistics.median(bt):.2f} 최소 {min(bt):.2f} · "
+              f"노트 중앙 {statistics.median(bn):.2f} 최소 {min(bn):.2f} · 정답 구간 전체 {len(allg)}개 중앙 {statistics.median(allg):.2f}")
+        for th in (0.3, 0.4, 0.6):
+            print(f"    기준 {th}: 가장 좋은 전사 정답도 미만인 질문 {frac_below(rows, 'gold_best_transcript', th):.0%} · "
+                  f"노트 {frac_below(rows, 'gold_best_note', th):.0%} · 정답 구간 전체 중 미만 {sum(1 for x in allg if x < th) / len(allg):.0%}")
+        print(f"    범위 밖 질문의 최고 점수 {neg} · 질문당 검색 {statistics.median(ms):.1f}ms")
         if a.verbose:
             for r in rows:
                 mark = "  " if r["negative"] else ("○ " if r["expand_rank"] and r["expand_rank"] <= 3 else "✕ ")
