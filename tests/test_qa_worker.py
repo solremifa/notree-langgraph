@@ -172,3 +172,80 @@ def test_retriever_maps_tool_errors_to_graph_errors():
         with pytest.raises(SearchUnavailable):
             await McpRetriever(_Ctx(ConnectionResetError("끊김")), "q").search("web", ["스택"])
     asyncio.run(t())
+
+
+def test_deleted_question_returns_no_content_and_copies_are_removed(tmp_path):
+    """답변 완료 뒤 삭제: 조회에 질문·답변·출처 원문이 나오지 않고, DB의 복사본도 지워진다 (2026-10-17 리뷰)."""
+    import sqlite3
+
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            e.start_worker(QA, name="q")
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            assert (await answered(e, q))["state"] == "answered"
+            assert (await e.api.tool("qa_delete", question_id=q["question_id"], user_id=USER))["deleted"]
+            got = await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER)
+            assert got["found"] and got["state"] == "deleted"
+            assert got["question"] is None and got["answer"] is None
+            con = sqlite3.connect(e.db)
+            row = con.execute("SELECT question, answer FROM qa_questions WHERE question_id=?",
+                              (q["question_id"],)).fetchone()
+            con.close()
+            assert row == (None, None)
+    run(t())
+
+
+def test_saved_answer_has_citations_in_sentence_order(tmp_path):
+    """화면 계약의 전체 citations: 문장별 인용을 순서대로, 중복 없이. 서버가 만든다."""
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            q = await ask(e, "스택?")
+            async with McpClient(env={**e.env, "NOTREE_REQUIRE_PERMIT": "0"}) as m:
+                ctx = await m.tool("qa_context", question_id=q["question_id"])
+                src = [{"id": i, "source": s, "text": "…", "ref": i} for i, s in (("t1", "transcript"), ("n1", "note"))]
+                sent = [{"text": "a", "citations": ["t1"]}, {"text": "b", "citations": ["n1", "t1"]}]
+                await m.tool("qa_complete", idem_key=q["job_id"], question_id=q["question_id"],
+                             expected_generation=ctx["generation"], status="completed", label="강의",
+                             answer="a [^t1] b [^n1][^t1]", sentences=sent, sources=src)
+                with pytest.raises(ToolError) as ex:                 # 출처에 없는 인용은 저장하지 않는다
+                    await m.tool("qa_complete", idem_key="op-y", question_id=q["question_id"],
+                                 expected_generation=ctx["generation"], status="completed", label="강의",
+                                 answer="c [^x9]", sentences=[{"text": "c", "citations": ["x9"]}], sources=src)
+                assert ex.value.code == "invalid_args"
+            got = await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER)
+            assert got["answer"]["citations"] == ["t1", "n1"]
+    run(t())
+
+
+class LoseCompleteResponse:
+    """qa_complete는 서버에 전달(저장 커밋)하고 응답만 잃어버린다. 나머지 도구는 그대로."""
+
+    def __init__(self, mcp):
+        self.mcp, self.lost = mcp, 0
+
+    async def tool(self, name, **args):
+        res = await self.mcp.tool(name, **args)
+        if name == "qa_complete" and self.lost == 0:
+            self.lost += 1
+            raise ConnectionResetError("응답 유실 (시험)")
+        return res
+
+
+def test_retry_after_lost_save_response_skips_the_graph(tmp_path):
+    """저장은 됐는데 응답을 못 받아 재시도되면, 질문 해석·검색·답변을 다시 하지 않고 완료 처리."""
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            llm = FakeQALLM()
+            e.start_worker(QA, name="q", mcp=LoseCompleteResponse(e.m_w), extras={"qa_llm": llm})
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            assert await e.wait_state(q["job_id"], timeout=20)
+            row = await e.row(q["job_id"])
+            assert row["state"] == "done" and row["attempts"] == 2
+            assert llm.calls.count("understand") == 1                # 두 번째 시도는 그래프를 건너뜀
+            counts = (await e.api.tool("tool_stats", thread_id=q["job_id"]))["counts"]
+            assert counts["qa_search"] == 2 and counts["qa_context"] == 2
+            assert (await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER))["state"] == "answered"
+    run(t())

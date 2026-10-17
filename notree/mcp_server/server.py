@@ -596,7 +596,8 @@ def qa_context(question_id: str, permit: str | None = None) -> dict:
             "SELECT DISTINCT lecture_id FROM qa_docs WHERE course_id=? AND lecture_id IS NOT NULL ORDER BY lecture_id",
             (q["course_id"],))]
         return ok(C.QaContextOut(question=q["question"], course_id=q["course_id"], course_name=c["name"] if c else "",
-                                 lecture_ids=lectures, generation=q["generation"]))
+                                 lecture_ids=lectures, generation=q["generation"],
+                                 answered=q["state"] == "answered" and q["idem_key"] == q["job_id"]))
 
 
 @tool
@@ -639,6 +640,10 @@ def qa_complete(idem_key: str, question_id: str, expected_generation: int, statu
     """[worker] 답변 저장. 같은 idem_key는 처음 결과 그대로 duplicate=true. 실행권과 질문 세대를 확인한다."""
     C.QaCompleteIn(idem_key=idem_key, question_id=question_id, expected_generation=expected_generation, status=status,
                    label=label, answer=answer, sentences=sentences, sources=sources, notice_code=notice_code)  # 값 검사
+    citations = list(dict.fromkeys(c for s in sentences for c in s["citations"]))   # 화면용 전체 인용 (순서, 중복 없음)
+    missing = [c for c in citations if c not in {s["id"] for s in sources}]
+    if missing:
+        raise ValueError(f"출처에 없는 인용: {missing}")
     with tx() as con:
         q = con.execute("SELECT * FROM qa_questions WHERE question_id=?", (question_id,)).fetchone()
         if not q:
@@ -654,8 +659,8 @@ def qa_complete(idem_key: str, question_id: str, expected_generation: int, statu
         if q["generation"] != expected_generation:                 # 삭제(state=deleted)도 세대가 올라가 여기서 걸린다
             raise Reject(ErrorCode.GENERATION_MISMATCH, f"질문이 바뀜 (세대 {q['generation']} ≠ {expected_generation})")
         answer_id = f"a-{uuid.uuid4().hex[:8]}"
-        body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "sources": sources,
-                "notice_code": notice_code}
+        body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "citations": citations,
+                "sources": sources, "notice_code": notice_code}
         con.execute("UPDATE qa_questions SET state='answered', answer=?, answer_id=?, idem_key=?, updated_at=? "
                     "WHERE question_id=?", (json.dumps(body, ensure_ascii=False), answer_id, idem_key, time.time(), question_id))
         _log(con, "qa_complete", q["job_id"])
@@ -669,16 +674,20 @@ def qa_get(question_id: str, user_id: str) -> dict:
         q = con.execute("SELECT * FROM qa_questions WHERE question_id=? AND user_id=?", (question_id, user_id)).fetchone()
         if not q:
             return ok(C.QaGetOut(found=False))
+        if q["state"] == "deleted":                                # 본문은 돌려주지 않는다 (복사본도 이미 지움)
+            return ok(C.QaGetOut(found=True, state="deleted", job_id=q["job_id"]))
         return ok(C.QaGetOut(found=True, question=q["question"], state=q["state"], job_id=q["job_id"],
                              answer=json.loads(q["answer"]) if q["answer"] else None))
 
 
 @tool
 def qa_delete(question_id: str, user_id: str) -> dict:
-    """[api] 질문 삭제. 세대를 올려 진행 중인 답변 저장이 generation_mismatch로 막히게 한다."""
+    """[api] 질문 삭제. 질문 원문·답변·출처 복사본을 지우고(보관 안 함), 세대를 올려 진행 중인 답변 저장을 막는다.
+    행은 남긴다: 진행 중 작업의 저장이 generation_mismatch로 거절되고, 조회는 'deleted'로 답하게."""
     with tx() as con:
-        cur = con.execute("UPDATE qa_questions SET state='deleted', generation=generation+1, updated_at=? "
-                          "WHERE question_id=? AND user_id=? AND state!='deleted'", (time.time(), question_id, user_id))
+        cur = con.execute("UPDATE qa_questions SET state='deleted', generation=generation+1, question=NULL, answer=NULL, "
+                          "updated_at=? WHERE question_id=? AND user_id=? AND state!='deleted'",
+                          (time.time(), question_id, user_id))
         return ok(C.QaDeleteOut(deleted=cur.rowcount == 1))
 
 

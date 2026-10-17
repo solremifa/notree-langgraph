@@ -3,7 +3,7 @@
     payload = {"question_id": ..., "deadline_at": 요청 + 90초}     (api의 qa_ask가 만든다)
 
 한 번의 실행
-  1. qa_context   → 질문·과목 이름·세대
+  1. qa_context   → 질문·과목 이름·세대. 이 작업의 답이 이미 저장돼 있으면(answered) 여기서 완료
   2. 그래프 실행   → 검색은 McpRetriever가 qa_search(노트·전사)·web_search(웹)로. 시간 예산은 deadline_at 기준
   3. qa_complete  → 결과 저장 (idem_key = job_id, expected_generation = 1의 세대)
 
@@ -68,6 +68,9 @@ async def qa(ctx: JobContext) -> None:
     if not qid:
         raise FatalError("payload에 question_id 없음")
     c = await ctx.tool("qa_context", question_id=qid)
+    if c.get("answered"):                     # 저장은 됐는데 응답을 못 받고 재시도됨 → 다시 만들지 않는다
+        log("qa", f"{qid}: 이 작업의 답이 이미 저장돼 있음 → 그래프 건너뛰고 완료")
+        return
     llm = ctx.extras.get("qa_llm") or get_qa_llm(os.getenv("NOTREE_QA_LLM", "fake"))
     retriever = McpRetriever(ctx, qid)
     cfg = {"configurable": {"llm": llm, "retriever": retriever, "deadline_at": ctx.deadline_at}}

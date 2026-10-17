@@ -531,6 +531,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `lecture_ids` | `list[str]` | 과목의 강의 목록 (전사 검색 범위를 좁힐 때) |
 | `generation` | `int` | 질문 세대. 삭제·수정되면 바뀐다 → qa_complete의 expected_generation |
 | `recent_turns` | `list[str]` = [] | 같은 과목의 최근 대화 (첫 통합에서는 비어 있음) |
+| `answered` | `bool` = False | 이 작업의 답이 이미 저장됨 (저장 응답을 못 받고 재시도된 경우) → 그래프를 건너뛰고 완료 |
 
 ### `qa_search`
 
@@ -591,7 +592,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `label` | `"강의" | "웹" | "일반 지식" | "근거 부족"` |  |
 | `answer` | `str` | 화면용 본문. 인용 표시 [^ID] 포함 (코드가 만든 것) |
 | `sentences` | `list[QaSentence]` |  |
-| `sources` | `list[QaSource]` | 인용된 근거만 |
+| `sources` | `list[QaSource]` | 인용된 근거만. 문장의 인용은 모두 여기에 있어야 함 (없으면 invalid_args) |
 | `notice_code` | `"not_found" | "insufficient" | "timeout" | null` = None |  |
 
 출력 (`data`)
@@ -622,7 +623,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `question` | `str | null` = None |  |
 | `state` | `"pending" | "answered" | "deleted" | null` = None |  |
 | `job_id` | `str | null` = None |  |
-| `answer` | `dict[str, any] | null` = None | qa_complete로 저장된 결과 (status, label, answer, sentences, sources, notice_code) |
+| `answer` | `dict[str, any] | null` = None | 저장된 결과 (status, label, answer, sentences, citations, sources, notice_code). citations는 서버가 문장별 인용을 순서대로 중복 없이 모은 것. 삭제된 질문은 question·answer 모두 null |
 
 ### `qa_delete`
 

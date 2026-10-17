@@ -11,6 +11,14 @@
 
 ## 2026-10-17
 
+### Q&A worker 리뷰 반영: 삭제 후 조회 차단, citations, 저장 응답 유실 후 재실행 · (이번 커밋)
+자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) "리뷰 반영" (브랜치 `feat/qa-worker`)
+
+- 🐛 삭제된 질문의 질문·답변·출처 원문이 `qa_get`으로 조회되던 문제 → `qa_delete`가 복사본까지 지우고, 조회는 `state=deleted`만
+- 🐛 저장·조회 결과에 화면 계약의 전체 `citations`가 없던 문제 → 서버가 문장별 인용에서 순서대로 중복 없이 생성. 출처에 없는 인용은 저장 거절
+- 🐛 저장 응답 유실 후 재시도 때 그래프(LLM)를 다시 돌리던 문제 → `qa_context.answered`가 참이면 건너뛰고 완료
+- 테스트 92 → 95개
+
 ### Q&A worker 통합 1·2단계: 도구 계약 + 가짜 도구로 연결 · `769129e`
 자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) (브랜치 `feat/qa-worker`)
 
