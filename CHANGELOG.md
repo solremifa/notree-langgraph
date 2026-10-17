@@ -11,6 +11,17 @@
 
 ## 2026-10-17
 
+### Q&A worker 통합 1·2단계: 도구 계약 + 가짜 도구로 연결 · (이번 커밋)
+자세히: [docs/changes/2026-10-17-qa-worker.md](docs/changes/2026-10-17-qa-worker.md) (브랜치 `feat/qa-worker`)
+
+- 🆕 Q&A 도구: `qa_ask`(api, 질문 + 작업 의도 한 트랜잭션), `qa_context`, `qa_search`, `web_search`, `qa_complete`(멱등·세대·실행권 확인), `qa_get`·`qa_delete`(api), `qa_seed`(dev). PoC는 SQLite + 키워드 일치 점수
+- 🆕 `qa` 핸들러가 그래프를 실행: `McpRetriever`(검색 도구 → 그래프 Retriever), 오류 변환(일시 거절 → 다시/다음 출처, 영구 거절·세대 불일치 → FatalError), 마감 = 요청 + 90초
+- 🆕 `notree.dev.qa_ask`: 질문 하나를 넣고 저장된 답을 출력
+- 🔧 실제 Redis 실행 기록에 Q&A 경로(전사·웹·일반 지식 3건) 추가, `docs/status.md` 갱신
+- 🔧 worker 시작 로그의 한도를 "기본 한도(종류별 설정 우선)"로 표기
+- ⚠️ 계획 단계였던 `qa_context`·`qa_complete`·`web_search` 입출력을 그래프에 맞춰 바꿈 (T5 확인 필요). `web_search`는 `question_id`를 받음
+- 테스트 84 → 92개
+
 ### 진행 상황 문서, 실제 Redis 실행 기록 · `bcf7d1d`
 - 🆕 `docs/status.md`: "PoC 구현·테스트 완료"와 운영 검증을 구분, Q&A는 "정책 흐름 구현, 실제 검색·LLM·worker 통합 전", Q&A 안의 통합 순서, 과목노트 실제 병합을 개발 목록에
 - 🆕 `docs/measurements/2026-10-17-real-redis/`: 실제 Redis + 프로세스 분리 실행 기록 (Windows 정상 경로, Linux 정상 경로 + worker 인계 90초 뒤 체크포인트에서 재개). 원본 로그 포함

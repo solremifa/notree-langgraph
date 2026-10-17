@@ -69,7 +69,7 @@ class Worker:
         ACTOR.set(self.name)
         await self._ensure_group()
         log("start", f"stream={self.cfg.stream} 동시 {self.concurrency}개 · lease {self.cfg.lease_sec:g}s · "
-                     f"재배송 {self.cfg.claim_idle_ms / 1000:g}s · 한도 {self.cfg.max_attempts}회 · "
+                     f"재배송 {self.cfg.claim_idle_ms / 1000:g}s · 기본 한도 {self.cfg.max_attempts}회(종류별 설정 우선) · "
                      f"핸들러 {sorted(self.handlers)}"
                      + (f" · {self.borrow.stream}에서 최대 {self.borrow_slots}개 빌려 씀" if self.borrow else ""))
         slots = asyncio.Semaphore(self.concurrency)

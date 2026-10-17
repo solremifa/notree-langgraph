@@ -340,37 +340,129 @@ class LectureNotePublishOut(BaseModel):
     version: int
 
 
+# ── Q&A (2026-10-17: 그래프 notree/graphs/qa의 검색 인터페이스·결과 형식에 맞춤) ──
+# 흐름: api qa_ask(질문 + 작업 의도를 한 트랜잭션) → worker qa_context → qa_search·web_search(그래프가 여러 번)
+#       → qa_complete(멱등, 세대 확인) → api qa_get(화면 조회). 노트 반영 제안·사용자 승인은 첫 통합에서 뺌.
+QaStatus = Literal["completed", "부분 답변", "근거 부족", "시간 초과"]
+QaLabel = Literal["강의", "웹", "일반 지식", "근거 부족"]
+QaNotice = Literal["not_found", "insufficient", "timeout"]
+
+
+class QaAskIn(BaseModel):
+    user_id: str = Field(description="질문한 사용자 (실제로는 api가 세션에서 꺼냄)")
+    course_id: str
+    question: str
+
+
+class QaAskOut(BaseModel):
+    question_id: str
+    job_id: str = Field(description="qa 작업. 마감(deadline_at)은 요청 시각 + 90초")
+
+
 class QaContextIn(BaseModel):
     question_id: str
 
 
 class QaContextOut(BaseModel):
     question: str
-    context_blocks: list[NoteBlock]
-    recent_turns: list[str]
-    token_budget_left: int
-    generation: int
+    course_id: str
+    course_name: str = Field(description="LLM에 주는 과목 이름")
+    lecture_ids: list[str] = Field(description="과목의 강의 목록 (전사 검색 범위를 좁힐 때)")
+    generation: int = Field(description="질문 세대. 삭제·수정되면 바뀐다 → qa_complete의 expected_generation")
+    recent_turns: list[str] = Field([], description="같은 과목의 최근 대화 (첫 통합에서는 비어 있음)")
+
+
+class QaSearchIn(BaseModel):
+    question_id: str = Field(description="검색 범위(사용자·과목)는 질문에서 정한다")
+    source: Literal["note", "transcript"]
+    keywords: list[str]
+    limit: int = 3
+    lecture_ids: list[str] | None = Field(None, description="전사 검색을 이 강의들로 좁힘. 없으면 과목 전체")
+
+
+class QaHit(BaseModel):
+    id: str = Field(description="근거 ID. 답변 인용과 같은 값")
+    source: Literal["note", "transcript", "web"]
+    text: str
+    score: float = Field(description="0~1. 그래프가 '충분한지' 판단에 씀")
+    ref: str = Field(description="화면 출처 표시 (노트 블록, 전사 구간, URL)")
+    lecture_id: str | None = None
+
+
+class QaSearchOut(BaseModel):
+    hits: list[QaHit]
+
+
+class QaSentence(BaseModel):
+    text: str
+    citations: list[str]
+
+
+class QaSource(BaseModel):
+    id: str
+    source: Literal["note", "transcript", "web"]
+    text: str
+    ref: str
 
 
 class QaCompleteIn(BaseModel):
-    idem_key: str
+    idem_key: str = Field(description="= job_id. 같은 키로 두 번 오면 처음 결과를 돌려주고 duplicate=true")
     question_id: str
-    expected_generation: int
-    answer: str
-    sources: list[dict[str, Any]] = Field(description="[{type: lecture|web|general, ref, fetched_at?}]")
+    expected_generation: int = Field(description="qa_context에서 받은 세대. 다르면 generation_mismatch (질문이 삭제·수정됨)")
+    status: QaStatus
+    label: QaLabel
+    answer: str = Field(description="화면용 본문. 인용 표시 [^ID] 포함 (코드가 만든 것)")
+    sentences: list[QaSentence]
+    sources: list[QaSource] = Field(description="인용된 근거만")
+    notice_code: QaNotice | None = None
 
 
 class QaCompleteOut(BaseModel):
     answer_id: str
-    reflect_suggested: bool = Field(description="노트 반영 제안 여부")
+    reflect_suggested: bool = Field(False, description="노트 반영 제안 여부 (첫 통합에서는 항상 false)")
+
+
+class QaGetIn(BaseModel):
+    question_id: str
+    user_id: str
+
+
+class QaGetOut(BaseModel):
+    found: bool
+    question: str | None = None
+    state: Literal["pending", "answered", "deleted"] | None = None
+    job_id: str | None = None
+    answer: dict[str, Any] | None = Field(None, description="qa_complete로 저장된 결과 (status, label, answer, sentences, sources, notice_code)")
+
+
+class QaDeleteIn(BaseModel):
+    question_id: str
+    user_id: str
+
+
+class QaDeleteOut(BaseModel):
+    deleted: bool
+
+
+class QaSeedIn(BaseModel):
+    user_id: str
+    course_id: str
+    course_name: str
+    docs: list[dict[str, Any]] = Field(description="[{source: note|transcript|web, id, text, lecture_id?, ref?}]")
+
+
+class QaSeedOut(BaseModel):
+    inserted: int
 
 
 class WebSearchIn(BaseModel):
+    question_id: str = Field(description="어떤 질문의 검색인지 (사용자별 한도·감사용. PoC는 그 과목에 시드한 web 문서에서 찾음)")
     query: str
+    limit: int = 3
 
 
 class WebSearchOut(BaseModel):
-    results: list[dict[str, Any]] = Field(description="[{title, url, snippet, fetched_at}]")
+    results: list[dict[str, Any]] = Field(description="[{id, title, url, snippet, score, fetched_at}]")
 
 
 class GradeContextIn(BaseModel):
@@ -473,12 +565,20 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
              "과목 노트에서 질문과 관련된 블록을 찾는다 (pg_trgm)"),
     ToolSpec("lecture_note_publish", LectureNotePublishIn, LectureNotePublishOut, W, "write", "T3·T4", "", False,
              "planned", "강의 최종 노트 발행 (완료/부분 완료)"),
-    ToolSpec("qa_context", QaContextIn, QaContextOut, W, "read", "T5", "T3·T4", False, "planned",
-             "Q&A 16k 컨텍스트 구성"),
-    ToolSpec("qa_complete", QaCompleteIn, QaCompleteOut, W, "write", "T5", "", False, "planned",
-             "답변 저장 (근거가 그대로일 때만 completed)"),
-    ToolSpec("web_search", WebSearchIn, WebSearchOut, W, "external", "T5", "", True, "planned",
-             "웹 검색 1회 (Brave/OpenAI 미정)"),
+    ToolSpec("qa_ask", QaAskIn, QaAskOut, API, "write", "T5", "T3·T4",
+             summary="질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)"),
+    ToolSpec("qa_context", QaContextIn, QaContextOut, W, "read", "T5", "T3·T4",
+             summary="질문·과목·강의 목록·세대. 사용자는 permit에서"),
+    ToolSpec("qa_search", QaSearchIn, QaSearchOut, W, "read", "T5", "T3·T4",
+             summary="노트·전사 근거 검색. PoC는 키워드 일치 점수, 실제는 pg_trgm(Read)"),
+    ToolSpec("web_search", WebSearchIn, WebSearchOut, W, "external", "T5", "",
+             summary="웹 검색 1회. PoC는 시드한 web 문서에서 찾는 가짜 (실제 공급자 미정)"),
+    ToolSpec("qa_complete", QaCompleteIn, QaCompleteOut, W, "write", "T5", "T3·T4",
+             summary="답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만"),
+    ToolSpec("qa_get", QaGetIn, QaGetOut, API, "read", "T5", "T3·T4", summary="화면 조회: 질문 상태와 저장된 답변"),
+    ToolSpec("qa_delete", QaDeleteIn, QaDeleteOut, API, "write", "T5", "T3·T4",
+             summary="질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)"),
+    ToolSpec("qa_seed", QaSeedIn, QaSeedOut, DEV, "dev", "T5", summary="PoC 검색용 노트·전사·웹 문서 넣기"),
     ToolSpec("grade_context", GradeContextIn, GradeContextOut, W, "read", "T5", "", False, "planned",
              "채점용 문제·루브릭·답안·근거"),
     ToolSpec("grade_save", GradeSaveIn, GradeSaveOut, W, "write", "T5", "", False, "planned",

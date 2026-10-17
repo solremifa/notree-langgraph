@@ -47,15 +47,20 @@
 | `note_publish` | 쓰기 | worker | T3·T4 |  |  | 구현 |
 | `note_get` | 개발용 | dev | T3·T4 |  |  | 구현 |
 | `tool_stats` | 개발용 | dev | worker 담당 |  |  | 구현 |
+| `qa_ask` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
+| `qa_context` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
+| `qa_search` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
+| `web_search` | 외부 | worker | T5 |  |  | 구현 |
+| `qa_complete` | 쓰기 | worker | T5 | T3·T4 |  | 구현 |
+| `qa_get` | 읽기 | api | T5 | T3·T4 |  | 구현 |
+| `qa_delete` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
+| `qa_seed` | 개발용 | dev | T5 |  |  | 구현 |
 | `transcript_range` | 읽기 | worker | T3·T4 | T1·T2 | ○ | 계획 |
 | `summary_segments` | 읽기 | worker | T3·T4 |  |  | 계획 |
 | `summary_publish` | 쓰기 | worker | T3·T4 |  |  | 계획 |
 | `notes_read` | 읽기 | worker | T3·T4 | T5 | ○ | 계획 |
 | `notes_search` | 읽기 | worker | T3·T4 | T5 | ○ | 계획 |
 | `lecture_note_publish` | 쓰기 | worker | T3·T4 |  |  | 계획 |
-| `qa_context` | 읽기 | worker | T5 | T3·T4 |  | 계획 |
-| `qa_complete` | 쓰기 | worker | T5 |  |  | 계획 |
-| `web_search` | 외부 | worker | T5 |  | ○ | 계획 |
 | `grade_context` | 읽기 | worker | T5 |  |  | 계획 |
 | `grade_save` | 쓰기 | worker | T5 |  |  | 계획 |
 | `question_publish` | 쓰기 | worker | T5 | T3·T4 |  | 계획 |
@@ -483,6 +488,182 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 |---|---|---|
 | `counts` | `dict[str, int]` |  |
 
+### `qa_ask`
+
+쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `user_id` | `str` | 질문한 사용자 (실제로는 api가 세션에서 꺼냄) |
+| `course_id` | `str` |  |
+| `question` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` |  |
+| `job_id` | `str` | qa 작업. 마감(deadline_at)은 요청 시각 + 90초 |
+
+### `qa_context`
+
+읽기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
+
+질문·과목·강의 목록·세대. 사용자는 permit에서
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question` | `str` |  |
+| `course_id` | `str` |  |
+| `course_name` | `str` | LLM에 주는 과목 이름 |
+| `lecture_ids` | `list[str]` | 과목의 강의 목록 (전사 검색 범위를 좁힐 때) |
+| `generation` | `int` | 질문 세대. 삭제·수정되면 바뀐다 → qa_complete의 expected_generation |
+| `recent_turns` | `list[str]` = [] | 같은 과목의 최근 대화 (첫 통합에서는 비어 있음) |
+
+### `qa_search`
+
+읽기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
+
+노트·전사 근거 검색. PoC는 키워드 일치 점수, 실제는 pg_trgm(Read)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` | 검색 범위(사용자·과목)는 질문에서 정한다 |
+| `source` | `"note" | "transcript"` |  |
+| `keywords` | `list[str]` |  |
+| `limit` | `int` = 3 |  |
+| `lecture_ids` | `list[str] | null` = None | 전사 검색을 이 강의들로 좁힘. 없으면 과목 전체 |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `hits` | `list[QaHit]` |  |
+
+### `web_search`
+
+외부 · 호출: worker · 정의: T5 · permit 필요
+
+웹 검색 1회. PoC는 시드한 web 문서에서 찾는 가짜 (실제 공급자 미정)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` | 어떤 질문의 검색인지 (사용자별 한도·감사용. PoC는 그 과목에 시드한 web 문서에서 찾음) |
+| `query` | `str` |  |
+| `limit` | `int` = 3 |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `results` | `list[dict[str, any]]` | [{id, title, url, snippet, score, fetched_at}] |
+
+### `qa_complete`
+
+쓰기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
+
+답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `idem_key` | `str` | = job_id. 같은 키로 두 번 오면 처음 결과를 돌려주고 duplicate=true |
+| `question_id` | `str` |  |
+| `expected_generation` | `int` | qa_context에서 받은 세대. 다르면 generation_mismatch (질문이 삭제·수정됨) |
+| `status` | `"completed" | "부분 답변" | "근거 부족" | "시간 초과"` |  |
+| `label` | `"강의" | "웹" | "일반 지식" | "근거 부족"` |  |
+| `answer` | `str` | 화면용 본문. 인용 표시 [^ID] 포함 (코드가 만든 것) |
+| `sentences` | `list[QaSentence]` |  |
+| `sources` | `list[QaSource]` | 인용된 근거만 |
+| `notice_code` | `"not_found" | "insufficient" | "timeout" | null` = None |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `answer_id` | `str` |  |
+| `reflect_suggested` | `bool` = False | 노트 반영 제안 여부 (첫 통합에서는 항상 false) |
+
+### `qa_get`
+
+읽기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+화면 조회: 질문 상태와 저장된 답변
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `found` | `bool` |  |
+| `question` | `str | null` = None |  |
+| `state` | `"pending" | "answered" | "deleted" | null` = None |  |
+| `job_id` | `str | null` = None |  |
+| `answer` | `dict[str, any] | null` = None | qa_complete로 저장된 결과 (status, label, answer, sentences, sources, notice_code) |
+
+### `qa_delete`
+
+쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `question_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `deleted` | `bool` |  |
+
+### `qa_seed`
+
+개발용 · 호출: dev · 정의: T5
+
+PoC 검색용 노트·전사·웹 문서 넣기
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `user_id` | `str` |  |
+| `course_id` | `str` |  |
+| `course_name` | `str` |  |
+| `docs` | `list[dict[str, any]]` | [{source: note|transcript|web, id, text, lecture_id?, ref?}] |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `inserted` | `int` |  |
+
 ## 계획된 도구
 
 담당자가 PR로 필드를 확정하고 `notree/mcp_server/server.py`에 구현합니다.
@@ -615,69 +796,6 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 |---|---|---|
 | `note_id` | `str` |  |
 | `version` | `int` |  |
-
-### `qa_context` (계획)
-
-읽기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
-
-Q&A 16k 컨텍스트 구성
-
-입력
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `question_id` | `str` |  |
-
-출력 (`data`)
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `question` | `str` |  |
-| `context_blocks` | `list[NoteBlock]` |  |
-| `recent_turns` | `list[str]` |  |
-| `token_budget_left` | `int` |  |
-| `generation` | `int` |  |
-
-### `qa_complete` (계획)
-
-쓰기 · 호출: worker · 정의: T5 · permit 필요
-
-답변 저장 (근거가 그대로일 때만 completed)
-
-입력
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `idem_key` | `str` |  |
-| `question_id` | `str` |  |
-| `expected_generation` | `int` |  |
-| `answer` | `str` |  |
-| `sources` | `list[dict[str, any]]` | [{type: lecture|web|general, ref, fetched_at?}] |
-
-출력 (`data`)
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `answer_id` | `str` |  |
-| `reflect_suggested` | `bool` | 노트 반영 제안 여부 |
-
-### `web_search` (계획)
-
-외부 · 호출: worker · 정의: T5 · **모델에 노출** · permit 필요
-
-웹 검색 1회 (Brave/OpenAI 미정)
-
-입력
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `query` | `str` |  |
-
-출력 (`data`)
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `results` | `list[dict[str, any]]` | [{title, url, snippet, fetched_at}] |
 
 ### `grade_context` (계획)
 

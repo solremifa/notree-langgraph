@@ -67,8 +67,26 @@ uv run python -m notree.dev.enqueue course_update sources=hello,big,world die_at
 - 중단 위치 형식은 `extract:<강의>` 또는 노드 이름(`merge`, `validate`, `publish`)입니다. `die_at=big`처럼 강의 이름만 주면 아무 데서도 멈추지 않습니다 (같은 날 한 번 그렇게 돌려 정상 완료된 `op-616cf525`가 로그에 남아 있음).
 - `crash_at`을 쓰면 worker는 살아 있고 작업만 실패해 재시도로 이어집니다.
 
+## 3. Q&A 경로 — Linux (`feat/qa-worker`)
+
+같은 환경에서 MCP 서버·배정기·**qa worker**(`--stream qa`)를 띄우고 `notree.dev.qa_ask`로 질문 3개를 넣었습니다.
+검색은 PoC 가짜(SQLite 키워드 일치, 데모 말뭉치 "자료구조"), LLM은 가짜입니다. 원본 로그: `qa_worker.log`.
+
+```bash
+uv run python -m notree.worker --stream qa --name A &
+uv run python -m notree.dev.qa_ask "스택 오버플로는 왜 생겨?"
+```
+
+| 질문 | 결과 | 검색 |
+|---|---|---|
+| 스택 오버플로는 왜 생겨? | `[강의 · completed]` 전사 t1 인용 | note → transcript |
+| 힙 정렬의 시간 복잡도는? | `[웹 · completed]` 웹 w1 인용 | note → transcript → web |
+| 오늘 점심 뭐 먹지? | `[일반 지식 · completed]` 인용 없음 | 없음 |
+
+세 작업 모두 `done`, 등록부터 저장까지 각각 2초 안쪽 (가짜 LLM).
+
 ## 확인하지 않은 것
 
 - PostgreSQL (MCP 서버 DB는 SQLite), 실제 업무 데이터, 실제 LLM
 - Redis 재시작·장애, MCP 서버 장애 중 실행, 여러 머신에 나눈 배치
-- 레인 분리 뒤 `qa` worker 경로 (Q&A 핸들러가 아직 TODO)
+- Q&A의 실제 검색(PG)·실제 LLM·화면 전달 (3절은 가짜 검색·LLM)

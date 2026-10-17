@@ -70,6 +70,13 @@ CREATE TABLE IF NOT EXISTS notes(
 CREATE TABLE IF NOT EXISTS tool_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT, thread_id TEXT);
 CREATE INDEX IF NOT EXISTS jobs_pending_lane ON jobs(state, stream, created);
+CREATE TABLE IF NOT EXISTS qa_courses(course_id TEXT PRIMARY KEY, user_id TEXT, name TEXT);
+CREATE TABLE IF NOT EXISTS qa_docs(
+  course_id TEXT, source TEXT, doc_id TEXT, user_id TEXT, lecture_id TEXT, text TEXT, ref TEXT,
+  PRIMARY KEY(course_id, source, doc_id));
+CREATE TABLE IF NOT EXISTS qa_questions(
+  question_id TEXT PRIMARY KEY, user_id TEXT, course_id TEXT, question TEXT, job_id TEXT,
+  generation INTEGER DEFAULT 1, state TEXT, answer TEXT, answer_id TEXT, idem_key TEXT, created REAL, updated_at REAL);
 """
 # 나중에 추가된 컬럼 (이전 버전 DB 호환)
 ADDED_COLUMNS = [
@@ -331,17 +338,23 @@ def _set(con, job_id: str, **cols) -> int:
 @tool
 def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None) -> dict:
     """[api] 업무 데이터와 같은 트랜잭션에 '의도(intent)'를 남긴다. 큐에는 아직 안 간다."""
+    with db() as con:
+        job_id = _insert_job(con, kind, payload, user_id, stream)
+    return ok(C.JobCreateOut(job_id=job_id))
+
+
+def _insert_job(con, kind: str, payload: dict, user_id: str, stream: str | None = None) -> str:
+    """작업 의도 한 행. 업무 데이터를 쓰는 트랜잭션 안에서 부른다 (qa_ask처럼)."""
     job_id = f"op-{uuid.uuid4().hex[:8]}"
     now = time.time()
     if kind in KIND_DEADLINE_SEC and payload.get("deadline_at") is None:   # Q&A·채점: 요청부터 전체 90초
         payload = {**payload, "deadline_at": now + KIND_DEADLINE_SEC[kind]}
-    with db() as con:
-        con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (job_id, kind, json.dumps(payload, ensure_ascii=False),
-                     stream or STREAM_OF.get(kind, "notree:batch"), "pending", now, now, user_id))
-        _log(con, "job_create", job_id)
-    return ok(C.JobCreateOut(job_id=job_id))
+    con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (job_id, kind, json.dumps(payload, ensure_ascii=False),
+                 stream or STREAM_OF.get(kind, "notree:batch"), "pending", now, now, user_id))
+    _log(con, "job_create", job_id)
+    return job_id
 
 
 @tool
@@ -524,6 +537,149 @@ def note_get(idem_key: str) -> dict:
         r = con.execute("SELECT * FROM notes WHERE idem_key=?", (idem_key,)).fetchone()
         return ok(C.NoteGetOut(found=True, **{k: r[k] for k in ("user_id", "course", "note", "status")})
                   if r else C.NoteGetOut(found=False))
+
+
+# ── Q&A (PoC: SQLite + 키워드 일치 점수. 실제는 PG + pg_trgm, 웹은 외부 공급자) ─────────
+# 사용자 경계: worker 도구는 permit의 사용자(u)와 질문의 사용자가 같아야 한다 (RLS 흉내). 다르면 not_found.
+def _qa_question(con, question_id: str, permit: str | None) -> tuple[sqlite3.Row, dict | None]:
+    q = con.execute("SELECT * FROM qa_questions WHERE question_id=?", (question_id,)).fetchone()
+    if not q or q["state"] == "deleted":
+        raise Reject(ErrorCode.NOT_FOUND, f"질문 없음: {question_id}")
+    claims = _claims(permit, q["job_id"])
+    if claims is not None and claims.get("u") != q["user_id"]:
+        raise Reject(ErrorCode.NOT_FOUND, f"질문 없음: {question_id}")      # 남의 질문은 '없음'과 구별하지 않는다
+    return q, claims
+
+
+def _score(text: str, keywords: list[str]) -> float:
+    if not keywords:
+        return 0.0
+    return sum(1 for k in keywords if k.lower() in text.lower()) / len(keywords)
+
+
+@tool
+def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) -> dict:
+    """[dev] 검색용 문서 넣기. 같은 (과목, 출처, id)는 덮어쓴다."""
+    with tx() as con:
+        con.execute("INSERT OR REPLACE INTO qa_courses VALUES(?,?,?)", (course_id, user_id, course_name))
+        for d in docs:
+            if d["source"] not in ("note", "transcript", "web"):
+                raise ValueError(f"source: {d['source']}")
+            con.execute("INSERT OR REPLACE INTO qa_docs VALUES(?,?,?,?,?,?,?)",
+                        (course_id, d["source"], d["id"], user_id, d.get("lecture_id"), d["text"], d.get("ref") or d["id"]))
+    return ok(C.QaSeedOut(inserted=len(docs)))
+
+
+@tool
+def qa_ask(user_id: str, course_id: str, question: str) -> dict:
+    """[api] 질문 행과 qa 작업 의도를 한 트랜잭션에. 마감은 job_create와 같은 규칙(요청 + 90초)."""
+    question_id = f"q-{uuid.uuid4().hex[:8]}"
+    now = time.time()
+    with tx() as con:
+        c = con.execute("SELECT user_id FROM qa_courses WHERE course_id=?", (course_id,)).fetchone()
+        if not c or c["user_id"] != user_id:
+            raise Reject(ErrorCode.NOT_FOUND, f"과목 없음: {course_id}")
+        job_id = _insert_job(con, "qa", {"question_id": question_id}, user_id)
+        con.execute("INSERT INTO qa_questions(question_id, user_id, course_id, question, job_id, state, created, updated_at) "
+                    "VALUES(?,?,?,?,?,'pending',?,?)", (question_id, user_id, course_id, question, job_id, now, now))
+    return ok(C.QaAskOut(question_id=question_id, job_id=job_id))
+
+
+@tool
+def qa_context(question_id: str, permit: str | None = None) -> dict:
+    """[worker] 질문·과목·강의 목록·세대."""
+    with db() as con:
+        q, _ = _qa_question(con, question_id, permit)
+        _log(con, "qa_context", q["job_id"])
+        c = con.execute("SELECT name FROM qa_courses WHERE course_id=?", (q["course_id"],)).fetchone()
+        lectures = [r["lecture_id"] for r in con.execute(
+            "SELECT DISTINCT lecture_id FROM qa_docs WHERE course_id=? AND lecture_id IS NOT NULL ORDER BY lecture_id",
+            (q["course_id"],))]
+        return ok(C.QaContextOut(question=q["question"], course_id=q["course_id"], course_name=c["name"] if c else "",
+                                 lecture_ids=lectures, generation=q["generation"]))
+
+
+@tool
+def qa_search(question_id: str, source: str, keywords: list[str], limit: int = 3,
+              lecture_ids: list[str] | None = None, permit: str | None = None) -> dict:
+    """[worker] 노트·전사 근거 검색 (읽기). 범위는 질문의 사용자·과목."""
+    if source not in ("note", "transcript"):
+        raise ValueError(f"source: {source} (웹은 web_search)")
+    with db() as con:
+        q, _ = _qa_question(con, question_id, permit)
+        _log(con, "qa_search", q["job_id"])
+        sql, args = "SELECT * FROM qa_docs WHERE course_id=? AND user_id=? AND source=?", [q["course_id"], q["user_id"], source]
+        if lecture_ids:
+            sql += f" AND lecture_id IN ({','.join('?' * len(lecture_ids))})"
+            args += lecture_ids
+        hits = [C.QaHit(id=r["doc_id"], source=source, text=r["text"], score=round(_score(r["text"], keywords), 3),
+                        ref=r["ref"], lecture_id=r["lecture_id"]) for r in con.execute(sql, args)]
+        hits = sorted((h for h in hits if h.score > 0), key=lambda h: -h.score)[:limit]
+        return ok(C.QaSearchOut(hits=hits))
+
+
+@tool
+def web_search(question_id: str, query: str, limit: int = 3, permit: str | None = None) -> dict:
+    """[worker] 웹 검색 1회. PoC는 그 과목에 시드한 web 문서에서 찾는 가짜."""
+    words = [w for w in query.split() if w]
+    with db() as con:
+        q, _ = _qa_question(con, question_id, permit)
+        _log(con, "web_search", q["job_id"])
+        rows = con.execute("SELECT * FROM qa_docs WHERE course_id=? AND source='web'", (q["course_id"],)).fetchall()
+        res = [{"id": r["doc_id"], "title": r["doc_id"], "url": r["ref"], "snippet": r["text"],
+                "score": round(_score(r["text"], words), 3), "fetched_at": time.time()} for r in rows]
+        res = sorted((x for x in res if x["score"] > 0), key=lambda x: -x["score"])[:limit]
+        return ok(C.WebSearchOut(results=res))
+
+
+@tool
+def qa_complete(idem_key: str, question_id: str, expected_generation: int, status: str, label: str, answer: str,
+                sentences: list[dict], sources: list[dict], notice_code: str | None = None,
+                permit: str | None = None) -> dict:
+    """[worker] 답변 저장. 같은 idem_key는 처음 결과 그대로 duplicate=true. 실행권과 질문 세대를 확인한다."""
+    C.QaCompleteIn(idem_key=idem_key, question_id=question_id, expected_generation=expected_generation, status=status,
+                   label=label, answer=answer, sentences=sentences, sources=sources, notice_code=notice_code)  # 값 검사
+    with tx() as con:
+        q = con.execute("SELECT * FROM qa_questions WHERE question_id=?", (question_id,)).fetchone()
+        if not q:
+            raise Reject(ErrorCode.NOT_FOUND, f"질문 없음: {question_id}")
+        claims = _claims(permit, q["job_id"])
+        if claims is not None and claims.get("u") != q["user_id"]:
+            raise Reject(ErrorCode.NOT_FOUND, f"질문 없음: {question_id}")
+        if q["idem_key"] == idem_key:                              # 이미 저장됨 (응답을 못 받은 재시도 등)
+            return ok(C.QaCompleteOut(answer_id=q["answer_id"]), duplicate=True)
+        if q["state"] == "answered":                               # 다른 키로 이미 답함 → 덮어쓰지 않는다
+            raise Reject(ErrorCode.GENERATION_MISMATCH, "이미 다른 실행이 답을 저장함")
+        _require_live(con, claims, q["job_id"])
+        if q["generation"] != expected_generation:                 # 삭제(state=deleted)도 세대가 올라가 여기서 걸린다
+            raise Reject(ErrorCode.GENERATION_MISMATCH, f"질문이 바뀜 (세대 {q['generation']} ≠ {expected_generation})")
+        answer_id = f"a-{uuid.uuid4().hex[:8]}"
+        body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "sources": sources,
+                "notice_code": notice_code}
+        con.execute("UPDATE qa_questions SET state='answered', answer=?, answer_id=?, idem_key=?, updated_at=? "
+                    "WHERE question_id=?", (json.dumps(body, ensure_ascii=False), answer_id, idem_key, time.time(), question_id))
+        _log(con, "qa_complete", q["job_id"])
+        return ok(C.QaCompleteOut(answer_id=answer_id))
+
+
+@tool
+def qa_get(question_id: str, user_id: str) -> dict:
+    """[api] 화면 조회."""
+    with db() as con:
+        q = con.execute("SELECT * FROM qa_questions WHERE question_id=? AND user_id=?", (question_id, user_id)).fetchone()
+        if not q:
+            return ok(C.QaGetOut(found=False))
+        return ok(C.QaGetOut(found=True, question=q["question"], state=q["state"], job_id=q["job_id"],
+                             answer=json.loads(q["answer"]) if q["answer"] else None))
+
+
+@tool
+def qa_delete(question_id: str, user_id: str) -> dict:
+    """[api] 질문 삭제. 세대를 올려 진행 중인 답변 저장이 generation_mismatch로 막히게 한다."""
+    with tx() as con:
+        cur = con.execute("UPDATE qa_questions SET state='deleted', generation=generation+1, updated_at=? "
+                          "WHERE question_id=? AND user_id=? AND state!='deleted'", (time.time(), question_id, user_id))
+        return ok(C.QaDeleteOut(deleted=cur.rowcount == 1))
 
 
 @tool
