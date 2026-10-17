@@ -167,3 +167,14 @@ def test_forged_permit_is_rejected(tmp_path):
             assert missing["code"] == "permit_invalid" and missing["message"] == "permit 필요"
             assert (await e.api.tool("job_finish", job_id=j, worker="w", permit=st["permit"]))["finished"] is True
     run(t())
+
+
+def test_heartbeat_is_counted_in_tool_stats(tmp_path):
+    """heartbeat도 DB를 두드리므로 호출 집계에 잡혀야 한다 (빠져 있던 것, 2026-10-17)."""
+    async def t():
+        async with Env(tmp_path) as e:
+            e.start_worker()
+            j = await e.job({"sleep": 1.0})
+            assert await e.wait_state(j)
+            assert (await e.api.tool("tool_stats", thread_id=j))["counts"].get("job_heartbeat", 0) >= 2
+    run(t())

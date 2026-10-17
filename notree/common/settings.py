@@ -70,14 +70,32 @@ ALLOC_LANES: tuple[tuple[str, int], ...] = (           # (레인, 한 바퀴 몫
 ALLOC_INTERVAL_SEC = _f("NOTREE_ALLOC_INTERVAL_SEC", 0.5)
 ALLOC_MAX_PER_TICK = int(_f("NOTREE_ALLOC_MAX_PER_TICK", 200))
 
-# 작업 종류별 시도 한도 (팀 결정 3번). 없으면 Stream 기본값(rt 2, batch 3)
+# 작업 종류별 실행 정책 (팀 결정 2·3번, 2026-10-17 확정). 시도 수는 모두 "최초 포함 총 N회".
+#   qa·grading     : 요청부터 전체 90초 안에서 최대 3회 (마감 = 요청 시각 + 90초, 시도당 제한 없이 남은 시간까지)
+#   final_note     : 시도당 5분, 총 3회
+#   course_update  : 시도당 10분, 총 3회
+#   live_summary   : 1회 (곧 다음 요약이 오므로 재시도 가치가 낮다)
+# 없으면 Stream 기본값 (rt 2회·90초, batch 3회·15분).
 KIND_MAX_ATTEMPTS: dict[str, int] = {
-    "live_summary": 1,          # 곧 다음 요약이 오므로 재시도 가치가 낮다
+    "qa": 3, "grading": 3,
+    "final_note": 3, "course_update": 3,
+    "live_summary": 1,
+}
+KIND_JOB_TIMEOUT_SEC: dict[str, float] = {      # 시도당 제한. Stream 제한보다 길게는 못 늘린다 (작은 쪽)
+    "final_note": 5 * 60,
+    "course_update": 10 * 60,
+}
+KIND_DEADLINE_SEC: dict[str, float] = {         # 요청부터 전체 마감. job_create·job_retry가 payload에 deadline_at으로 넣는다
+    "qa": 90, "grading": 90,
 }
 
 
 def max_attempts_for(kind: str, cfg: StreamConfig) -> int:
     return KIND_MAX_ATTEMPTS.get(kind, cfg.max_attempts)
+
+
+def job_timeout_for(kind: str, cfg: StreamConfig) -> float:
+    return min(cfg.job_timeout_sec, KIND_JOB_TIMEOUT_SEC.get(kind, cfg.job_timeout_sec))
 
 
 # scheduler 주기 작업 (팀 결정 6·9번)

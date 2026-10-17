@@ -35,6 +35,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # 저장소 루트 (파일 경로로 직접 띄워질 때 notree import)
+from notree.common.settings import KIND_DEADLINE_SEC  # noqa: E402
 from notree.contracts import tools as C  # noqa: E402
 from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
 
@@ -332,6 +333,8 @@ def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None
     """[api] 업무 데이터와 같은 트랜잭션에 '의도(intent)'를 남긴다. 큐에는 아직 안 간다."""
     job_id = f"op-{uuid.uuid4().hex[:8]}"
     now = time.time()
+    if kind in KIND_DEADLINE_SEC and payload.get("deadline_at") is None:   # Q&A·채점: 요청부터 전체 90초
+        payload = {**payload, "deadline_at": now + KIND_DEADLINE_SEC[kind]}
     with db() as con:
         con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
                     "VALUES(?,?,?,?,?,?,?,?)",
@@ -413,6 +416,7 @@ def job_heartbeat(job_id: str, worker: str, lease_sec: float, permit: str | None
     """[worker] lease 연장. renewed=false면 실행권을 잃은 것 (다른 worker·다른 시도로 넘어감)."""
     claims = _claims(permit, job_id)
     with tx() as con:
+        _log(con, "job_heartbeat", job_id)        # 호출 집계에 빠져 있던 것 (DB를 두드리는데 계측에 0으로 보였음)
         if not _is_live(con, claims, job_id):
             return ok(C.JobHeartbeatOut(renewed=False))
         cur = con.execute("UPDATE jobs SET lease_until=? WHERE job_id=? AND lease_owner=? AND state='running'",
@@ -464,9 +468,10 @@ def job_release(job_id: str, worker: str, reason: str, permit: str | None = None
 @tool
 def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
     """[api] 사용자의 '다시 시도'. 다시 해도 되는 실패만 pending으로 되살린다. 체크포인트는 그대로라 이어서 실행된다.
-    마감이 있던 작업은 deadline_at으로 새 마감을 준다 (안 주면 지난 마감 그대로라 바로 다시 실패)."""
+    마감이 있던 작업은 deadline_at으로 새 마감을 준다. 안 주면 Q&A·채점은 지금부터 정책 마감(90초),
+    그 밖의 작업은 지난 마감 그대로라 바로 다시 실패한다."""
     with db() as con:
-        r = con.execute("SELECT state, user_retryable, payload FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        r = con.execute("SELECT state, user_retryable, payload, kind FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         if not r:
             raise Reject(ErrorCode.NOT_FOUND, job_id)
         if r["state"] != "failed":
@@ -474,6 +479,8 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
         if not r["user_retryable"]:
             return ok(C.JobRetryOut(revived=False, reason="영구 실패라 다시 시도할 수 없음"))
         payload = json.loads(r["payload"])
+        if deadline_at is None and r["kind"] in KIND_DEADLINE_SEC:
+            deadline_at = time.time() + KIND_DEADLINE_SEC[r["kind"]]
         if deadline_at is not None:
             payload["deadline_at"] = deadline_at
         _set(con, job_id, state="pending", attempts=0, lease_owner=None, lease_until=None, fail_reason=None,

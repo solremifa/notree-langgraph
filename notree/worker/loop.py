@@ -220,7 +220,7 @@ class Worker:
         try:
             if fn is None:
                 raise FatalError(f"핸들러 없음: {kind}")
-            timeout = cfg.job_timeout_sec
+            timeout = S.job_timeout_for(kind, cfg)
             if left is not None:
                 if left <= 0:
                     raise DeadlinePassed()

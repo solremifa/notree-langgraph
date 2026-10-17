@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 class JobCreateIn(BaseModel):
     kind: str = Field(description="작업 종류 (핸들러 이름)")
-    payload: dict[str, Any] = Field(description="핸들러 입력")
+    payload: dict[str, Any] = Field(description="핸들러 입력. Q&A·채점에 deadline_at이 없으면 서버가 요청 시각 + 90초로 넣는다")
     user_id: str = Field(description="요청한 사용자. permit에 담겨 MCP 서버의 RLS 기준이 된다")
     stream: str | None = Field(None, description="생략하면 작업 종류별 기본 Stream")
 
@@ -119,7 +119,7 @@ class JobReleaseOut(BaseModel):
 
 class JobRetryIn(BaseModel):
     job_id: str
-    deadline_at: float | None = Field(None, description="마감이 있던 작업(Q&A)은 새 마감을 준다. 없으면 기존 값 유지")
+    deadline_at: float | None = Field(None, description="새 마감. 없으면 Q&A·채점은 지금 + 90초, 그 밖의 작업은 기존 값 유지")
 
 
 class JobRetryOut(BaseModel):

@@ -1,0 +1,6 @@
+per_session 녹음  2000개 → 트랜잭션  3995.6/s · PG CPU  31.2% (2코어 중) · WAL  6143.6KB/s · 저장까지 p50    8.1ms p99  132.4ms
+grouped     녹음  2000개 → 트랜잭션     7.1/s · PG CPU   5.7% (2코어 중) · WAL  5866.3KB/s · 저장까지 p50  189.9ms p99  374.1ms
+per_session 녹음   560개 → 트랜잭션  1126.1/s · PG CPU  10.3% (2코어 중) · WAL  1656.3KB/s · 저장까지 p50    2.5ms p99    7.8ms
+grouped     녹음   560개 → 트랜잭션     8.1/s · PG CPU   1.8% (2코어 중) · WAL  1791.2KB/s · 저장까지 p50  143.5ms p99  275.0ms
+per_session 녹음  2000개 → 트랜잭션  3357.4/s · PG CPU  26.0% (2코어 중) · WAL  5680.9KB/s · 저장까지 p50   15.7ms p99 4233.3ms
+per_session 녹음  2000개 → 트랜잭션  4060.1/s · PG CPU  34.1% (2코어 중) · WAL  6022.7KB/s · 저장까지 p50   16.1ms p99  123.1ms

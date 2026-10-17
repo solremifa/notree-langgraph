@@ -1,13 +1,13 @@
 # worker 관련 팀 결정 사항 (확정)
 
-2026-10-15 확정. 처음 제안에서 무엇이 바뀌었고 코드의 어디를 고쳤는지는
+2026-10-15 확정 (2·3번 작업 종류별 값과 11번은 2026-10-17 추가). 처음 제안에서 무엇이 바뀌었고 코드의 어디를 고쳤는지는
 [changes/2026-10-15-team-decisions.md](changes/2026-10-15-team-decisions.md)에 따로 정리했습니다.
 
 | # | 항목 | 확정 내용 | 코드 |
 |---|---|---|---|
 | 1 | 재배송 주체 | worker가 `XAUTOCLAIM`으로 직접 회수. scheduler는 누락 복구(6번)만 | `notree/worker/loop.py` `_next` |
-| 2 | 시간 값 | rt 15/5/20초·제한 90초, batch 60/20/90초·제한 15분. 마감 시각(`deadline_at`) 지원 | `notree/common/settings.py`, `loop.py` |
-| 3 | 재시도·실패 | rt 2회, batch 3회, 실시간 요약 1회. 실패는 `failed` + 사유 + 다시 시도 가능 여부 | `settings.KIND_MAX_ATTEMPTS`, `loop.py` |
+| 2 | 시간 값 | rt 15/5/20초·제한 90초, batch 60/20/90초·제한 15분. Q&A·채점은 요청부터 전체 90초(`deadline_at`), final_note 시도당 5분, course_update 시도당 10분 | `notree/common/settings.py`, `loop.py` |
+| 3 | 재시도·실패 | 최초 포함 총 횟수: Q&A·채점 3회(90초 안에서), final_note·course_update 3회, 실시간 요약 1회. 실패는 `failed` + 사유 + 다시 시도 가능 여부 | `settings.KIND_MAX_ATTEMPTS`, `loop.py` |
 | 4 | permit | HMAC 서명, 사용자 ID 포함. MCP가 꺼내 씀(인자로 받지 않음). 유효 rt 5분·batch 30분 | `notree/mcp_server/server.py` `_issue_permit` |
 | 5 | 동시 실행 | 프로세스당 rt 4, batch 1 | `settings.RT/BATCH.concurrency` |
 | 6 | 배정기 누락 복구 | 10초마다, reserved 30초·sent 120초 넘게 멈춘 의도를 다시 XADD | `notree/scheduler/periodic.py` |
@@ -15,6 +15,7 @@
 | 8 | MCP 도구 계약 | 이름 `영역_동사`, 공통 인자·응답 형식, 계약은 Pydantic 코드 하나 | `notree/contracts/` |
 | 9 | 체크포인트 정리 | 완료·실패 후 7일 보관 뒤 삭제, 1시간마다 | `checkpoint_cleanup` 도구, `periodic.py` |
 | 10 | Q&A 구현 방식 | LangGraph로 구현 (노트 → 전사 → 웹, 인용 확인). 보완 목록 10번 참고 | `notree/graphs/qa/`, `qa` 핸들러 (T5) |
+| 11 | 레인 | Q&A·채점(`qa`) / 실시간 요약(`rt`) / batch로 분리, 배정도 레인별. 슬롯은 고정이 기본, 빌려 쓰기는 옵션 | `settings.STREAMS`, `ALLOC_LANES`, `BORROW` |
 
 ---
 
@@ -35,6 +36,18 @@
 
 규칙: heartbeat < lease < 재배송 기준. 실행 제한 ≤ 사용자에게 약속한 시간.
 
+**작업 종류별 값** (2026-10-17 확정, `settings.KIND_*`). 시도 수는 모두 **최초 포함 총 횟수**입니다.
+
+| 작업 | 전체 마감 | 시도당 제한 | 총 시도 |
+|---|---|---|---|
+| `qa`, `grading` | 요청부터 90초 (`deadline_at`) | 없음 (마감까지 남은 시간) | 3회, 모두 90초 안에서 |
+| `final_note` | 없음 | 5분 | 3회 |
+| `course_update` | 없음 | 10분 | 3회 |
+| `live_summary` | 없음 | rt 기본 90초 | 1회 |
+
+- Q&A·채점은 api가 `deadline_at`을 안 넣으면 서버(`job_create`)가 요청 시각 + 90초로 넣습니다. 사용자 재시도(`job_retry`)는 새 마감을 안 주면 지금 + 90초로 다시 잡습니다.
+- 시도당 제한은 레인 제한보다 길게 늘리지 않습니다 (둘 중 짧은 쪽).
+
 **마감 시각**: api가 의도를 만들 때 payload에 `deadline_at`(unix 초)을 넣으면, worker는 실행 제한과 남은 시간 중 짧은 쪽으로 실행합니다.
 - 시작할 때 이미 지났으면 실행하지 않고 실패 확정 (`마감 시각 지남`, 다시 시도 가능)
 - 실행 중 마감을 넘기면 재시도하지 않고 실패 확정 (`마감 시각 초과`)
@@ -50,7 +63,7 @@
 | 실행 제한 초과 (마감 전) | 핸들러 없음 (미구현) |
 | 예상 못 한 예외 | |
 
-- 한도: rt 2회, batch 3회, `live_summary` 1회 (`settings.KIND_MAX_ATTEMPTS`에서 종류별로 바꿈)
+- 한도 (최초 포함): Q&A·채점 3회, final_note·course_update 3회, `live_summary` 1회. 그 밖은 rt 2회·batch 3회 (`settings.KIND_MAX_ATTEMPTS`)
 - 재시도 간격: lease를 반납하고 재배송 기준만큼 기다렸다 다시 (고정 간격). 429가 많으면 측정 후 늘어나는 간격 검토
 - 실패 확정 시 DB에 `state=failed`, `fail_reason`, `user_retryable`이 남습니다. 화면은 이 셋을 근거로 표시합니다
   - `user_retryable=true`: 한도 초과, 실행 제한·마감 초과 → "다시 시도" 버튼
@@ -172,3 +185,34 @@
   - 참고: 인용 확인은 "인용 ID 유효성 검사"일 뿐 사실성 검증이 아님 (근거 n1=LIFO를 붙여 "FIFO"라고 답해도 통과)
 - **검색 방식 확인 필요**: 도구 계약은 pg_trgm, 기획의 Agent 안은 벡터 DB 인덱싱. 팀에서 하나로 정해야 함
 - 아직 정할 것 (기획·API): 과목과 관계없는 질문에 답할지, "근거 부족"일 때 일반 지식 답을 같이 보여줄지, 진행 상황 표시 여부
+
+---
+
+## 11. 레인 (2026-10-17)
+
+- 레인 = Redis Stream + 그 Stream을 읽는 worker 슬롯. `qa`(Q&A·채점), `rt`(실시간 요약), `batch`(최종 노트·과목 노트).
+- 배정도 레인별로 합니다. DB 도구는 "이 레인의 대기 의도를 생성 순서로 N개"(`job_reserve_pending stream=`)만 하고, 어느 레인을 얼마나 먼저 고를지는 배정기가 정합니다 (`ALLOC_LANES`, 기본 qa 10 / rt 10 / batch 5, 한 바퀴 단위).
+- 슬롯은 **고정이 기본**입니다. 빌려 쓰기(qa가 비면 rt 작업을 가져옴)는 옵션이고, 쓸 때는 **qa 총 슬롯과 함께** 정합니다 (예: "qa 16슬롯 중 최대 8개 빌려 씀"). 빌려 쓰는 수는 qa 총 슬롯 - 1을 넘지 못합니다.
+- 근거와 측정: [changes/2026-10-16-lanes.md](changes/2026-10-16-lanes.md)
+
+## 결정 대기 (2026-10-17 정리)
+
+하나로 묶지 말고 따로 정합니다.
+
+| 항목 | 선택지 | 메모 |
+|---|---|---|
+| heartbeat·lease·진행 상태를 Redis로 | 옮김 / 유지 | 옮겨도 실행권 확인은 DB의 `exec_epoch`로 (`attempts`는 사용자 재시도 때 0으로 돌아가 쓸 수 없음). Redis 쪽 생존 신호는 하나로 (지금 쓰는 Stream 방치 시간 또는 TTL 키) |
+| DB에 기록한 작업의 전달 누락 복구 | outbox(영속 작업 의도) + 주기 복구 **유지** | heartbeat 위치와 별개. "DB 저장 성공 → API 종료·Redis 장애 → Redis 등록 실패" 구간은 커밋 직후 XADD로도 남는다 |
+| 정상 경로 전달을 즉시 깨우기 | 커밋 직후 XADD 또는 배정기 깨우기(NOTIFY 등) | 복구 장치는 그대로 두고 0.5초 주기 대기만 줄인다. 사용자·비용 한도를 배정기가 판단해 왔다면 그 판단을 어디로 옮길지 함께 정함 |
+| Q&A 검색 (`pg_trgm`) | DB 조회(Read)로 봄 | "DB는 CRUD만" = 업무 판단은 애플리케이션. 유사 문자열 후보 조회는 Read. 검색 모듈 분리와 검색 엔진 교체는 별개 결정 |
+| 전사 검색 범위 | 우선 검색 2개 + 부족 시 확장 | 노트로 고른 강의 2개를 먼저, 근거가 부족하면 과목 전체로. 속도와 함께 **근거 검색 성공률**을 비교한 뒤 확정 |
+
+바로 할 수 있는 작업의 조건
+
+| 작업 | 조건 |
+|---|---|
+| 요약 간격 자동 조절 | 처리한 전사 번호를 유지하고, 대기 요청을 병합해 내용이 빠지지 않게 |
+| 전사 묶음 저장 | 최대 저장 지연, 종료 시 남은 분량 저장, 장애 복구 기준 합의 |
+| 전사 검색 우선 범위 | 우선 탐색으로만 쓰고 근거 부족 시 넓힘 |
+| Q&A 그래프 worker 연결 | 실행 마감·permit·오류 변환·멱등 저장 연결 |
+| 실제 OpenAI 검증 | 새 JSON 형식과 함께 인용·부분 답변·시간 초과 확인 |

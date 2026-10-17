@@ -9,6 +9,20 @@
 
 ---
 
+## 2026-10-17
+
+### 실행 정책 확정, 결정 문서 정리, 측정 자료 보존 · (이번 커밋)
+- 🔧 작업 종류별 실행 정책 (팀 결정 2·3번): Q&A·채점 요청부터 전체 90초 안에서 최초 포함 3회, final_note 시도당 5분·총 3회, course_update 시도당 10분·총 3회 (`settings.KIND_MAX_ATTEMPTS`, `KIND_JOB_TIMEOUT_SEC`, `KIND_DEADLINE_SEC`)
+- 🆕 Q&A·채점 작업에 `deadline_at`이 없으면 `job_create`가 요청 시각 + 90초로 넣음. `job_retry`는 새 마감을 안 주면 지금 + 90초
+- 🐛 `job_heartbeat`가 호출 집계(`tool_stats`)에 빠져 있던 문제
+- 🔧 `docs/team-decisions.md`: 2·3번 값, 11번(레인: 고정 기본·빌려 쓰기는 qa 총 슬롯과 함께), "결정 대기" 표 — heartbeat 위치 / 전달 누락 복구(outbox 유지) / 즉시 전달을 따로 정함, `pg_trgm`은 Read, 전사 검색은 "우선 2개 + 부족 시 확장"
+- 🔧 `docs/changes/2026-10-16-lanes.md`: "커밋 직후 XADD면 outbox가 필요 없다"는 취지 삭제, 슬롯 표기
+- 🆕 PG 부하 측정 재현 도구 `notree/dev/pgload/`와 원본 결과 `docs/measurements/` (Q&A 검색·전사 저장은 10/17 재측정. 전사 per_session p99는 0.12~4.2초로 흔들려 문서의 "2.5초"를 고침)
+- 🆕 dev 의존성 `asyncpg`
+- 🗑 `feat/taskiq` → `archive/taskiq`로 보관, 실험 기록 문서만 `docs/changes/2026-10-15-taskiq-trial.md`로 가져옴
+- ⚠️ Q&A·채점·final_note·course_update의 시도 한도·시도당 제한이 바뀜 (rt 2회 → 3회, batch 15분 → 5·10분)
+- 테스트 80 → 84개
+
 ## 2026-10-16
 
 ### 레인 리뷰 반영: 배정 단계 레인 분리, 벤치마크 집계 · `f94564d`
