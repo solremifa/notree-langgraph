@@ -269,3 +269,88 @@ def test_seed_rejects_the_same_doc_id_in_another_source(tmp_path):
             await m.tool("qa_seed", user_id="u", course_id="c", course_name="자료구조",          # 같은 출처 덮어쓰기는 그대로 됨
                          docs=[{"source": "note", "id": "same", "text": "스택은 LIFO 구조이다"}])
     asyncio.run(t())
+
+
+class LoseEveryCompleteResponse(LoseCompleteResponse):
+    """qa_complete는 매번 저장하고 응답만 잃는다."""
+
+    async def tool(self, name, **args):
+        res = await self.mcp.tool(name, **args)
+        if name == "qa_complete":
+            self.lost += 1
+            raise ConnectionResetError("응답 유실 (시험)")
+        return res
+
+
+def test_lost_save_response_on_the_last_attempt_still_finishes_the_job(tmp_path, monkeypatch):
+    """리뷰 6차 ③: 마지막 시도에서 저장 직후 응답만 잃어도 작업은 실패가 아니라 완료 (답변·작업 상태가 같다)."""
+    monkeypatch.setitem(S.KIND_MAX_ATTEMPTS, "qa", 1)          # 첫 시도가 곧 마지막 시도
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            llm, mcp = FakeQALLM(), LoseEveryCompleteResponse(e.m_w)
+            e.start_worker(QA, name="q", mcp=mcp, extras={"qa_llm": llm})
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            assert await e.wait_state(q["job_id"], timeout=20)
+            row = await e.row(q["job_id"])
+            assert row["state"] == "done" and row["attempts"] == 1, row
+            assert mcp.lost == 1 and llm.calls.count("understand") == 1   # LLM 다시 안 부름, 저장도 한 번
+            got = await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER)
+            assert got["state"] == "answered" and got["answer"]["status"] == "completed"
+    run(t())
+
+
+def test_last_attempt_without_a_saved_answer_still_fails(tmp_path, monkeypatch):
+    """반대 경우: 저장이 실제로 안 됐으면 done_check는 실패를 바꾸지 않는다."""
+    monkeypatch.setitem(S.KIND_MAX_ATTEMPTS, "qa", 1)
+
+    class RefuseComplete:
+        def __init__(self, mcp):
+            self.mcp = mcp
+
+        async def tool(self, name, **args):
+            if name == "qa_complete":
+                raise ConnectionResetError("저장 전에 끊김 (시험)")
+            return await self.mcp.tool(name, **args)
+
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            e.start_worker(QA, name="q", mcp=RefuseComplete(e.m_w), extras={"qa_llm": FakeQALLM()})
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            assert await e.wait_state(q["job_id"], timeout=20)
+            row = await e.row(q["job_id"])
+            assert row["state"] == "failed" and "시도 한도 초과" in str(row), row
+            assert (await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER))["state"] != "answered"
+    run(t())
+
+
+class SaveThenStallPastDeadline:
+    """worker가 보는 마감을 1.5초 뒤로 줄이고(job_start 응답), qa_complete는 저장한 뒤 마감이 지날 때까지 응답을 늦춘다."""
+
+    def __init__(self, mcp):
+        self.mcp, self.deadline = mcp, None
+
+    async def tool(self, name, **args):
+        import time
+        res = await self.mcp.tool(name, **args)
+        if name == "job_start" and res.get("status") == "started":
+            self.deadline = time.time() + 1.5
+            res = {**res, "payload": {**res["payload"], "deadline_at": self.deadline}}
+        if name == "qa_complete":
+            await asyncio.sleep(max(0.0, self.deadline - time.time()) + 1.0)
+        return res
+
+
+def test_deadline_passing_right_after_the_save_still_finishes_the_job(tmp_path):
+    """리뷰 6차 ③: 저장 직후 전체 마감이 지나 시간 초과로 끊겨도, 결과가 저장돼 있으면 완료."""
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            e.start_worker(QA, name="q", mcp=SaveThenStallPastDeadline(e.m_w), extras={"qa_llm": FakeQALLM()})
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            assert await e.wait_state(q["job_id"], timeout=20)
+            row = await e.row(q["job_id"])
+            assert row["state"] == "done" and row["attempts"] == 1, row
+            assert (await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER))["state"] == "answered"
+    run(t())

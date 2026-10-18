@@ -17,6 +17,8 @@
                       ├─ 마감 시각 지남   → job_fail(다시 시도 가능)가 확정되면 XACK
                       ├─ 그 밖의 실패     → 시도 < 한도: job_release (ACK 안 함 → claim_idle 뒤 재배송)
                       │                    시도 = 한도: job_fail(다시 시도 가능)가 확정되면 XACK
+                      │   ※ 마감·한도로 실패를 확정하기 전에 done_check(있으면)로 결과가 이미 저장됐는지 본다
+                      │     → 저장돼 있으면 job_finish (저장 직후 응답만 잃은 마지막 시도)
                       ├─ LeaseLost       → 아무것도 안 함 (이미 다른 worker 것)
                       └─ 종료 신호로 취소 → job_release (ACK 안 함 → 다른 worker가 곧 이어받음)
   완료·실패 확정을 못 받으면(장애·실행권 없음) ACK하지 않는다 → 메시지가 남아 재배송으로 다시 처리된다.
@@ -36,11 +38,12 @@ from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
 from notree.worker.ownership import Ownership, RedisLease
-from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
+from notree.worker.registry import DONE_CHECKS, FatalError, JobContext, SimulatedDeath, load_handlers
 
 
 CONFIRM_BACKOFF = (0.2, 0.5, 1.0)   # 완료·실패 표시 재시도 간격 (마지막 값은 쓰이지 않음)
-BORROW_POLL_MS = 200                # 빌려 쓸 수 있을 때 자기 Stream을 기다리는 최대 시간 (그 뒤 빌릴 것을 다시 본다)
+DONE_CHECK_TIMEOUT = 5.0            # 실패 확정 전 저장 여부 확인에 쓰는 최대 시간
+BORROW_POLL_MS = 200               # 빌려 쓸 수 있을 때 자기 Stream을 기다리는 최대 시간 (그 뒤 빌릴 것을 다시 본다)
 
 
 class DeadlinePassed(Exception):
@@ -305,26 +308,43 @@ class Worker:
                 log("job", f"{job_id}: 종료로 중단 → lease 반납")
             raise
         except DeadlinePassed:
-            await self._fail(ctx, msg_id, "마감 시각 지남", user_retryable=True)
+            await self._give_up(ctx, msg_id, "마감 시각 지남")
         except FatalError as e:
             await self._fail(ctx, msg_id, f"fatal: {e}", user_retryable=False)
         except Exception as e:  # RetryableError, TimeoutError, 예상 못 한 오류
             reason = "timeout" if isinstance(e, TimeoutError) else f"{type(e).__name__}: {e}"
             left = ctx.time_left()
             if left is not None and left <= 0:
-                await self._fail(ctx, msg_id, f"마감 시각 초과 ({reason})", user_retryable=True)
+                await self._give_up(ctx, msg_id, f"마감 시각 초과 ({reason})")
             elif ctx.attempt >= ctx.max_attempts:
-                await self._fail(ctx, msg_id, f"시도 한도 초과 ({reason})", user_retryable=True)
+                await self._give_up(ctx, msg_id, f"시도 한도 초과 ({reason})")
             else:
                 await self._ctl(ctx, "job_release", reason=reason)
                 log("retry", f"{job_id}: {reason} → lease 반납, {cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
         else:
-            confirmed = await self._confirm(ctx, "job_finish", "finished")
-            if confirmed:
-                await self._ack(msg_id, cfg)
-                log("done", f"{job_id} 완료 → XACK")
-            else:
-                log("done", f"{job_id}: 완료 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
+            await self._finish(ctx, msg_id)
+
+    async def _finish(self, ctx: JobContext, msg_id: str, note: str = "") -> None:
+        confirmed = await self._confirm(ctx, "job_finish", "finished")
+        if confirmed:
+            await self._ack(msg_id, ctx.cfg)
+            log("done", f"{ctx.job_id} 완료{note} → XACK")
+        else:
+            log("done", f"{ctx.job_id}: 완료 확정 못 받음({self._why(confirmed)}) → ACK 안 함, 재배송으로 다시 처리")
+
+    async def _give_up(self, ctx: JobContext, msg_id: str, reason: str) -> None:
+        """다음 시도가 없는 실패(마감·시도 한도). 확정 전에 결과가 이미 저장됐는지 본다. 저장 직후 응답만 잃었으면 완료."""
+        check = DONE_CHECKS.get(ctx.kind)
+        if check is not None:
+            try:
+                saved = await asyncio.wait_for(check(ctx), timeout=DONE_CHECK_TIMEOUT)
+            except Exception as e:      # 확인 못 하면 원래대로 실패 확정 (사용자는 다시 시도 가능)
+                log("error", f"{ctx.job_id}: 저장 여부 확인 실패({type(e).__name__}: {e}) → 실패로 확정")
+                saved = False
+            if saved:
+                await self._finish(ctx, msg_id, f" (결과가 이미 저장돼 있음, '{reason}' 대신)")
+                return
+        await self._fail(ctx, msg_id, reason, user_retryable=True)
 
     async def _fail(self, ctx: JobContext, msg_id: str, reason: str, *, user_retryable: bool) -> None:
         confirmed = await self._confirm(ctx, "job_fail", "failed", reason=reason, user_retryable=user_retryable)

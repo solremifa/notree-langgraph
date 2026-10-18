@@ -12,6 +12,8 @@
 """
 import asyncio
 
+from redis.exceptions import ResponseError
+
 from notree.common import settings as S
 from notree.common.log import ACTOR, log
 from notree.worker.mcp_client import McpClient
@@ -33,14 +35,22 @@ async def resend_stale(r, mcp: McpClient, reserved_sec: float = S.RESEND_RESERVE
 
 
 REDIS_MARKER = "notree:redis-alive"     # 값 = 표시를 남길 때의 Redis run_id
+NO_RUN_ID = "no-run-id"                 # INFO를 못 쓰는 Redis(fakeredis, INFO를 막은 관리형): 표시 키가 있나만으로 판단
+
+
+async def redis_run_id(r) -> str:
+    """Redis 프로세스마다 새로 정해지는 run_id. INFO가 없으면 NO_RUN_ID (스냅숏 복원은 이때 못 잡는다)."""
+    try:
+        return (await r.info("server")).get("run_id") or NO_RUN_ID
+    except ResponseError:
+        return NO_RUN_ID
 
 
 async def redis_lost(r) -> bool:
     """Redis 상태를 잃었을 수 있나: 표시 키가 없거나(FLUSHALL·새 Redis), 표시 키의 run_id가 지금과 다름(프로세스 재시작·
     스냅숏 복원·장애 조치). 스냅숏에서 돌아온 표시 키는 그 뒤에 보낸 메시지가 없다는 사실을 숨기므로, 키가 있다는 것만으로는
     안전하지 않다. Redis는 비영속(save "", appendonly no)이 원칙이라 재시작은 곧 유실이다."""
-    run_id = (await r.info("server")).get("run_id")
-    return (await r.get(REDIS_MARKER)) != run_id
+    return (await r.get(REDIS_MARKER)) != await redis_run_id(r)
 
 
 async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
@@ -64,7 +74,7 @@ async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
         after = res["next_after"]
     if res.get("held"):
         log("recover", f"lease가 살아 있는 작업 {res['held']}개는 보류 → 다음 주기에 다시 확인")
-    await r.set(REDIS_MARKER, (await r.info("server")).get("run_id"))   # 세대를 DB에 올린 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시)
+    await r.set(REDIS_MARKER, await redis_run_id(r))   # 세대를 DB에 올린 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시)
     return sent
 
 
