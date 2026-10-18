@@ -11,6 +11,14 @@
 
 ## 2026-10-18
 
+### Redis 소유권 리뷰 2차: 펜싱 번호로 늦은 job_start 거절 · (이번 커밋)
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-2차-소유권-획득--db-시작-경쟁-펜싱-번호)
+
+- 🐛 소유 키를 얻은 뒤 DB 시작이 늦어지는 사이 키가 넘어가면, 늦게 온 시작이 더 높은 실행 세대를 받아 Redis 소유자와 DB 실행자가 달라졌음 → 키를 얻을 때 펜싱 번호(INCR), DB가 본 최대 번호 이하는 `stale_fence`
+- 🆕 Redis 초기화로 카운터가 작아지면 DB가 알려 준 값까지 올려 복원
+- ⚠️ 계약: `job_start.fence`, 응답 상태 `stale_fence`와 `fence_max` (선택 필드, redis 모드에서만)
+- 테스트 111 → 114개
+
 ### heartbeat를 Redis 소유 키로 (시험 구현, 기본값은 db) · `ae42b20`
 자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md) (브랜치 `feat/redis-heartbeat`)
 

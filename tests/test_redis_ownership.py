@@ -353,3 +353,70 @@ def test_stopped_process_resumes_without_overwriting(tmp_path, redis_url):
     assert "소유권을 잃음" in a_log or "완료 확정 못 받음(실행권 없음)" in a_log
     assert "완료 → XACK" not in a_log                                   # A는 ACK하지 않음
     assert stats.get("job_heartbeat", 0) == 0 and pending == 0 and keys == []
+
+
+# ── 4. 소유권 획득 ↔ DB 시작 사이의 경쟁 (리뷰 2차) ──────────────────
+def test_late_job_start_from_a_former_owner_is_rejected(tmp_path, redis_url):
+    """A가 소유 키를 얻고 DB 시작이 늦어지는 동안 키가 만료되고 B가 키·DB 시작을 모두 마침.
+    A의 늦은 job_start는 거절돼야 한다 (Redis 소유자 B ≠ DB 실행자 A가 되면 안 됨)."""
+    async def t():
+        async with RealEnv(tmp_path, redis_url) as e:
+            j = (await e.api.tool("job_create", kind="echo", payload={}, user_id="u", stream=RT.stream))["job_id"]
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            m = await e.r.xadd(RT.stream, {"job_id": j})
+            short = dataclasses.replace(RT, lease_sec=0.3)
+            a = O.Ownership(e.r, j, "rt-A", short, m)
+            assert await a.acquire()
+            await asyncio.sleep(0.4)                                    # A의 DB 시작이 늦어지는 사이 키 만료
+            b = O.Ownership(e.r, j, "rt-B", RT, m)
+            assert await b.acquire()
+            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0, fence=b.fence)
+            assert sb["status"] == "started"
+            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0, fence=a.fence)   # 늦게 도착
+            assert sa["status"] == "stale_fence" and sa["fence_max"] == b.fence
+            fin = await e.api.tool("job_finish", job_id=j, worker="rt-B", permit=sb["permit"])
+            assert fin["finished"]                                      # B의 쓰기는 그대로 유효
+    asyncio.run(t())
+
+
+def test_fence_recovers_after_redis_wipe(tmp_path, redis_url):
+    """Redis가 초기화되면 펜싱 카운터가 1부터 다시 시작한다 → DB가 stale_fence와 함께 알려 준 값까지 올리고 다시 얻는다."""
+    async def t():
+        async with RealEnv(tmp_path, redis_url) as e:
+            j = (await e.api.tool("job_create", kind="echo", payload={}, user_id="u", stream=RT.stream))["job_id"]
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            m = await e.r.xadd(RT.stream, {"job_id": j})
+            for _ in range(3):                                          # 펜스 3까지 씀
+                o = O.Ownership(e.r, j, "rt-A", RT, m)
+                assert await o.acquire()
+                st = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0, fence=o.fence)
+                assert st["status"] == "started"
+                await o.release()
+            await e.r.flushall()
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            o = O.Ownership(e.r, j, "rt-C", RT, m)
+            assert await o.acquire() and o.fence == 1
+            st = await e.api.tool("job_start", job_id=j, worker="rt-C", lease_sec=0, fence=o.fence)
+            assert st["status"] == "stale_fence" and st["fence_max"] == 3
+            await o.raise_fence(st["fence_max"])
+            await o.release()
+            o = O.Ownership(e.r, j, "rt-C", RT, m)
+            assert await o.acquire() and o.fence == 4
+            assert (await e.api.tool("job_start", job_id=j, worker="rt-C", lease_sec=0, fence=o.fence))["status"] == "started"
+    asyncio.run(t())
+
+
+def test_worker_heals_a_stale_fence_and_finishes(tmp_path, redis_url, redis_mode):
+    """DB에 큰 펜스가 남아 있는 작업(Redis 초기화 뒤 상황)을 worker가 스스로 올려 잡고 끝낸다."""
+    async def t():
+        async with RealEnv(tmp_path, redis_url) as e:
+            j = await e.job({"text": "fence"})
+            import sqlite3
+            con = sqlite3.connect(e.db)
+            con.execute("UPDATE jobs SET fence_max=7 WHERE job_id=?", (j,))
+            con.commit()
+            con.close()
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=20)
+            assert await e.own_keys() == []
+    asyncio.run(t())

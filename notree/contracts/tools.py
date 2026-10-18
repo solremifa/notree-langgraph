@@ -65,10 +65,13 @@ class JobStartIn(BaseModel):
     worker: str
     lease_sec: float = Field(description="DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 "
                                          "(NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch)")
+    fence: int | None = Field(None, description="Redis 소유 키를 얻을 때 받은 펜싱 번호. 이 작업에서 본 가장 큰 번호 이하면 "
+                                                "stale_fence로 거절 (소유권을 잃은 뒤 늦게 도착한 시작 요청)")
 
 
 class JobStartOut(BaseModel):
-    status: Literal["started", "done", "failed", "leased", "unknown"]
+    status: Literal["started", "done", "failed", "leased", "unknown", "stale_fence"]
+    fence_max: int | None = Field(None, description="stale_fence일 때 DB가 본 가장 큰 펜싱 번호 (Redis 카운터를 여기까지 올린다)")
     kind: str | None = None
     payload: dict[str, Any] | None = None
     attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")

@@ -220,7 +220,11 @@ class Worker:
 
     async def _process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig, own: Ownership | None) -> None:
         st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name,
-                                 lease_sec=0 if own else cfg.lease_sec)
+                                 **({"lease_sec": 0, "fence": own.fence} if own else {"lease_sec": cfg.lease_sec}))
+        if st["status"] == "stale_fence":         # 소유권을 잃은 뒤 늦게 온 시작이거나, Redis 초기화로 카운터가 작아짐
+            await own.raise_fence(st["fence_max"])
+            log("skip", f"{job_id}: 펜싱 번호 {own.fence} ≤ DB {st['fence_max']} → 시작 안 함 (카운터를 올림, 재배송 때 다시)")
+            return
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이미 {st['status']} → ACK만")

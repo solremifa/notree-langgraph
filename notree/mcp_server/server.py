@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS qa_questions(
 ADDED_COLUMNS = [
     ("jobs", "user_id TEXT"), ("jobs", "updated_at REAL"), ("jobs", "user_retryable INTEGER"),
     ("jobs", "exec_epoch INTEGER DEFAULT 0"),   # 실행 세대: job_start마다 +1, 절대 되돌리지 않음 (job_retry도)
+    ("jobs", "fence_max INTEGER DEFAULT 0"),    # Redis 소유 키 펜싱 번호 중 가장 큰 것 (늦은 job_start 거절)
     ("notes", "user_id TEXT"),
 ]
 
@@ -401,7 +402,7 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
 
 
 @tool
-def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
+def job_start(job_id: str, worker: str, lease_sec: float, fence: int | None = None) -> dict:
     """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
     lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지).
     lease_sec=0 (LIVENESS=redis): 실행 중 판단은 worker가 Redis 소유 키로 이미 했다. 여기서는 실행 세대만 올려
@@ -414,12 +415,15 @@ def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
             return ok(C.JobStartOut(status="unknown"))
         if r["state"] in ("done", "failed"):
             return ok(C.JobStartOut(status=r["state"]))
+        if fence is not None and fence <= (r["fence_max"] or 0):   # 소유권을 잃은 뒤 늦게 온 시작 요청
+            return ok(C.JobStartOut(status="stale_fence", fence_max=r["fence_max"]))
         if r["state"] == "running" and (r["lease_until"] or 0) > now:
             return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
                                     lease_left_sec=round(r["lease_until"] - now, 1)))
         epoch = (r["exec_epoch"] or 0) + 1
         _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
-             attempts=r["attempts"] + 1, exec_epoch=epoch)
+             attempts=r["attempts"] + 1, exec_epoch=epoch,
+             **({"fence_max": fence} if fence is not None else {}))
         return ok(C.JobStartOut(
             status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1,
             previous_owner=r["lease_owner"],

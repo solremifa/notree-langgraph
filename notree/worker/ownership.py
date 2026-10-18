@@ -16,6 +16,10 @@
   - 키 해제도 토큰 비교 (만료 뒤 다른 worker가 잡은 키를 이전 worker가 지우지 못하게)
   - Redis에 닿지 못하는 시간이 TTL을 넘으면 소유권을 장담할 수 없으므로 잃은 것으로 보고 작업을 취소한다
   - 최종 쓰기는 이 키가 아니라 DB의 exec_epoch(permit)로 막는다. 키는 '동시에 두 번 시작하지 않기'와 '살아 있는 작업 재배송 막기'용
+  - 펜싱 번호: 키를 얻을 때 notree:fence:{job_id}를 INCR해 받는다 (SET NX와 같은 Lua). job_start(fence=)로 DB에 넘기면
+    DB는 지금까지 본 가장 큰 번호 이하를 stale_fence로 거절한다 → "A가 키를 얻고 DB 시작이 늦어지는 사이 키가 만료되고
+    B가 키·DB 시작을 마친 뒤 A의 늦은 시작이 도착"해도 A가 실행자가 되지 못한다.
+    Redis가 초기화되면 카운터가 1부터 다시 시작하므로, stale_fence가 알려 준 값까지 카운터를 올리고 다시 얻는다 (raise_fence).
 
 한 Redis 인스턴스 전제 (소유 키와 Stream이 다른 슬롯이라 Redis Cluster에서는 이 Lua를 그대로 못 쓴다).
 """
@@ -37,6 +41,19 @@ if #c == 0 then return -2 end
 redis.call('PEXPIRE', KEYS[1], ARGV[5])
 return 1
 """
+ACQUIRE_LUA = """
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+  local f = redis.call('INCR', KEYS[2])
+  redis.call('PEXPIRE', KEYS[2], ARGV[3])
+  return f
+end
+return 0
+"""
+FENCE_KEEP_MS = 24 * 3600 * 1000     # 펜싱 카운터 보관 (작업마다 키 하나). 만료돼 작아지면 stale_fence → raise_fence로 복원
+RAISE_FENCE_LUA = """
+if tonumber(redis.call('GET', KEYS[1]) or '0') < tonumber(ARGV[1]) then redis.call('SET', KEYS[1], ARGV[1]) end
+return 1
+"""
 RELEASE_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
@@ -49,6 +66,10 @@ def own_key(job_id: str) -> str:
     return f"notree:own:{job_id}"
 
 
+def fence_key(job_id: str) -> str:
+    return f"notree:fence:{job_id}"
+
+
 class Ownership:
     def __init__(self, redis, job_id: str, consumer: str, cfg: StreamConfig, msg_id: str) -> None:
         self.r, self.job_id, self.consumer, self.cfg, self.msg_id = redis, job_id, consumer, cfg, msg_id
@@ -56,14 +77,23 @@ class Ownership:
         self.value = f"{consumer}:{uuid.uuid4().hex[:8]}|{cfg.stream}|{msg_id}"
         self.ttl_ms = int(cfg.lease_sec * 1000)
         self.holder: str | None = None
+        self.fence: int | None = None
+        self._acquire = redis.register_script(ACQUIRE_LUA)
+        self._raise = redis.register_script(RAISE_FENCE_LUA)
         self._beat = redis.register_script(HEARTBEAT_LUA)
         self._release = redis.register_script(RELEASE_LUA)
 
     async def acquire(self) -> bool:
-        if await self.r.set(self.key, self.value, nx=True, px=self.ttl_ms):
+        f = int(await self._acquire(keys=[self.key, fence_key(self.job_id)], args=[self.value, self.ttl_ms, FENCE_KEEP_MS]))
+        if f:
+            self.fence = f
             return True
         self.holder = await self.r.get(self.key)          # 기록용 (원자적이지 않아도 됨)
         return False
+
+    async def raise_fence(self, at_least: int) -> None:
+        """Redis 초기화 등으로 카운터가 DB보다 작아졌을 때 DB가 본 값까지 올린다 (내리지는 않음)."""
+        await self._raise(keys=[fence_key(self.job_id)], args=[at_least])
 
     async def heartbeat(self) -> int:
         """1 = 갱신, 0·-1·-2 = 소유권 없음 (BEAT_RESULT)."""
