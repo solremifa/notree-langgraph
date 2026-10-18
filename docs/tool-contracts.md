@@ -155,13 +155,13 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: scheduler · 정의: worker 담당
 
-Redis 통째 유실 뒤: 기준 시각 전의 reserved·sent·lease 끝난 running을 다시 보낼 목록 (살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 다 처리되면 복구 종료
+Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 (살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료
 
 입력
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `start` | `bool` = False | Redis 초기화를 방금 발견함 → 복구 기준 시각을 지금으로 기록 |
+| `start` | `bool` = False | Redis 초기화를 방금 발견함 → 전달 세대를 올림 |
 | `after` | `str | null` = None | 이전 쪽의 next_after (job_id 순서로 이어서) |
 | `limit` | `int` = 500 |  |
 
@@ -188,12 +188,13 @@ Redis 통째 유실 뒤: 기준 시각 전의 reserved·sent·lease 끝난 runni
 | `job_id` | `str` |  |
 | `worker` | `str` |  |
 | `lease_sec` | `float` |  |
+| `dispatch_gen` | `int | null` = None | 메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절 |
 
 출력 (`data`)
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `status` | `"started" | "done" | "failed" | "leased" | "unknown"` |  |
+| `status` | `"started" | "done" | "failed" | "leased" | "unknown" | "stale_dispatch"` |  |
 | `kind` | `str | null` = None |  |
 | `payload` | `dict[str, any] | null` = None |  |
 | `attempt` | `int | null` = None | 1부터. 이번이 몇 번째 시도인지 |

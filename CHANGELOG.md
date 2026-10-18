@@ -11,6 +11,11 @@
 
 ## 2026-10-18
 
+### Redis 유실 복구 리뷰 4차: 전달 세대 · (이번 커밋)
+- 🐛 초기화 전 메시지의 늦은 `job_start`가 복구 시작 뒤 도착하면 `updated_at`이 기준 뒤로 바뀌어 복구에서 빠지고 영영 running → 전달 세대(`dispatch_gen`)를 메시지·작업에 기록, 이전 세대의 시작은 `stale_dispatch`로 거절, 복구 대상은 "마지막 전달이 이전 세대"
+- ⚠️ 계약: `ReservedJob.gen`, `job_start.dispatch_gen`, 상태 `stale_dispatch` (선택). XADD 메시지에 `gen` 필드
+- 테스트 → 126개
+
 ### Redis 유실 복구 리뷰 3차: '발견'과 '완료' 분리 · `b712b2a`
 - 🐛 표시 키를 복구 완료로 써서, 첫 복구 때 lease가 살아 있던 고립 작업이 영영 running에 남음 → 표시 키는 발견, 완료는 DB(`meta.recovery_since`)가 판단해 열려 있는 동안 매 주기 재확인
 - 🐛 한 번에 500건만 처리 → job_id 순서로 쪽을 나눠 끝까지

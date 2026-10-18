@@ -63,6 +63,7 @@ class Worker:
         self.borrow_slots = min(borrow_slots, self.concurrency - 1) if self.borrow else 0   # 자기 몫 최소 1개
         self.borrowed = 0                         # 지금 실행 중인 빌린 작업 수
         self.claim_cursor: dict[str, str] = {}    # Stream별 XAUTOCLAIM 다음 탐색 위치 (한 번에 PEL을 COUNT×10개까지만 봄)
+        self.msg_gen: dict[str, int] = {}         # 메시지 ID → 전달 세대 (메시지에 gen이 있을 때). job_start에 넘긴다
 
     # ── 메인 루프 ──
     async def run(self, stop: asyncio.Event) -> str:
@@ -173,6 +174,7 @@ class Worker:
         if not claimed:
             return None
         msg_id, fields = claimed[0]
+        self._remember_gen(msg_id, fields)
         return msg_id, fields["job_id"], self._how(cfg, "재배송"), cfg
 
     async def _read(self, cfg: StreamConfig, block: int | None):
@@ -180,7 +182,12 @@ class Worker:
         if not res:
             return None
         msg_id, fields = res[0][1][0]
+        self._remember_gen(msg_id, fields)
         return msg_id, fields["job_id"], self._how(cfg, "신규"), cfg
+
+    def _remember_gen(self, msg_id: str, fields: dict) -> None:
+        if fields.get("gen") is not None:
+            self.msg_gen[msg_id] = int(fields["gen"])
 
     async def _drain(self) -> None:
         if self.running:
@@ -197,6 +204,7 @@ class Worker:
     async def _guarded(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig) -> None:
         """process 바깥의 마지막 안전망. 여기까지 온 오류는 ACK 없이 두므로 재배송된다."""
         if job_id in self.active_jobs:
+            self.msg_gen.pop(msg_id, None)
             log("skip", f"{job_id}: 이 worker가 이미 실행 중 → 손대지 않음")
             return
         self.active_jobs.add(job_id)
@@ -212,7 +220,13 @@ class Worker:
     async def process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig | None = None) -> None:
         ACTOR.set(self.name)
         cfg = cfg or self.cfg                     # 이 메시지가 온 레인의 설정 (빌린 작업이면 빌려 온 레인)
-        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec)
+        gen = self.msg_gen.pop(msg_id, None)
+        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec,
+                                 **({"dispatch_gen": gen} if gen is not None else {}))
+        if st["status"] == "stale_dispatch":     # Redis 유실 전에 보낸 메시지 → 복구가 새 세대로 다시 보냈거나 보낼 것
+            await self._ack(msg_id, cfg)
+            log("skip", f"{job_id}: 이전 전달 세대({gen})의 메시지 → 시작 안 함, ACK (복구가 새로 보냄)")
+            return
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이미 {st['status']} → ACK만")

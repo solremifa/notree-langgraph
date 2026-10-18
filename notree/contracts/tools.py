@@ -40,6 +40,7 @@ class ReservedJob(BaseModel):
     job_id: str
     kind: str
     stream: str
+    gen: int | None = Field(None, description="전달 세대. XADD 메시지에 함께 넣는다 (Redis 유실을 발견할 때마다 DB가 올림)")
 
 
 class JobListOut(BaseModel):
@@ -64,10 +65,11 @@ class JobStartIn(BaseModel):
     job_id: str
     worker: str
     lease_sec: float
+    dispatch_gen: int | None = Field(None, description="메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절")
 
 
 class JobStartOut(BaseModel):
-    status: Literal["started", "done", "failed", "leased", "unknown"]
+    status: Literal["started", "done", "failed", "leased", "unknown", "stale_dispatch"]
     kind: str | None = None
     payload: dict[str, Any] | None = None
     attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")
@@ -128,7 +130,7 @@ class JobRetryOut(BaseModel):
 
 
 class JobRecoverIn(BaseModel):
-    start: bool = Field(False, description="Redis 초기화를 방금 발견함 → 복구 기준 시각을 지금으로 기록")
+    start: bool = Field(False, description="Redis 초기화를 방금 발견함 → 전달 세대를 올림")
     after: str | None = Field(None, description="이전 쪽의 next_after (job_id 순서로 이어서)")
     limit: int = 500
 
@@ -598,8 +600,8 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("job_mark_sent", JobIdIn, JobMarkSentOut, SCH, "control", LEAD, summary="XADD 후 전송 완료 표시"),
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
     ToolSpec("job_recover_orphans", JobRecoverIn, JobRecoverOut, SCH, "control", LEAD,
-             summary="Redis 통째 유실 뒤: 기준 시각 전의 reserved·sent·lease 끝난 running을 다시 보낼 목록 (살아 있는 lease는 보류, "
-                     "쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 다 처리되면 복구 종료"),
+             summary="Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 "
+                     "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
              summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,
