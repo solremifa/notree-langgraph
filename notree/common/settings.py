@@ -15,6 +15,10 @@ REDIS_URL = os.getenv("NOTREE_REDIS_URL", "redis://localhost:6379/0")
 MCP_URL = os.getenv("NOTREE_MCP_URL", "http://127.0.0.1:8765/mcp")
 GROUP = os.getenv("NOTREE_GROUP", "workers")          # Redis consumer group 이름 (worker 종류별 Stream 공통)
 SHUTDOWN_GRACE_SEC = _f("NOTREE_SHUTDOWN_GRACE_SEC", 30)  # 종료 신호 후 하던 작업을 기다려 주는 시간
+# 실행 중 판단을 어디서 하나 (2026-10-18 시험 중, 팀 결정 전이라 기본은 db)
+#   db    : job_heartbeat로 DB lease 연장 + Redis 방치 시간 초기화 (지금까지)
+#   redis : Redis 소유 키 + Lua heartbeat 한 번 (notree/worker/ownership.py). DB heartbeat 없음, 실행권은 exec_epoch
+LIVENESS = os.getenv("NOTREE_LIVENESS", "db")
 
 
 @dataclass(frozen=True)
