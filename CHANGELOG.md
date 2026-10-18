@@ -20,10 +20,28 @@
 - 🐛 worker가 메시지의 전달 세대를 메시지 ID만으로 기억 → Stream마다 ID가 따로 매겨져, 빌려 쓰는 worker는 두 Stream의 같은 ID를 함께 들 수 있음 → 한쪽 세대가 덮어써 정상 메시지를 이전 세대로 잘못 거절·ACK할 수 있었음 → (Stream, ID)로 기억. 실제 Redis에서 두 Stream에 같은 ID `5-0`으로 확인
 - 테스트 → 127개
 
+### 통합 갱신: 전달 세대 + DB 실행 세대 · `78dd2ad`
+- 🔧 `integ/2026-10-18`에 전달 세대 반영. `job_start(dispatch_gen)` + 응답 `exec_epoch`를 함께, 소유 키 모드에서 이전 세대 메시지는 DB 시작 전에 걸러짐
+- 🆕 결합 시험: 소유 키 모드에서 리뷰 4차 순서
+- 테스트 → 143개 (통합 브랜치, 건너뜀 0)
+
+### Redis 소유권 문서 정정 · `37381a8`
+- 🔧 "Redis 소유자는 늘 DB 실행자와 같다" → "최종 쓰기는 DB의 현재 실행 세대만 허용" (세대 발급과 키 저장 사이 일시 불일치 명시), 동시 시작으로 시도가 소모되는 것은 시도 한도를 줄이는 비용으로 명시
 ### Redis 유실 복구 리뷰 4차: 전달 세대 · `9b31d5b`
 - 🐛 초기화 전 메시지의 늦은 `job_start`가 복구 시작 뒤 도착하면 `updated_at`이 기준 뒤로 바뀌어 복구에서 빠지고 영영 running → 전달 세대(`dispatch_gen`)를 메시지·작업에 기록, 이전 세대의 시작은 `stale_dispatch`로 거절, 복구 대상은 "마지막 전달이 이전 세대"
 - ⚠️ 계약: `ReservedJob.gen`, `job_start.dispatch_gen`, 상태 `stale_dispatch` (선택). XADD 메시지에 `gen` 필드
 - 테스트 → 126개
+### 통합 갱신: 리뷰 3차 반영 세 브랜치 · `d054287`
+- 🔧 `integ/2026-10-18`에 job_retry 원자성, 복구 발견/완료 분리, DB 세대 기반 소유 키를 합침. 결합 장애 시험을 새 프로토콜에 맞춤
+- 테스트 → 139개 (통합 브랜치, 건너뜀 0)
+
+### Redis 소유권 리뷰 3차: 번호는 DB 실행 세대만 · `43c43b3`
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-23차-소유권-획득--db-시작-경쟁--번호는-db만-발급)
+
+- 🐛 Redis가 발급했지만 DB가 아직 못 본 펜싱 번호가 Redis 초기화를 건너 늦게 도착하면 허용돼 실행자를 덮음 (재현) → Redis 펜싱 카운터를 없애고 DB의 `exec_epoch`만 번호로 사용
+- 🔧 순서 변경: 소유 키 확인(held) → `job_start`가 세대 발급 → 세대를 담아 키 쓰기(더 큰 세대만 덮어씀)
+- ⚠️ 계약: `job_start.fence`·`stale_fence`·`fence_max` 삭제 (2차에서 추가했던 것), `job_start` 응답에 `exec_epoch`
+- 테스트 114 → 115개
 
 ### Redis 유실 복구 리뷰 3차: '발견'과 '완료' 분리 · `b712b2a`
 - 🐛 표시 키를 복구 완료로 써서, 첫 복구 때 lease가 살아 있던 고립 작업이 영영 running에 남음 → 표시 키는 발견, 완료는 DB(`meta.recovery_since`)가 판단해 열려 있는 동안 매 주기 재확인
@@ -34,6 +52,12 @@
 ### 실시간 요약 리뷰 3차: job_retry 원자성 · `1dc797d`
 - 🐛 사용자 재시도의 "후속 요약 없음" 확인과 상태 변경이 한 트랜잭션이 아니어서, 그사이 커밋이 후속 요약을 넣으면 `UNIQUE constraint failed` → 한 쓰기 트랜잭션 + `WHERE state='failed'`, 제약 충돌도 "되살리지 않음"으로 응답. MCP 서버 2개로 동시 30회 재현 뒤 고침
 - 테스트 115 → 116개
+### 통합 시험: 결합 장애 (실제 Redis) · `91cec9e`
+자세히: [docs/changes/2026-10-18-integration.md](docs/changes/2026-10-18-integration.md) (브랜치 `integ/2026-10-18` = summary-coalesce + dispatch-recovery + redis-heartbeat)
+
+- 🆕 결합 장애 시험 2개: 소유 키 모드에서 요약 중 Redis 초기화 + 새 커밋 + 유실 복구, 다시 보낸 작업의 펜싱 복원
+- 테스트 → 134개 (통합 브랜치)
+
 ### 배정·회수·Redis 유실 복구 · `6b98185`
 자세히: [docs/changes/2026-10-18-dispatch-recovery.md](docs/changes/2026-10-18-dispatch-recovery.md) (브랜치 `fix/dispatch-recovery`)
 
@@ -65,6 +89,22 @@
 - 🆕 scheduler 주기 작업에 요약 누락 복구 (아무도 읽어 가지 않은 전사가 있을 때만)
 - 🔧 `jobs.lecture_id`, `job_reserve_pending`에 실시간 요약 배정 조건, `.gitignore`에 `data/`
 - 테스트 101 → 109개
+### Redis 소유권 리뷰 2차: 펜싱 번호로 늦은 job_start 거절 · `5ccfa4a`
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-2차-소유권-획득--db-시작-경쟁-펜싱-번호)
+
+- 🐛 소유 키를 얻은 뒤 DB 시작이 늦어지는 사이 키가 넘어가면, 늦게 온 시작이 더 높은 실행 세대를 받아 Redis 소유자와 DB 실행자가 달라졌음 → 키를 얻을 때 펜싱 번호(INCR), DB가 본 최대 번호 이하는 `stale_fence`
+- 🆕 Redis 초기화로 카운터가 작아지면 DB가 알려 준 값까지 올려 복원
+- ⚠️ 계약: `job_start.fence`, 응답 상태 `stale_fence`와 `fence_max` (선택 필드, redis 모드에서만)
+- 테스트 111 → 114개
+
+### heartbeat를 Redis 소유 키로 (시험 구현, 기본값은 db) · `ae42b20`
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md) (브랜치 `feat/redis-heartbeat`)
+
+- 🆕 `NOTREE_LIVENESS=redis`: 소유 키 `SET NX` + Lua heartbeat 한 번(토큰 일치·PEL 소유자 나·원본 메시지 존재일 때만 갱신). DB heartbeat 없음, 늦은 쓰기는 `exec_epoch`
+- 🆕 `notree/worker/ownership.py`, 실제 Redis 시험 10개 (`tests/test_redis_ownership.py`: Lua 규칙, 인계, 갱신 지연, 프로세스 SIGKILL·SIGSTOP)
+- 🔧 계약: `job_start.lease_sec=0` = DB lease 없이 실행 세대만, `job_get`에 `exec_epoch`
+- 🔧 `.gitignore`에 `data/` (main에 빠져 있어 강의 자료가 커밋될 수 있었음)
+- 테스트 101 → 111개 (Redis 시험은 redis-server 없으면 건너뜀)
 
 ## 2026-10-17
 

@@ -4,6 +4,10 @@
 
 한 메시지의 처리 (process)
   이미 이 worker가 실행 중인 job → 손대지 않음 (보조 방어)
+  [LIVENESS=redis] 소유 키가 살아 있음 → 손대지 않음 (다른 실행이 살아 있음. ACK도 안 함 — 지금의 보수적 규칙)
+                   없으면 job_start(lease_sec=0)로 DB가 실행 세대를 발급 → 그 세대를 담아 소유 키를 씀 (더 큰 세대만 덮어씀)
+                   → 못 쓰면 낡은 실행이라 시작 안 함. heartbeat는 Redis Lua 한 번 (ownership.py)
+                   끝나면(죽은 경우 제외) 소유 키를 토큰 비교로 해제
   job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
              ├─ leased                  → 손대지 않음 (살아 있는 lease. 같은 worker라도)
              └─ started → Lease 안에서 핸들러 실행 (job_timeout과 마감 시각 중 짧은 쪽으로 제한)
@@ -31,6 +35,7 @@ from notree.common.log import ACTOR, log
 from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
+from notree.worker.ownership import Ownership, RedisLease
 from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
 
 
@@ -226,17 +231,40 @@ class Worker:
     async def process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig | None = None) -> None:
         ACTOR.set(self.name)
         cfg = cfg or self.cfg                     # 이 메시지가 온 레인의 설정 (빌린 작업이면 빌려 온 레인)
+        if S.LIVENESS != "redis":
+            return await self._process(msg_id, job_id, how, cfg, None)
+        own = Ownership(self.r, job_id, self.name, cfg, msg_id)
+        if await own.held():                      # 살아 있는 실행이 있음 → DB 시작도 하지 않는다 (세대를 올리지 않게)
+            self._pop_gen(cfg, msg_id)
+            log("skip", f"{job_id}: 소유 키를 {(own.holder or '?').split('|')[0]}가 가짐 → 손대지 않음")
+            return
+        try:
+            await self._process(msg_id, job_id, how, cfg, own)
+        finally:
+            if not self.dead:                     # 죽은 프로세스는 정리하지 않는다 (키는 TTL로 풀림)
+                try:
+                    await own.release()
+                except Exception as e:
+                    log("error", f"{job_id}: 소유 키 해제 실패({type(e).__name__}) → TTL로 풀림")
+
+    async def _process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig, own: Ownership | None) -> None:
         gen = self._pop_gen(cfg, msg_id)
         if gen is None and not self.allow_legacy:  # 세대 없는 메시지: 어느 Redis 세대에서 왔는지 알 수 없음
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 전달 세대가 없는 메시지 → 시작 안 함, ACK (재전송이 세대를 붙여 다시 보냄. "
                         f"전환 기간이면 NOTREE_ALLOW_LEGACY_MESSAGES=1)")
             return
-        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec,
+        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name,
+                                 lease_sec=0 if own else cfg.lease_sec,
                                  **({"dispatch_gen": gen} if gen is not None else {}))
         if st["status"] == "stale_dispatch":     # Redis 유실 전에 보낸 메시지 → 복구가 새 세대로 다시 보냈거나 보낼 것
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이전 전달 세대({gen})의 메시지 → 시작 안 함, ACK (복구가 새로 보냄)")
+            return
+        if own and st["status"] == "started" and not await own.acquire(st["exec_epoch"]):
+            # 더 큰(또는 같은) 세대가 이미 키를 가짐 → 나는 낡은 실행. 아무것도 하지 않는다 (내 쓰기는 DB가 어차피 거절)
+            log("skip", f"{job_id}: 세대 {st['exec_epoch']}로 소유 키를 못 얻음 "
+                        f"({(own.holder or '?').split('|')[0]}가 더 큰 세대) → 시작 안 함")
             return
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)
@@ -263,7 +291,8 @@ class Worker:
                 if left <= 0:
                     raise DeadlinePassed()
                 timeout = min(timeout, left)
-            async with Lease(ctx, touch=lambda: self._touch(msg_id, cfg)):
+            lease = RedisLease(ctx, own) if own else Lease(ctx, touch=lambda: self._touch(msg_id, cfg))
+            async with lease:
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")

@@ -179,7 +179,7 @@ Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·le
 
 작업 제어 · 호출: worker · 정의: worker 담당
 
-실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased
+실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)
 
 입력
 
@@ -187,7 +187,7 @@ Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·le
 |---|---|---|
 | `job_id` | `str` |  |
 | `worker` | `str` |  |
-| `lease_sec` | `float` |  |
+| `lease_sec` | `float` | DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 (NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch) |
 | `dispatch_gen` | `int | null` = None | 메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절 |
 
 출력 (`data`)
@@ -195,6 +195,7 @@ Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·le
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | `status` | `"started" | "done" | "failed" | "leased" | "unknown" | "stale_dispatch"` |  |
+| `exec_epoch` | `int | null` = None | started일 때 이번 실행 세대 (영속·단조). Redis 소유 키 모드는 이 값을 키에 담는다 |
 | `kind` | `str | null` = None |  |
 | `payload` | `dict[str, any] | null` = None |  |
 | `attempt` | `int | null` = None | 1부터. 이번이 몇 번째 시도인지 |
@@ -207,7 +208,7 @@ Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·le
 
 작업 제어 · 호출: worker · 정의: worker 담당 · permit 필요
 
-lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false
+lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음
 
 입력
 
@@ -329,6 +330,7 @@ lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false
 | `lease_owner` | `str | null` = None |  |
 | `lease_until` | `float | null` = None |  |
 | `attempts` | `int | null` = None |  |
+| `exec_epoch` | `int | null` = None | 실행 세대. job_start마다 1씩 오르고 되돌아가지 않음 (늦은 쓰기 차단) |
 | `fail_reason` | `str | null` = None |  |
 | `user_retryable` | `bool | null` = None |  |
 | `created` | `float | null` = None |  |

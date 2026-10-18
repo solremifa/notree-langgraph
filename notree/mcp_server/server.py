@@ -444,7 +444,9 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
 @tool
 def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | None = None) -> dict:
     """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
-    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지)."""
+    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지).
+    lease_sec=0 (LIVENESS=redis): DB lease로 실행 중을 판단하지 않는다. 실행 세대만 올려 이전 실행자의 permit을 무효로 만들고,
+    worker는 받은 세대(exec_epoch)를 Redis 소유 키에 담는다 — 키는 더 큰 세대만 덮어쓸 수 있다 (ownership.py)."""
     now = time.time()
     with tx() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -462,7 +464,7 @@ def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | No
         _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
              attempts=r["attempts"] + 1, exec_epoch=epoch)
         return ok(C.JobStartOut(
-            status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1,
+            status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1, exec_epoch=epoch,
             previous_owner=r["lease_owner"],
             permit=_issue_permit(job_id, worker, r["attempts"] + 1, epoch, r["user_id"] or "anonymous", r["stream"])))
 

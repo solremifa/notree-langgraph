@@ -64,12 +64,14 @@ class JobResendStaleIn(BaseModel):
 class JobStartIn(BaseModel):
     job_id: str
     worker: str
-    lease_sec: float
+    lease_sec: float = Field(description="DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 "
+                                         "(NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch)")
     dispatch_gen: int | None = Field(None, description="메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절")
 
 
 class JobStartOut(BaseModel):
     status: Literal["started", "done", "failed", "leased", "unknown", "stale_dispatch"]
+    exec_epoch: int | None = Field(None, description="started일 때 이번 실행 세대 (영속·단조). Redis 소유 키 모드는 이 값을 키에 담는다")
     kind: str | None = None
     payload: dict[str, Any] | None = None
     attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")
@@ -154,6 +156,7 @@ class JobRow(BaseModel):
     lease_owner: str | None = None
     lease_until: float | None = None
     attempts: int | None = None
+    exec_epoch: int | None = Field(None, description="실행 세대. job_start마다 1씩 오르고 되돌아가지 않음 (늦은 쓰기 차단)")
     fail_reason: str | None = None
     user_retryable: bool | None = None
     created: float | None = None
@@ -603,9 +606,10 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
              summary="Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 "
                      "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
-             summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased"),
+             summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. "
+                     "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,
-             summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false"),
+             summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음"),
     ToolSpec("job_finish", JobWorkerIn, JobFinishOut, W, "control", LEAD,
              summary="완료 표시. finished=true를 확인한 뒤에만 XACK"),
     ToolSpec("job_fail", JobFailIn, JobFailOut, W, "control", LEAD, summary="실패 확정. failed=true를 확인한 뒤에만 XACK"),
