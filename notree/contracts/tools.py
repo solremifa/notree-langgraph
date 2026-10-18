@@ -326,8 +326,9 @@ class TranscriptCommitIn(BaseModel):
 
 class TranscriptCommitOut(BaseModel):
     saved_until: int
-    enqueued_job_id: str | None = Field(None, description="이번 커밋이 새로 등록한 요약 작업. 대기 중 요약이 이미 있으면 None (합쳐짐)")
-    coalesced: bool
+    added: int = Field(description="이번 커밋으로 새로 저장된 전사 수. 0이면 재전송·빈 묶음 → 요약을 등록하지 않음")
+    enqueued_job_id: str | None = Field(None, description="이번 커밋이 새로 등록한 요약 작업")
+    coalesced: bool = Field(description="새 전사가 있었지만 대기 중 요약이 이미 있어 그 요약에 합쳐짐")
 
 
 class SummaryRecoverIn(BaseModel):
@@ -603,15 +604,18 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("note_get", NoteGetIn, NoteGetOut, DEV, "dev", "T3·T4", summary="발행된 노트 조회"),
     ToolSpec("tool_stats", ThreadIn, ToolStatsOut, DEV, "dev", LEAD, summary="도구 호출 횟수 (실행 흐름 확인용)"),
     # 계획된 도구
-    ToolSpec("transcript_range", TranscriptRangeIn, TranscriptRangeOut, W, "read", "T3·T4", "T1·T2", True,
-             summary="[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. 읽은 끝 번호를 attempted_until로 남긴다 (누락 복구 판단용)"),
+    ToolSpec("transcript_range", TranscriptRangeIn, TranscriptRangeOut, W, "write", "T3·T4", "T1·T2", True,
+             summary="[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. **상태 변경**: 읽은 끝 번호를 attempted_until로 남김 "
+                     "(누락 복구 판단용) → 이 강의의 live_summary 작업의 현재 실행권이 있어야 함"),
     ToolSpec("summary_segments", SummarySegmentsIn, SummarySegmentsOut, W, "read", "T3·T4", "", False, "planned",
              "최종 노트용 구간 요약 목록"),
     ToolSpec("summary_publish", SummaryPublishIn, SummaryPublishOut, W, "write", "T3·T4",
-             summary="[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq) 확인"),
+             summary="[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq), "
+                     "작업↔강의 연결(종류 live_summary·같은 lecture_id·같은 사용자) 확인. duplicate도 연결 확인"),
     ToolSpec("lecture_start", LectureStartIn, LectureOut, API, "write", "T3·T4", summary="[PoC] 녹음 시작 (강의 행)"),
     ToolSpec("transcript_commit", TranscriptCommitIn, TranscriptCommitOut, API, "write", "T3·T4",
-             summary="[PoC] 확정 전사 묶음 저장 + 대기 중 요약이 없으면 요약 작업 1건 등록 (강의당 대기 1개, DB 유일 인덱스)"),
+             summary="[PoC] 확정 전사 묶음 저장 + **새 전사가 실제로 저장됐고** 대기 중 요약이 없으면 요약 작업 1건 등록 "
+                     "(강의당 대기 1개, DB 유일 인덱스). 재전송·빈 묶음은 상태만 돌려줌"),
     ToolSpec("lecture_end", LectureIn, LectureOut, API, "write", "T3·T4",
              summary="[PoC] 녹음 종료: 상태 ended, 세대 +1 (늦은 실시간 요약이 덮지 못하게)"),
     ToolSpec("lecture_get", LectureIn, LectureOut, DEV, "dev", "T3·T4", summary="[PoC] 강의 상태·요약 위치 조회"),

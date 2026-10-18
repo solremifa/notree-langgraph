@@ -47,7 +47,7 @@
 | `note_publish` | 쓰기 | worker | T3·T4 |  |  | 구현 |
 | `note_get` | 개발용 | dev | T3·T4 |  |  | 구현 |
 | `tool_stats` | 개발용 | dev | worker 담당 |  |  | 구현 |
-| `transcript_range` | 읽기 | worker | T3·T4 | T1·T2 | ○ | 구현 |
+| `transcript_range` | 쓰기 | worker | T3·T4 | T1·T2 | ○ | 구현 |
 | `summary_publish` | 쓰기 | worker | T3·T4 |  |  | 구현 |
 | `lecture_start` | 쓰기 | api | T3·T4 |  |  | 구현 |
 | `transcript_commit` | 쓰기 | api | T3·T4 |  |  | 구현 |
@@ -495,9 +495,9 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 
 ### `transcript_range`
 
-읽기 · 호출: worker · 정의: T3·T4 · 리뷰: T1·T2 · **모델에 노출** · permit 필요
+쓰기 · 호출: worker · 정의: T3·T4 · 리뷰: T1·T2 · **모델에 노출** · permit 필요
 
-[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. 읽은 끝 번호를 attempted_until로 남긴다 (누락 복구 판단용)
+[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. **상태 변경**: 읽은 끝 번호를 attempted_until로 남김 (누락 복구 판단용) → 이 강의의 live_summary 작업의 현재 실행권이 있어야 함
 
 입력
 
@@ -521,7 +521,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 
 쓰기 · 호출: worker · 정의: T3·T4 · permit 필요
 
-[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq) 확인
+[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq), 작업↔강의 연결(종류 live_summary·같은 lecture_id·같은 사용자) 확인. duplicate도 연결 확인
 
 입력
 
@@ -572,7 +572,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 
 쓰기 · 호출: api · 정의: T3·T4
 
-[PoC] 확정 전사 묶음 저장 + 대기 중 요약이 없으면 요약 작업 1건 등록 (강의당 대기 1개, DB 유일 인덱스)
+[PoC] 확정 전사 묶음 저장 + **새 전사가 실제로 저장됐고** 대기 중 요약이 없으면 요약 작업 1건 등록 (강의당 대기 1개, DB 유일 인덱스). 재전송·빈 묶음은 상태만 돌려줌
 
 입력
 
@@ -587,8 +587,9 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | `saved_until` | `int` |  |
-| `enqueued_job_id` | `str | null` = None | 이번 커밋이 새로 등록한 요약 작업. 대기 중 요약이 이미 있으면 None (합쳐짐) |
-| `coalesced` | `bool` |  |
+| `added` | `int` | 이번 커밋으로 새로 저장된 전사 수. 0이면 재전송·빈 묶음 → 요약을 등록하지 않음 |
+| `enqueued_job_id` | `str | null` = None | 이번 커밋이 새로 등록한 요약 작업 |
+| `coalesced` | `bool` | 새 전사가 있었지만 대기 중 요약이 이미 있어 그 요약에 합쳐짐 |
 
 ### `lecture_end`
 

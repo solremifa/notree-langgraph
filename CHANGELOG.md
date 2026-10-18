@@ -11,6 +11,15 @@
 
 ## 2026-10-18
 
+### 실시간 요약 리뷰 반영: 작업↔강의 연결 확인, 재전송 재등록 막기 · (이번 커밋)
+자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md#리뷰-반영-3b1c00e-이후)
+
+- 🐛 P1 `summary_publish`가 permit의 작업이 그 강의를 요약하는 작업인지 확인하지 않아, 다른 작업의 유효한 permit으로 남의 강의 요약을 바꿀 수 있었음 → 종류·lecture_id·사용자·현재 실행권 확인 (duplicate 경로 포함)
+- 🐛 P1 같은 전사 묶음 재전송이 실패한 요약을 다시 등록 → 새 전사가 저장됐을 때만 등록
+- 🐛 P2 실행권을 잃은 worker도 `transcript_range`로 attempted_until을 올릴 수 있었음 → 현재 실행권 확인, 계약에 상태 변경 도구로 표시
+- ⚠️ `transcript_commit` 응답에 `added`, `coalesced` 의미 좁힘
+- 테스트 109 → 112개
+
 ### 실시간 요약 범위 합치기 (PoC) · `3b1c00e`
 자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md) (브랜치 `feat/summary-coalesce`)
 

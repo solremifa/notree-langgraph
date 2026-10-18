@@ -225,3 +225,78 @@ def test_recovery_registers_once_when_a_job_is_lost(tmp_path):
             assert (await e.api.tool("summary_recover"))["registered"] == []   # 대기 작업이 있으니 다시 안 함
             assert len(summary_jobs(e)) == 1
     asyncio.run(t())
+
+
+# ── 리뷰에서 재현된 문제 (2026-10-18) ───────────────────────────────
+async def _start(e, job_id, worker="w", lease=5.0):
+    return await e.api.tool("job_start", job_id=job_id, worker=worker, lease_sec=lease)
+
+
+def test_permit_of_another_job_cannot_publish_or_read_a_lecture(tmp_path):
+    """Alice의 다른 작업(echo) permit, Alice의 다른 강의 요약 permit으로 Bob의 강의 요약을 바꾸거나 읽지 못한다.
+    이미 저장된 결과를 돌려주는 duplicate 경로도 강의 연결을 확인한다."""
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("lecture_start", lecture_id="alice-L", user_id="alice")
+            await e.api.tool("lecture_start", lecture_id="bob-L", user_id="bob")
+            await e.api.tool("transcript_commit", lecture_id="bob-L", user_id="bob", segments=segs(1, 2))
+            ja = (await e.api.tool("transcript_commit", lecture_id="alice-L", user_id="alice",
+                                   segments=segs(1, 2)))["enqueued_job_id"]
+            echo = (await e.api.tool("job_create", kind="echo", payload={}, user_id="alice"))["job_id"]
+            for job in (echo, ja):
+                p = (await _start(e, job, lease=0.01))["permit"]
+                with pytest.raises(ToolError) as ex:
+                    await e.api.tool("summary_publish", idem_key=job, lecture_id="bob-L", expected_generation=1,
+                                     from_seq=1, upto_seq=2, text="탈취", permit=p)
+                assert ex.value.code == "permit_invalid"
+                with pytest.raises(ToolError):
+                    await e.api.tool("transcript_range", lecture_id="bob-L", permit=p)
+            bob = await e.api.tool("lecture_get", lecture_id="bob-L", user_id="bob")
+            assert bob["processed_until"] == 0 and bob["rolling_summary"] == "" and bob["attempted_until"] == 0
+            await asyncio.sleep(0.05)                                 # 이전 lease 만료 뒤 다시 시작해 새 permit
+            pa = (await _start(e, ja, worker="w2"))["permit"]
+            await e.api.tool("transcript_range", lecture_id="alice-L", permit=pa)
+            ok = await e.api.tool("summary_publish", idem_key=ja, lecture_id="alice-L", expected_generation=1,
+                                  from_seq=1, upto_seq=2, text="정상", permit=pa)
+            assert ok["status"] == "published"
+            with pytest.raises(ToolError) as ex:                      # 같은 idem_key로 다른 강의 → duplicate로 새지 않음
+                await e.api.tool("summary_publish", idem_key=ja, lecture_id="bob-L", expected_generation=1,
+                                 from_seq=1, upto_seq=2, text="정상", permit=pa)
+            assert ex.value.code == "permit_invalid"
+    asyncio.run(t())
+
+
+def test_resending_the_same_batch_does_not_reregister_a_failed_summary(tmp_path):
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            j = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 1)))["enqueued_job_id"]
+            p = (await _start(e, j))["permit"]
+            await e.api.tool("transcript_range", lecture_id=L, permit=p)
+            await e.api.tool("job_fail", job_id=j, worker="w", reason="요약 실패", user_retryable=False, permit=p)
+            assert (await e.api.tool("summary_recover"))["registered"] == []
+            for batch in (segs(1, 1), []):                             # 재전송·빈 묶음
+                r = await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=batch)
+                assert r["enqueued_job_id"] is None and r["added"] == 0 and not r["coalesced"]
+            assert len(summary_jobs(e)) == 1
+            r = await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 2))   # 2번이 새로 옴
+            assert r["added"] == 1 and r["enqueued_job_id"]
+    asyncio.run(t())
+
+
+def test_stale_permit_cannot_move_attempted_until(tmp_path):
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            j = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 2)))["enqueued_job_id"]
+            old = (await _start(e, j, worker="A", lease=0.01))["permit"]
+            await asyncio.sleep(0.05)
+            new = (await _start(e, j, worker="B"))["permit"]           # B가 새 실행권 (실행 세대 2)
+            await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(3, 3))
+            with pytest.raises(ToolError) as ex:
+                await e.api.tool("transcript_range", lecture_id=L, permit=old)
+            assert ex.value.code == "permit_invalid"
+            assert (await lec(e))["attempted_until"] == 0
+            assert (await e.api.tool("transcript_range", lecture_id=L, permit=new))["last_seq"] == 3
+            assert (await lec(e))["attempted_until"] == 3
+    asyncio.run(t())

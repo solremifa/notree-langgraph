@@ -15,8 +15,7 @@
 | 누락 복구 | 녹음 중 · 요약 안 된 전사 있음 · **아무도 읽어 가지 않은 전사 있음** · 대기·실행 중 요약 없음 → 1건 | `summary_recover` (scheduler 주기) |
 
 "후속 1건은 결과 저장 트랜잭션에서 등록"이라던 검토 때의 제안 대신, **커밋이 대기 1건을 등록하고 배정이 앞 요약 끝날 때까지 기다리는** 방식으로 바꿨습니다.
-- 후속 요청이 커밋 시점에 DB에 남으므로, 요약 저장과 등록 사이에서 잃어버릴 구간이 없습니다.
-- 요약 저장 트랜잭션은 자기 작업이 아직 running인 상태라 "대기 1개" 제약과 부딪혔습니다.
+후속 요청이 전사 커밋 시점에 DB에 확실히 남으므로, 요약 저장과 후속 등록 사이에서 잃어버릴 구간이 없습니다.
 
 실패한 요약 구간은 복구 스캔이 혼자 다시 등록하지 않습니다(`attempted_until` 조건). 새 전사가 오면 커밋이 등록하고, 그 요약이 처리 위치부터 읽으므로 실패 구간까지 함께 처리합니다.
 
@@ -25,7 +24,17 @@
 `lecture_start` · `transcript_commit` · `lecture_end` · `lecture_get`(dev) · `summary_recover`(scheduler).
 계획 상태였던 `transcript_range`·`summary_publish`를 구현하면서 `from_seq`, `state`, `status`(published·duplicate·stale) 필드를 더했습니다.
 
-## 시험 (`tests/test_summary_coalesce.py`, 8개)
+## 리뷰 반영 (3b1c00e 이후)
+
+세 문제를 시험으로 먼저 재현한 뒤 고쳤습니다.
+
+| 문제 | 고치기 전 | 고친 뒤 |
+|---|---|---|
+| P1 다른 작업의 permit으로 남의 강의 요약 변경 | Alice의 Q&A·echo 작업 permit(유효)으로 Bob 강의에 `summary_publish` → published, Bob의 요약·위치가 바뀜 | 저장 트랜잭션에서 **작업 종류 live_summary · 작업의 lecture_id = 대상 · 작업 사용자 = 강의 주인 · 현재 실행권** 확인. duplicate 경로도 작업↔강의 연결과 저장된 결과의 강의를 확인 |
+| P1 같은 묶음 재전송이 실패한 요약을 다시 등록 | 커밋이 새 번호와 관계없이 `saved > processed`면 등록 → 재전송만으로 실패 구간 LLM 반복 | **새 전사가 실제로 저장됐을 때만** 등록. 재전송·빈 묶음은 상태만 돌려줌 (`added=0`) |
+| P2 실행권을 잃은 worker가 attempted_until 변경 | 이전 permit으로 `transcript_range` 성공, 복구 판단 값이 올라감 | 같은 작업↔강의 연결 + **현재 실행권** 확인 뒤에만 변경. 계약에 상태 변경 도구(write)로 표시 |
+
+## 시험 (`tests/test_summary_coalesce.py`, 11개)
 
 | 시험 | 결과 |
 |---|---|
@@ -37,6 +46,9 @@
 | 요약 중 녹음 종료 → 저장 안 됨, 이후 커밋 거절, 복구도 등록 안 함 | 통과 |
 | 요약 실패 → 복구가 다시 등록 안 함 → 새 커밋 뒤 요약이 [1-3]으로 실패 구간까지 처리 | 통과 |
 | 등록된 작업이 사라짐 → 복구가 1건만 등록 | 통과 |
+| (리뷰) Alice의 echo·다른 강의 요약 permit으로 Bob 강의 저장·읽기 → 거절, duplicate 경로로도 안 샘 | 통과 |
+| (리뷰) 실패 뒤 같은 묶음 재전송·빈 묶음 → 등록 안 함, 새 번호가 오면 등록 | 통과 |
+| (리뷰) 이전 실행자의 permit으로 transcript_range → 거절, attempted_until 그대로 | 통과 |
 
 시험하면서 본 것: 앞 요약이 배정만 되고 아직 전사를 읽기 전에 커밋이 오면 대기 1건이 더 생기고, 앞 요약이 그 전사까지 읽어 가면 뒤 요약은 **LLM을 부르지 않고** 빈 실행으로 끝납니다. 구간은 겹치지 않습니다. 비용은 작업 하나의 배정·DB 읽기뿐이라 그대로 두었습니다.
 
@@ -49,4 +61,4 @@
 
 ## 깨지는 변경
 
-없음. `jobs`에 `lecture_id` 열 추가, `job_reserve_pending`에 실시간 요약 배정 조건 추가 (다른 종류는 그대로). `.gitignore`에 `data/`.
+`transcript_commit` 응답에 `added` 추가, `coalesced`는 "새 전사가 대기 요약에 합쳐짐"만 뜻함. `transcript_range`는 이 강의 요약 작업의 현재 permit이 있어야 함 (REQUIRE_PERMIT=1). `jobs`에 `lecture_id` 열 추가, `job_reserve_pending`에 실시간 요약 배정 조건 추가 (다른 종류는 그대로). `.gitignore`에 `data/`.

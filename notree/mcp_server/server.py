@@ -555,6 +555,18 @@ def _lecture_out(r) -> dict:
     return ok(C.LectureOut(**{k: r[k] for k in C.LectureOut.model_fields}))
 
 
+def _require_summary_job(con, claims: dict | None, lec: sqlite3.Row, *, live: bool = True) -> None:
+    """permit의 작업이 이 강의를 요약하도록 허가된 작업인지: 종류 live_summary · 같은 lecture_id · 작업 사용자 = 강의 주인.
+    live=True면 지금도 실행권(소유자·실행 세대)이 있어야 한다. permit 없이 부르는 dev 경로(REQUIRE_PERMIT=0)는 검사 안 함."""
+    if claims is None:
+        return
+    j = con.execute("SELECT kind, lecture_id, user_id FROM jobs WHERE job_id=?", (claims["j"],)).fetchone()
+    if not j or j["kind"] != "live_summary" or j["lecture_id"] != lec["lecture_id"] or j["user_id"] != lec["user_id"]:
+        raise Reject(ErrorCode.PERMIT_INVALID, "이 강의를 요약하는 작업의 permit이 아님")
+    if live:
+        _require_live(con, claims, claims["j"])
+
+
 def _enqueue_summary(con, lec: sqlite3.Row) -> str | None:
     """대기 요약이 없으면 1건 등록하고 job_id, 이미 있으면 None (합쳐짐)."""
     try:
@@ -589,18 +601,23 @@ def transcript_commit(lecture_id: str, user_id: str, segments: list[dict]) -> di
                 raise ValueError(f"전사 번호에 빈틈: {saved} 다음이 {seq}")
             con.execute("INSERT INTO transcripts VALUES(?,?,?)", (lecture_id, seq, seg["text"]))
             saved = seq
-        con.execute("UPDATE lectures SET saved_until=?, updated_at=? WHERE lecture_id=?", (saved, time.time(), lecture_id))
+        added = saved - lec["saved_until"]
         _log(con, "transcript_commit", lecture_id)
-        job_id = _enqueue_summary(con, lec) if saved > lec["processed_until"] else None
-        return ok(C.TranscriptCommitOut(saved_until=saved, enqueued_job_id=job_id, coalesced=job_id is None))
+        if not added:                                        # 재전송·빈 묶음: 요약을 등록하지 않는다 (실패 구간 재시도 우회 방지)
+            return ok(C.TranscriptCommitOut(saved_until=saved, added=0, coalesced=False))
+        con.execute("UPDATE lectures SET saved_until=?, updated_at=? WHERE lecture_id=?", (saved, time.time(), lecture_id))
+        job_id = _enqueue_summary(con, lec)
+        return ok(C.TranscriptCommitOut(saved_until=saved, added=added, enqueued_job_id=job_id, coalesced=job_id is None))
 
 
 @tool
 def transcript_range(lecture_id: str, after_seq: int | None = None, permit: str | None = None) -> dict:
-    """[worker] 롤링 요약 + 요약 위치 이후 확정 전사. 읽은 끝 번호를 attempted_until로 남긴다."""
+    """[worker] 롤링 요약 + 요약 위치 이후 확정 전사. 상태 변경: 읽은 끝 번호를 attempted_until로 남긴다
+    → 이 강의를 요약하는 작업의 **현재** 실행권이 있어야 한다 (실행권을 잃은 이전 실행자는 못 바꿈)."""
     claims = _claims(permit, None)
     with tx() as con:
-        lec = _lecture(con, lecture_id, claims["u"] if claims else None)   # permit의 사용자 = 강의 주인
+        lec = _lecture(con, lecture_id)
+        _require_summary_job(con, claims, lec)
         start = (lec["processed_until"] if after_seq is None else after_seq) + 1
         rows = con.execute("SELECT seq, text FROM transcripts WHERE lecture_id=? AND seq BETWEEN ? AND ? ORDER BY seq",
                            (lecture_id, start, lec["saved_until"])).fetchall()
@@ -619,8 +636,11 @@ def summary_publish(idem_key: str, lecture_id: str, expected_generation: int, fr
     claims = _claims(permit, idem_key)
     with tx() as con:
         lec = _lecture(con, lecture_id)
-        done = con.execute("SELECT version FROM summaries WHERE idem_key=?", (idem_key,)).fetchone()
+        _require_summary_job(con, claims, lec, live=False)    # 작업↔강의 연결은 duplicate 경로에도
+        done = con.execute("SELECT version, lecture_id FROM summaries WHERE idem_key=?", (idem_key,)).fetchone()
         if done:
+            if done["lecture_id"] != lecture_id:
+                raise Reject(ErrorCode.PERMIT_INVALID, "다른 강의에 저장된 결과")
             return ok(C.SummaryPublishOut(status="duplicate", summary_version=done["version"],
                                           processed_until=lec["processed_until"]), duplicate=True)
         _require_live(con, claims, idem_key)
