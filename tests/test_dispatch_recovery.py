@@ -24,6 +24,7 @@ from notree.worker.loop import Worker  # noqa: E402
 from notree.worker.mcp_client import McpClient  # noqa: E402
 from test_skeleton import Env  # noqa: E402
 
+ROOT = Path(__file__).resolve().parents[1]
 RT = dataclasses.replace(S.RT, lease_sec=1.0, heartbeat_sec=0.3, claim_idle_ms=1000, job_timeout_sec=20)
 real_redis = pytest.mark.skipif(shutil.which("redis-server") is None, reason="redis-server 없음")
 
@@ -340,4 +341,91 @@ def test_legacy_messages_are_accepted_only_when_explicitly_allowed(tmp_path):
             await e.r.xadd(RT.stream, {"job_id": j})
             e.start_worker(cfg=RT, allow_legacy=True)                    # 전환 기간·개발 도구에서만
             assert await e.wait_state(j, ("done",))
+    asyncio.run(t())
+
+
+# ── 리뷰 6차: 스냅숏 복원 (표시 키는 돌아오지만 그 뒤 메시지는 없음) ─────────────
+def _redis_proc(port, d):
+    p = subprocess.Popen(["redis-server", "--port", str(port), "--dir", str(d), "--dbfilename", "dump.rdb",
+                          "--save", "", "--appendonly", "no"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+            return p
+        except OSError:
+            time.sleep(0.1)
+    return p
+
+
+@real_redis
+def test_restore_from_an_old_snapshot_is_detected_as_loss(tmp_path):
+    """표시 키가 든 스냅숏이 저장된 뒤 새 작업이 전달됨 → Redis가 그 스냅숏으로 복원 → 표시 키는 있지만 메시지는 없음.
+    표시 키만 보면 유실을 못 알아챈다 → 재시작(run_id 변경)도 유실로 보고 다시 보내야 한다."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+    port = _free_port()
+    proc = _redis_proc(port, tmp_path)
+    url = f"redis://127.0.0.1:{port}/0"
+
+    async def t():
+        nonlocal proc
+        async with RealEnv(tmp_path, url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)                   # 표시 키
+            await e.r.save()                                             # (잘못 설정된 Redis의) 스냅숏
+            j = await e.job({"text": "after-snapshot"})
+            got = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"]
+            await e.r.xadd(RT.stream, {"job_id": j, "gen": str(got[0]["gen"])})
+            await e.api.tool("job_mark_sent", job_id=j)
+            await e.r.connection_pool.disconnect()
+            proc.terminate(); proc.wait(5)                               # 죽음 (스냅숏은 디스크에 남음)
+            proc = _redis_proc(port, tmp_path)                           # 과거 스냅숏으로 복원
+            assert await e.r.exists("notree:redis-alive")                # 표시 키는 돌아옴
+            assert await e.r.xlen(RT.stream) == 0                        # 메시지는 없음
+            assert await recover_after_redis_loss(e.r, e.api) == 1       # 그래도 유실로 보고 다시 보냄
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+
+    try:
+        asyncio.run(t())
+    finally:
+        proc.terminate(); proc.wait(5)
+
+
+@real_redis
+def test_compose_redis_settings_come_back_empty_after_restart(tmp_path):
+    """docker-compose.yml의 redis command 인자 그대로 띄우고, 데이터를 쓴 뒤 정상 종료(SHUTDOWN) → 재시작하면 비어 있어야 한다
+    (스냅숏·AOF를 남기지 않음). 설정 파일을 읽어 쓰므로 설정이 바뀌면 이 시험도 따라간다."""
+    import re as _re
+    text = (ROOT / "docker-compose.yml").read_text()
+    args = _re.findall(r'"([^"]*)"', _re.search(r"command:\s*\[(.*?)\]", text).group(1))
+    assert args[0] == "redis-server" and "--save" in args and "--appendonly" in args
+    port = _free_port()
+
+    def start():
+        p = subprocess.Popen(args + ["--port", str(port), "--dir", str(tmp_path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        return p
+
+    async def t():
+        p = start()
+        r = aioredis.from_url(f"redis://127.0.0.1:{port}/0", decode_responses=True)
+        await r.set("k", "v")
+        await r.xadd("s", {"a": "1"})
+        try:
+            await r.shutdown()                                           # 정상 종료 (설정에 따라 저장할 수도 있는 경로)
+        except Exception:
+            pass
+        p.wait(5)
+        await r.aclose()
+        p = start()
+        r = aioredis.from_url(f"redis://127.0.0.1:{port}/0", decode_responses=True)
+        n = await r.dbsize()
+        await r.aclose()
+        p.terminate(); p.wait(5)
+        assert n == 0 and not list(tmp_path.glob("*.rdb")) and not list(tmp_path.glob("appendonly*"))
     asyncio.run(t())

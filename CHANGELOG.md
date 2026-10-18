@@ -9,6 +9,16 @@
 
 ---
 
+## 2026-10-19
+
+### ① Redis 비영속 설정, 스냅숏 복원도 유실로 감지 · (이번 커밋)
+자세히: [docs/changes/2026-10-19-review-6.md](docs/changes/2026-10-19-review-6.md) (브랜치 `fix/review-6`)
+
+- 🐛 compose가 Redis 기본 스냅숏을 켠 채라 재시작 때 표시 키가 돌아와 유실을 못 알아챔 (작업이 멈춤) → `--save "" --appendonly no`, 볼륨 없음
+- 🐛 표시 키가 있다는 것만으로 판단 → 값에 Redis run_id를 담아 재시작·스냅숏 복원·장애 조치도 유실로 감지
+- ⚠️ 기존 Redis 컨테이너는 `docker compose up -d --force-recreate`로 새로 만들 것
+- 테스트 → 148개
+
 ## 2026-10-18
 
 ### main 머지 후 문서: 상태·시험 환경·요약 한계 · `974901f`

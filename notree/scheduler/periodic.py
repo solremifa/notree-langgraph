@@ -32,15 +32,23 @@ async def resend_stale(r, mcp: McpClient, reserved_sec: float = S.RESEND_RESERVE
     return len(jobs)
 
 
-REDIS_MARKER = "notree:redis-alive"     # 이 키가 없으면 Redis가 새로 시작됐거나 초기화된 것 (비영속 Redis)
+REDIS_MARKER = "notree:redis-alive"     # 값 = 표시를 남길 때의 Redis run_id
+
+
+async def redis_lost(r) -> bool:
+    """Redis 상태를 잃었을 수 있나: 표시 키가 없거나(FLUSHALL·새 Redis), 표시 키의 run_id가 지금과 다름(프로세스 재시작·
+    스냅숏 복원·장애 조치). 스냅숏에서 돌아온 표시 키는 그 뒤에 보낸 메시지가 없다는 사실을 숨기므로, 키가 있다는 것만으로는
+    안전하지 않다. Redis는 비영속(save "", appendonly no)이 원칙이라 재시작은 곧 유실이다."""
+    run_id = (await r.info("server")).get("run_id")
+    return (await r.get(REDIS_MARKER)) != run_id
 
 
 async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
-    """매 주기. 표시 키가 없으면 Redis 초기화를 '발견'한 것 → DB에 복구 기준 시각을 남기고(start) 표시 키를 둔다.
+    """매 주기. Redis 유실을 '발견'하면(redis_lost) DB의 전달 세대를 올리고(start) 표시 키(= 지금 run_id)를 둔다.
     복구가 '끝났는지'는 DB가 안다 (보류된 running이 남아 있으면 open) → 열려 있는 동안 매 주기 다시 확인한다.
     쪽 단위로 끝까지 돈다. 다시 보낸 작업 수.
     처음 배포할 때도 한 번 시작된다 (새 Redis와 지워진 Redis를 구분할 수 없음) — 중복 메시지는 job_start가 걸러 낸다."""
-    start = not await r.exists(REDIS_MARKER)
+    start = await redis_lost(r)
     sent, after = 0, None
     while True:
         res = await mcp.tool("job_recover_orphans", start=start, after=after, limit=page)
@@ -56,7 +64,7 @@ async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
         after = res["next_after"]
     if res.get("held"):
         log("recover", f"lease가 살아 있는 작업 {res['held']}개는 보류 → 다음 주기에 다시 확인")
-    await r.set(REDIS_MARKER, "1")                      # 기준 시각을 DB에 남긴 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시 시작)
+    await r.set(REDIS_MARKER, (await r.info("server")).get("run_id"))   # 세대를 DB에 올린 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시)
     return sent
 
 

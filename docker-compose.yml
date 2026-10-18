@@ -1,5 +1,10 @@
 # 진짜 Redis로 여러 프로세스를 띄워 보고 싶을 때:  docker compose up -d
+# Redis는 비영속이 원칙 (본문을 담지 않는 재구성 가능한 저장소, 설계 v0.2 16절):
+#   스냅숏(save)·AOF를 끈다. 재시작하면 비어서 시작하고, scheduler가 유실로 보고 DB에서 전달 상태를 다시 만든다.
+#   볼륨을 붙이지 않는다 (예전 덤프를 다시 읽지 않게). 설정을 바꿨으면 컨테이너를 새로 만든다: docker compose up -d --force-recreate
+#   표시 키에 run_id를 담아 두므로 실수로 스냅숏이 복원돼도 유실로 감지한다 (notree/scheduler/periodic.py)
 services:
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports: ["6379:6379"]
