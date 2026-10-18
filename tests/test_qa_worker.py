@@ -249,3 +249,23 @@ def test_retry_after_lost_save_response_skips_the_graph(tmp_path):
             assert counts["qa_search"] == 2 and counts["qa_context"] == 2
             assert (await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER))["state"] == "answered"
     run(t())
+
+
+def test_seed_rejects_the_same_doc_id_in_another_source(tmp_path):
+    """인용 ID는 출처 전체에서 유일 (리뷰 6차 ②): 노트에 있는 ID를 전사로 또 넣으면 거절."""
+    import os
+
+    from notree.worker.mcp_client import McpClient
+
+    async def t():
+        env = {**os.environ, "NOTREE_DB": str(tmp_path / "seed.db"), "NOTREE_REQUIRE_PERMIT": "0"}
+        async with McpClient(env=env) as m:
+            await m.tool("qa_seed", user_id="u", course_id="c", course_name="자료구조",
+                         docs=[{"source": "note", "id": "same", "text": "스택은 LIFO이다"}])
+            with pytest.raises(ToolError) as ex:
+                await m.tool("qa_seed", user_id="u", course_id="c", course_name="자료구조",
+                             docs=[{"source": "transcript", "id": "same", "text": "힙은 완전 이진 트리이다"}])
+            assert ex.value.code == "invalid_args"
+            await m.tool("qa_seed", user_id="u", course_id="c", course_name="자료구조",          # 같은 출처 덮어쓰기는 그대로 됨
+                         docs=[{"source": "note", "id": "same", "text": "스택은 LIFO 구조이다"}])
+    asyncio.run(t())

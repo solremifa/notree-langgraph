@@ -170,6 +170,21 @@ def split_keywords(keywords: list[str]) -> list[str]:
     return out
 
 
+def _accept_hits(existing: list[HitDict], new: list[HitDict], source: str) -> tuple[list[HitDict], list[str]]:
+    """인용 ID는 출처 전체에서 유일해야 한다 (계약). 이미 받은 근거와 ID가 같은데 출처나 원문이 다르면 뒤에 온 것을 거절한다.
+    그러지 않으면 답변은 A를 인용했는데 저장되는 원문이 B로 바뀐다 (sources_for가 ID로 찾음). 같은 근거의 재검색은 통과."""
+    seen = {h["id"]: (h["source"], h["text"]) for h in existing}
+    ok, notes = [], []
+    for h in new:
+        prev = seen.get(h["id"])
+        if prev is not None and prev != (h["source"], h["text"]):
+            notes.append(f"{source}: 근거 ID 충돌 '{h['id']}' (이미 {prev[0]}에서 받은 다른 원문) → 거절")
+            continue
+        seen[h["id"]] = (h["source"], h["text"])
+        ok.append(h)
+    return ok, notes
+
+
 def _search(source: str):
     async def node(state: QAState, config: RunnableConfig) -> dict:
         retriever, notes, attempted = _cfg(config)["retriever"], [], False
@@ -182,7 +197,8 @@ def _search(source: str):
             attempted = True
             try:
                 hits = await asyncio.wait_for(retriever.search(source, state.get("keywords", [])), timeout=limit)
-                return {"hits": hits, "searched": [source], "queried": [source], "skipped": notes, **reset}
+                hits, clash = _accept_hits(state.get("hits", []), hits, source)
+                return {"hits": hits, "searched": [source], "queried": [source], "skipped": notes + clash, **reset}
             except (SearchUnavailable, TimeoutError) as e:
                 why = "시간 초과" if isinstance(e, TimeoutError) else f"일시 장애: {e}"
                 notes.append(f"{source}: {why} → {'다시 시도' if i < SEARCH_RETRIES[source] else '건너뜀'}")

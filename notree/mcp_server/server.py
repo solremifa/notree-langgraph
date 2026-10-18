@@ -827,6 +827,10 @@ def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) ->
         for d in docs:
             if d["source"] not in ("note", "transcript", "web"):
                 raise ValueError(f"source: {d['source']}")
+            clash = con.execute("SELECT source FROM qa_docs WHERE course_id=? AND doc_id=? AND source<>?",
+                                (course_id, d["id"], d["source"])).fetchone()
+            if clash:                                        # 인용 ID는 출처 전체에서 유일 (계약)
+                raise ValueError(f"문서 ID '{d['id']}'가 이미 {clash['source']}에 있음 (출처 전체에서 유일해야 함)")
             con.execute("INSERT OR REPLACE INTO qa_docs VALUES(?,?,?,?,?,?,?)",
                         (course_id, d["source"], d["id"], user_id, d.get("lecture_id"), d["text"], d.get("ref") or d["id"]))
     return ok(C.QaSeedOut(inserted=len(docs)))

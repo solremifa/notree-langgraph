@@ -364,3 +364,31 @@ def test_sources_hold_only_cited_hits_and_notice_code_is_set():
     assert out2["notice_code"] == "not_found" and out2["sources"] == [] and out2["sentences"] == []
     out3, _ = run_with("스택은 어떤 구조야?", ScriptedRetriever({"note": [LIFO]}), deadline_in=-1)
     assert out3["notice_code"] == "timeout"
+
+
+# ── 리뷰 6차 ②: 인용 ID 충돌 ─────────────────────────────────────
+def test_same_id_from_different_sources_never_swaps_the_cited_text():
+    """노트와 전사가 같은 ID 'same'을 쓰면, 답변은 노트를 인용했는데 저장된 원문이 전사로 바뀌던 문제.
+    같은 ID에 다른 출처·원문이 오면 뒤에 온 것을 거절해야 한다 (인용 ID는 출처 전체에서 유일)."""
+    from notree.graphs.qa.llm import Answer, Sentence, Understanding
+
+    class CiteFirst:
+        def __init__(self):
+            self.calls = []
+
+        async def understand(self, q, course):
+            self.calls.append("understand")
+            return Understanding(related=True, keywords=["스택", "LIFO", "트리", "기타"])
+
+        async def answer(self, question, evidence, attempt, problem="", related=True):
+            self.calls.append(f"answer#{attempt}")
+            h = evidence[0]
+            return Answer(sentences=[Sentence(text=h["text"], citations=[h["id"]])])
+
+    docs = {"note": [("same", "스택은 LIFO이다")], "transcript": [("same", "힙은 완전 이진 트리이다")], "web": []}
+    ret = FakeRetriever(docs)
+    out = asyncio.run(build_qa_graph().ainvoke({"question": "스택?"}, {"configurable": {"llm": CiteFirst(), "retriever": ret}}))
+    src = {s["id"]: s for s in out["sources"]}
+    assert out["citations"] == ["same"]
+    assert src["same"]["source"] == "note" and src["same"]["text"] == "스택은 LIFO이다"      # 인용한 원문 그대로
+    assert any("ID 충돌" in s for s in out.get("skipped", []))

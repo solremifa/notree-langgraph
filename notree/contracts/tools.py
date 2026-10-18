@@ -450,7 +450,8 @@ class QaSearchIn(BaseModel):
 
 
 class QaHit(BaseModel):
-    id: str = Field(description="근거 ID. 답변 인용과 같은 값")
+    id: str = Field(description="근거 ID. 답변 인용과 같은 값. **출처(노트·전사·웹) 전체에서 유일해야 한다** — "
+                               "그래프는 같은 ID에 다른 출처·원문이 오면 뒤에 온 것을 거절한다")
     source: Literal["note", "transcript", "web"]
     text: str
     score: float = Field(description="0~1. 그래프가 '충분한지' 판단에 씀")

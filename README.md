@@ -25,7 +25,7 @@ uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초
 uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
 uv run python -m notree.dev.qa_run       # Q&A 근거 탐색 그래프 (feat/qa-graph 실험)
-uv run pytest -q                         # 148개
+uv run pytest -q                         # 150개
 ```
 
 **실제 Redis가 필요한 시험**(`test_redis_ownership`, `test_dispatch_recovery`, `test_combined_faults` 일부)은 PATH에 `redis-server`가
