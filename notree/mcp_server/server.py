@@ -510,13 +510,22 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
     마감이 있던 작업은 deadline_at으로 새 마감을 준다. 안 주면 Q&A·채점은 지금부터 정책 마감(90초),
     그 밖의 작업은 지난 마감 그대로라 바로 다시 실패한다."""
     with db() as con:
-        r = con.execute("SELECT state, user_retryable, payload, kind FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        r = con.execute("SELECT state, user_retryable, payload, kind, lecture_id FROM jobs WHERE job_id=?",
+                        (job_id,)).fetchone()
         if not r:
             raise Reject(ErrorCode.NOT_FOUND, job_id)
         if r["state"] != "failed":
             return ok(C.JobRetryOut(revived=False, reason=f"failed 상태가 아님 ({r['state']})"))
         if not r["user_retryable"]:
             return ok(C.JobRetryOut(revived=False, reason="영구 실패라 다시 시도할 수 없음"))
+        if r["kind"] == "live_summary":                      # 실시간 요약: 강의당 대기 1개·동시 실행 1개 규칙을 지킨다
+            lec = con.execute("SELECT state FROM lectures WHERE lecture_id=?", (r["lecture_id"],)).fetchone()
+            if not lec or lec["state"] != "recording":
+                return ok(C.JobRetryOut(revived=False, reason="녹음이 끝난 강의의 실시간 요약은 되살리지 않음"))
+            if con.execute("SELECT 1 FROM jobs WHERE kind='live_summary' AND lecture_id=? AND job_id<>? "
+                           "AND state IN ('pending','reserved','sent','running')", (r["lecture_id"], job_id)).fetchone():
+                return ok(C.JobRetryOut(revived=False,
+                                        reason="후속 요약이 이미 있음 → 그 요약이 실패 구간부터 함께 처리함"))
         payload = json.loads(r["payload"])
         if deadline_at is None and r["kind"] in KIND_DEADLINE_SEC:
             deadline_at = time.time() + KIND_DEADLINE_SEC[r["kind"]]
@@ -618,6 +627,7 @@ def transcript_range(lecture_id: str, after_seq: int | None = None, permit: str 
     with tx() as con:
         lec = _lecture(con, lecture_id)
         _require_summary_job(con, claims, lec)
+        mine = claims and con.execute("SELECT 1 FROM summaries WHERE idem_key=?", (claims["j"],)).fetchone()
         start = (lec["processed_until"] if after_seq is None else after_seq) + 1
         rows = con.execute("SELECT seq, text FROM transcripts WHERE lecture_id=? AND seq BETWEEN ? AND ? ORDER BY seq",
                            (lecture_id, start, lec["saved_until"])).fetchall()
@@ -626,7 +636,8 @@ def transcript_range(lecture_id: str, after_seq: int | None = None, permit: str 
         _log(con, "transcript_range", lecture_id)
         return ok(C.TranscriptRangeOut(state=lec["state"], rolling_summary=lec["rolling_summary"],
                                        new_text="\n".join(r["text"] for r in rows), from_seq=start,
-                                       last_seq=lec["saved_until"], generation=lec["generation"]))
+                                       last_seq=lec["saved_until"], generation=lec["generation"],
+                                       already_published=bool(mine)))
 
 
 @tool

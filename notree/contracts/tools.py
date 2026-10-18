@@ -264,6 +264,7 @@ class TranscriptRangeOut(BaseModel):
     from_seq: int = Field(description="이번 범위의 첫 번호 (= processed_until + 1)")
     last_seq: int = Field(description="이번 범위의 끝 번호 (= 읽은 시점의 saved_until). from_seq보다 작으면 새 전사 없음")
     generation: int = Field(description="발행할 때 expected_generation으로 다시 넘긴다")
+    already_published: bool = Field(False, description="이 작업(permit)의 요약이 이미 저장됨 → 다시 요약하지 않고 완료")
 
 
 class SummarySegmentsIn(BaseModel):

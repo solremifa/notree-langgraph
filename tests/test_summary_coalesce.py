@@ -300,3 +300,65 @@ def test_stale_permit_cannot_move_attempted_until(tmp_path):
             assert (await e.api.tool("transcript_range", lecture_id=L, permit=new))["last_seq"] == 3
             assert (await lec(e))["attempted_until"] == 3
     asyncio.run(t())
+
+
+# ── 리뷰 2차 (2026-10-18): 사용자 재시도·저장 응답 유실 ───────────────
+def test_user_retry_does_not_collide_with_a_follow_up_summary(tmp_path):
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            a = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 1)))["enqueued_job_id"]
+            p = (await _start(e, a))["permit"]
+            await e.api.tool("job_fail", job_id=a, worker="w", reason="요약 실패", user_retryable=True, permit=p)
+            b = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(2, 2)))["enqueued_job_id"]
+            assert b
+            r = await e.api.tool("job_retry", job_id=a)               # 오류 없이, 되살리지 않고 이유를 알려 줌
+            assert r["revived"] is False and "후속" in r["reason"]
+            assert [s for _, s in summary_jobs(e)] == ["failed", "pending"]
+    asyncio.run(t())
+
+
+def test_user_retry_revives_only_when_no_other_summary_exists(tmp_path):
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            a = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 1)))["enqueued_job_id"]
+            p = (await _start(e, a))["permit"]
+            await e.api.tool("job_fail", job_id=a, worker="w", reason="요약 실패", user_retryable=True, permit=p)
+            assert (await e.api.tool("job_retry", job_id=a))["revived"] is True     # 다른 요약이 없으면 되살림
+            p = (await _start(e, a, worker="w2"))["permit"]
+            await e.api.tool("job_fail", job_id=a, worker="w2", reason="요약 실패", user_retryable=True, permit=p)
+            await e.api.tool("lecture_end", lecture_id=L, user_id=U)
+            r = await e.api.tool("job_retry", job_id=a)               # 녹음이 끝났으면 되살리지 않음
+            assert r["revived"] is False and "녹음" in r["reason"]
+    asyncio.run(t())
+
+
+class LostResponseMcp:
+    """지정한 도구를 실제로 실행한 뒤, 응답만 잃어버린 것처럼 처음 n번 예외를 던진다."""
+
+    def __init__(self, inner, lose: dict[str, int]):
+        self.inner, self.lose = inner, dict(lose)
+
+    async def tool(self, name, **args):
+        res = await self.inner.tool(name, **args)
+        if self.lose.get(name, 0) > 0:
+            self.lose[name] -= 1
+            raise ToolError(name, "unavailable", "응답 유실 (주입)", True)
+        return res
+
+    def __getattr__(self, item):
+        return getattr(self.inner, item)
+
+
+def test_lost_publish_response_ends_as_done_not_failed(tmp_path):
+    async def t():
+        async with Env(tmp_path) as e:
+            e.start_worker(cfg=RT, mcp=LostResponseMcp(e.m_w, {"summary_publish": 1}))
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            j = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 3)))["enqueued_job_id"]
+            assert await e.wait_state(j)
+            assert (await e.row(j))["state"] == "done"                 # 요약은 저장됐으니 작업도 완료
+            assert (await lec(e))["processed_until"] == 3 and ranges(e) == [(1, 3)]
+            assert LS.CALLS == [(1, 3)]                                # LLM은 한 번만
+    asyncio.run(t())

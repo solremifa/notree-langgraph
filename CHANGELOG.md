@@ -11,6 +11,11 @@
 
 ## 2026-10-18
 
+### 실시간 요약 리뷰 2차: 사용자 재시도 충돌, 저장 응답 유실 · (이번 커밋)
+- 🐛 `job_retry`가 실패한 요약을 되살릴 때 후속 요약이 대기 중이면 `UNIQUE constraint failed`로 깨짐 → 후속 요약이 있거나 녹음이 끝났으면 되살리지 않고 이유를 돌려줌
+- 🐛 `summary_publish` 응답만 유실되면 요약은 저장됐는데 작업은 failed(시도 한도 초과) → 같은 idem_key로 저장을 다시 보내 확인 (LLM은 다시 안 부름), 다시 실행돼도 `transcript_range.already_published`면 완료
+- 테스트 112 → 115개
+
 ### 실시간 요약 리뷰 반영: 작업↔강의 연결 확인, 재전송 재등록 막기 · `a1face6`
 자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md#리뷰-반영-3b1c00e-이후)
 
