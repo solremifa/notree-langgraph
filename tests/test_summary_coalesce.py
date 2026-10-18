@@ -362,3 +362,28 @@ def test_lost_publish_response_ends_as_done_not_failed(tmp_path):
             assert (await lec(e))["processed_until"] == 3 and ranges(e) == [(1, 3)]
             assert LS.CALLS == [(1, 3)]                                # LLM은 한 번만
     asyncio.run(t())
+
+
+# ── 리뷰 3차 (2026-10-18): 재시도와 커밋이 동시에 ───────────────────
+def test_retry_and_commit_racing_never_break_the_pending_rule(tmp_path):
+    """사용자 재시도(MCP 서버 A)와 새 전사 커밋(MCP 서버 B)을 동시에 30번. 매번 오류 없이, 대기 요약은 많아야 1개."""
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            async with McpClient(env=e.env) as m2:
+                await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+                seq = 0
+                for k in range(30):
+                    seq += 1
+                    j = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U,
+                                          segments=segs(seq, seq)))["enqueued_job_id"]
+                    p = (await _start(e, j, worker=f"w{k}"))["permit"]
+                    await e.api.tool("job_fail", job_id=j, worker=f"w{k}", reason="실패", user_retryable=True, permit=p)
+                    seq += 1
+                    r, c = await asyncio.gather(e.api.tool("job_retry", job_id=j),
+                                                m2.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(seq, seq)))
+                    assert len(summary_jobs(e, ("pending",))) == 1
+                    assert r["revived"] != bool(c["enqueued_job_id"])      # 둘 중 정확히 하나만 대기 요약을 만듦
+                    for jid, st in summary_jobs(e, ("pending",)):            # 다음 바퀴를 위해 정리
+                        p = (await _start(e, jid, worker=f"x{k}"))["permit"]
+                        await e.api.tool("job_finish", job_id=jid, worker=f"x{k}", permit=p)
+    asyncio.run(t())
