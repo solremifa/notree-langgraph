@@ -371,11 +371,16 @@ def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None
     return ok(C.JobCreateOut(job_id=job_id))
 
 
+def _pending_summary_clash(e: sqlite3.IntegrityError) -> bool:
+    """이 오류가 '강의당 대기 요약 1개'(jobs_one_pending_summary) 위반인가. 다른 UNIQUE·NOT NULL 위반과 구분한다."""
+    return str(e) == "UNIQUE constraint failed: jobs.lecture_id"
+
+
 def _insert_job(con, kind: str, payload: dict, user_id: str, stream: str | None = None,
                 lecture_id: str | None = None) -> str:
     """작업 의도 한 행. 업무 데이터를 쓰는 트랜잭션 안에서 부른다 (qa_ask처럼).
     실시간 요약은 lecture_id를 준다 → 대기 중 요약이 이미 있으면 sqlite3.IntegrityError (jobs_one_pending_summary)."""
-    job_id = f"op-{uuid.uuid4().hex[:8]}"
+    job_id = f"op-{uuid.uuid4().hex}"          # UUID 전체 (앞 8자리만 쓰면 7만여 건에서 충돌 확률 50%)
     now = time.time()
     if kind in KIND_DEADLINE_SEC and payload.get("deadline_at") is None:   # Q&A·채점: 요청부터 전체 90초
         payload = {**payload, "deadline_at": now + KIND_DEADLINE_SEC[kind]}
@@ -601,7 +606,9 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
             n = con.execute("UPDATE jobs SET state='pending', attempts=0, lease_owner=NULL, lease_until=NULL, "
                             "fail_reason=NULL, user_retryable=NULL, payload=?, updated_at=? WHERE job_id=? AND state='failed'",
                             (json.dumps(payload, ensure_ascii=False), time.time(), job_id)).rowcount
-        except sqlite3.IntegrityError:                       # 마지막 방어: 강의당 대기 요약 1개 (jobs_one_pending_summary)
+        except sqlite3.IntegrityError as e:                  # 마지막 방어: 강의당 대기 요약 1개 (jobs_one_pending_summary)
+            if not _pending_summary_clash(e):
+                raise
             return ok(C.JobRetryOut(revived=False, reason="후속 요약이 이미 있음 → 그 요약이 실패 구간부터 함께 처리함"))
         if n != 1:
             return ok(C.JobRetryOut(revived=False, reason="그사이 상태가 바뀜"))
@@ -653,7 +660,9 @@ def _enqueue_summary(con, lec: sqlite3.Row) -> str | None:
     try:
         return _insert_job(con, "live_summary", {"lecture_id": lec["lecture_id"]}, lec["user_id"],
                            lecture_id=lec["lecture_id"])
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
+        if not _pending_summary_clash(e):                    # 다른 제약(작업 ID 충돌 등)은 합치기가 아니다 → 그대로 오류
+            raise
         return None
 
 
@@ -839,7 +848,7 @@ def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) ->
 @tool
 def qa_ask(user_id: str, course_id: str, question: str) -> dict:
     """[api] 질문 행과 qa 작업 의도를 한 트랜잭션에. 마감은 job_create와 같은 규칙(요청 + 90초)."""
-    question_id = f"q-{uuid.uuid4().hex[:8]}"
+    question_id = f"q-{uuid.uuid4().hex}"
     now = time.time()
     with tx() as con:
         c = con.execute("SELECT user_id FROM qa_courses WHERE course_id=?", (course_id,)).fetchone()
@@ -924,7 +933,7 @@ def qa_complete(idem_key: str, question_id: str, expected_generation: int, statu
         _require_live(con, claims, q["job_id"])
         if q["generation"] != expected_generation:                 # 삭제(state=deleted)도 세대가 올라가 여기서 걸린다
             raise Reject(ErrorCode.GENERATION_MISMATCH, f"질문이 바뀜 (세대 {q['generation']} ≠ {expected_generation})")
-        answer_id = f"a-{uuid.uuid4().hex[:8]}"
+        answer_id = f"a-{uuid.uuid4().hex}"
         body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "citations": citations,
                 "sources": sources, "notice_code": notice_code}
         con.execute("UPDATE qa_questions SET state='answered', answer=?, answer_id=?, idem_key=?, updated_at=? "

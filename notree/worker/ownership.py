@@ -77,7 +77,7 @@ class Ownership:
     def __init__(self, redis, job_id: str, consumer: str, cfg: StreamConfig, msg_id: str) -> None:
         self.r, self.job_id, self.consumer, self.cfg, self.msg_id = redis, job_id, consumer, cfg, msg_id
         self.key = own_key(job_id)
-        self.token = f"{consumer}:{uuid.uuid4().hex[:8]}"
+        self.token = f"{consumer}:{uuid.uuid4().hex}"
         self.value: str | None = None                  # acquire 때 세대를 담아 정해진다
         self.epoch: int | None = None
         self.ttl_ms = int(cfg.lease_sec * 1000)

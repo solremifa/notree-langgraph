@@ -12,7 +12,7 @@ from notree.graphs.qa import FakeRetriever, build_qa_graph
 from notree.graphs.qa.llm import FakeQALLM
 from notree.graphs.qa import QAFatal, SearchForbidden, SearchUnavailable  # noqa: E402
 from notree.graphs.qa import graph as G  # noqa: E402
-from notree.graphs.qa.graph import INSUFFICIENT_TEXT, TIMEOUT_TEXT, render  # noqa: E402
+from notree.graphs.qa.graph import INSUFFICIENT_TEXT, TIMEOUT_TEXT, clean_sentences, render  # noqa: E402
 from notree.graphs.qa.llm import NOT_FOUND_TEXT  # noqa: E402
 from notree.graphs.qa.retriever import sample_corpus
 
@@ -392,3 +392,20 @@ def test_same_id_from_different_sources_never_swaps_the_cited_text():
     assert out["citations"] == ["same"]
     assert src["same"]["source"] == "note" and src["same"]["text"] == "스택은 LIFO이다"      # 인용한 원문 그대로
     assert any("ID 충돌" in s for s in out.get("skipped", []))
+
+
+# ── 리뷰 6차 ④ (2026-10-19): 인용 표시 정제가 코드·인덱싱을 바꾸지 않는다 ─────────────────
+
+@pytest.mark.parametrize("text, cleaned", [
+    ("value = a[n1]", "value = a[n1]"),                                   # 변수 인덱싱 (리뷰 재현)
+    ("행렬은 m[i][n1]로 읽는다 [n1]", "행렬은 m[i][n1]로 읽는다"),          # 인덱싱은 두고 문장 끝 인용만
+    ("`x = a[n1]`를 쓴다 [t1]", "`x = a[n1]`를 쓴다"),                     # 인라인 코드
+    ("```py\nb = a[n1]  # [^n1]\n```\n끝 [^t1]", "```py\nb = a[n1]  # [^n1]\n```\n끝"),   # 코드 블록
+    ("정규식 `[^a-z]`는 소문자가 아닌 글자", "정규식 `[^a-z]`는 소문자가 아닌 글자"),   # 코드 속 [^..]
+    ("f(x)[n1] 값", "f(x)[n1] 값"),
+    ("스택은 LIFO다[n1]", "스택은 LIFO다"),                                 # 한글 바로 뒤는 인용
+    ("스택은 LIFO다 [n1].", "스택은 LIFO다."),
+])
+def test_clean_keeps_code_and_indexing(text, cleaned):
+    out = clean_sentences([{"text": text, "citations": ["n1"]}], known_ids={"n1", "t1"})
+    assert out[0]["text"] == cleaned and out[0]["citations"] == ["n1"]

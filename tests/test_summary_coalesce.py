@@ -387,3 +387,25 @@ def test_retry_and_commit_racing_never_break_the_pending_rule(tmp_path):
                         p = (await _start(e, jid, worker=f"x{k}"))["permit"]
                         await e.api.tool("job_finish", job_id=jid, worker=f"x{k}", permit=p)
     asyncio.run(t())
+
+
+def test_id_collision_is_not_mistaken_for_a_pending_summary(tmp_path, monkeypatch):
+    """리뷰 6차 ④: 요약 등록의 IntegrityError는 '대기 요약이 이미 있음'일 때만 합치기로 본다.
+    작업 ID가 겹치면(앞 8자리만 쓰던 때 가능) 조용히 합쳐진 척하지 않고 오류. ID는 이제 UUID 전체."""
+    import sqlite3
+    import uuid
+
+    from notree.mcp_server import server as srv
+    monkeypatch.setattr(srv, "DB", tmp_path / "ids.db")
+    srv._init_db()
+    with srv.tx() as con:
+        con.execute("INSERT INTO lectures(lecture_id, user_id, state, updated_at) VALUES('L','u','recording',0)")
+        con.execute("INSERT INTO lectures(lecture_id, user_id, state, updated_at) VALUES('M','u','recording',0)")
+        first = srv._enqueue_summary(con, con.execute("SELECT * FROM lectures WHERE lecture_id='L'").fetchone())
+        assert first and len(first) == len("op-") + 32
+        assert srv._enqueue_summary(con, con.execute("SELECT * FROM lectures WHERE lecture_id='L'").fetchone()) is None
+    fixed = uuid.UUID(first[3:])
+    monkeypatch.setattr(srv.uuid, "uuid4", lambda: fixed)         # 다른 강의인데 같은 작업 ID가 나옴
+    with pytest.raises(sqlite3.IntegrityError, match="jobs.job_id"):
+        with srv.tx() as con:
+            srv._enqueue_summary(con, con.execute("SELECT * FROM lectures WHERE lecture_id='M'").fetchone())

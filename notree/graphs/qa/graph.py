@@ -97,17 +97,30 @@ def label_for(related: bool, cited: list[HitDict]) -> str:
 
 
 _FOOTNOTE = re.compile(r"\s*\[\^[^\[\]\s]{1,40}\]")
+_CODE = re.compile(r"```.*?(?:```|$)|`[^`\n]*`", re.S)     # 코드 블록·인라인 코드 (닫히지 않은 블록은 끝까지)
+_INDEXED = r"(?<![A-Za-z0-9_\])}])"    # 바로 앞이 영문·숫자·_·닫는 괄호면 인덱싱(a[n1], f(x)[n1]) → 내용. 한글 뒤(…다[n1])는 인용
+
+
+def _strip_marks(prose: str, ids: set[str]) -> str:
+    prose = _FOOTNOTE.sub("", prose)
+    for i in ids:
+        prose = re.sub(r"\s*" + _INDEXED + r"\[" + re.escape(i) + r"\]", "", prose)
+    return prose
 
 
 def clean_sentences(sentences: list[dict], known_ids: set[str] | frozenset = frozenset()) -> list[dict]:
     """LLM이 문장 text에 넣은 인용 표시를 지운 문장 목록. 화면은 이 text를 그대로 그리고, 출처는 citations로만 만든다.
-    지우는 것: [^..] 형식, 이번 근거·인용 ID와 정확히 같은 [ID]. 그 밖의 대괄호(a[0], [1, 2, 3], 구간 [0, 1])는 내용이라 둔다."""
+    지우는 것: 일반 문장 속 [^..] 형식, 이번 근거·인용 ID와 정확히 같은 [ID] (앞이 공백·문장 시작·문장부호일 때).
+    두는 것: 코드 블록(```)과 인라인 코드(`) 안 전부, 영문·숫자·_·닫는 괄호 바로 뒤의 [ID](a[n1] 같은 인덱싱. 그래서 'LIFO[n1]'도 남는다),
+    그 밖의 대괄호(a[0], [1, 2, 3], 구간 [0, 1]) — 모두 답변 내용이다 (2026-10-19 리뷰 6차 ④)."""
     out = []
     for s in sentences:
         ids = list(dict.fromkeys(s.get("citations") or []))
-        text = _FOOTNOTE.sub("", s["text"])
-        for i in set(known_ids) | set(ids):
-            text = re.sub(r"\s*\[" + re.escape(i) + r"\]", "", text)
+        marks, text, pos = set(known_ids) | set(ids), "", 0
+        for m in _CODE.finditer(s["text"]):
+            text += _strip_marks(s["text"][pos:m.start()], marks) + m.group(0)
+            pos = m.end()
+        text += _strip_marks(s["text"][pos:], marks)
         if text.strip():
             out.append({"text": text.strip(), "citations": ids})
     return out
