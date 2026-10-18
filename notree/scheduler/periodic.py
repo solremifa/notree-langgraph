@@ -30,19 +30,29 @@ async def resend_stale(r, mcp: McpClient, reserved_sec: float = S.RESEND_RESERVE
 REDIS_MARKER = "notree:redis-alive"     # 이 키가 없으면 Redis가 새로 시작됐거나 초기화된 것 (비영속 Redis)
 
 
-async def recover_after_redis_loss(r, mcp: McpClient) -> int:
-    """표시 키가 없으면 DB에서 전달 상태를 다시 만든 뒤 표시 키를 남긴다. 다시 보낸 작업 수.
-    처음 배포할 때도 한 번 돈다 (새 Redis와 지워진 Redis를 구분할 수 없음) — 중복 메시지는 job_start가 걸러 낸다."""
-    if await r.exists(REDIS_MARKER):
-        return 0
-    res = await mcp.tool("job_recover_orphans")
-    for j in res["jobs"]:
-        msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
-        log("recover", f"{j['job_id']} [{j['kind']}] Redis 유실 복구 → 다시 XADD {j['stream']} {msg_id}")
-    if res["failed"]:
-        log("recover", f"마감·시도 한도로 실패 확정: {res['failed']}")
-    await r.set(REDIS_MARKER, "1")
-    return len(res["jobs"])
+async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
+    """매 주기. 표시 키가 없으면 Redis 초기화를 '발견'한 것 → DB에 복구 기준 시각을 남기고(start) 표시 키를 둔다.
+    복구가 '끝났는지'는 DB가 안다 (보류된 running이 남아 있으면 open) → 열려 있는 동안 매 주기 다시 확인한다.
+    쪽 단위로 끝까지 돈다. 다시 보낸 작업 수.
+    처음 배포할 때도 한 번 시작된다 (새 Redis와 지워진 Redis를 구분할 수 없음) — 중복 메시지는 job_start가 걸러 낸다."""
+    start = not await r.exists(REDIS_MARKER)
+    sent, after = 0, None
+    while True:
+        res = await mcp.tool("job_recover_orphans", start=start, after=after, limit=page)
+        start = False                                   # 기준 시각은 첫 쪽에서만 새로
+        for j in res["jobs"]:
+            msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
+            log("recover", f"{j['job_id']} [{j['kind']}] Redis 유실 복구 → 다시 XADD {j['stream']} {msg_id}")
+        sent += len(res["jobs"])
+        if res["failed"]:
+            log("recover", f"마감·시도 한도로 실패 확정: {res['failed']}")
+        if not res.get("next_after"):
+            break
+        after = res["next_after"]
+    if res.get("held"):
+        log("recover", f"lease가 살아 있는 작업 {res['held']}개는 보류 → 다음 주기에 다시 확인")
+    await r.set(REDIS_MARKER, "1")                      # 기준 시각을 DB에 남긴 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시 시작)
+    return sent
 
 
 async def recover_summaries(mcp: McpClient) -> int:

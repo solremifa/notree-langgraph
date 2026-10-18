@@ -146,3 +146,68 @@ def test_orphaned_jobs_are_resent_after_redis_wipe(tmp_path, redis_url):
             assert await e.wait_state(running, ("done",)) and await e.wait_state(sent, ("done",))
             assert (await e.row(running))["attempts"] == 2
     asyncio.run(t())
+
+
+# ── 리뷰 3차: 복구 '발견'과 '완료'를 나눔 ──────────────────────────
+@real_redis
+def test_job_with_live_lease_at_first_recovery_is_rechecked_after_it_expires(tmp_path, redis_url):
+    """DB 모드: worker가 죽고 Redis도 유실됐는데 DB lease는 아직 남아 있음 → 첫 복구는 보류,
+    lease가 끝난 뒤의 주기에서 다시 보낸다 (표시 키가 생겼다고 복구가 끝난 게 아님)."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            j = await e.job({"text": "held"})
+            await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream)
+            await e.api.tool("job_mark_sent", job_id=j)
+            await e.api.tool("job_start", job_id=j, worker="dead", lease_sec=1.5)   # 죽었지만 lease는 1.5초 남음
+            await e.r.flushall()
+            assert await recover_after_redis_loss(e.r, e.api) == 0       # 보류
+            assert (await e.row(j))["state"] == "running"
+            await asyncio.sleep(1.7)
+            assert await recover_after_redis_loss(e.r, e.api) == 1       # lease가 끝난 뒤 다시 확인해 보냄
+            assert await recover_after_redis_loss(e.r, e.api) == 0       # 복구 끝
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",))
+    asyncio.run(t())
+
+
+@real_redis
+def test_recovery_walks_past_the_page_limit(tmp_path, redis_url):
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            jobs = [await e.job({"text": str(i)}) for i in range(7)]
+            await e.api.tool("job_reserve_pending", limit=10, stream=RT.stream)
+            for j in jobs:
+                await e.api.tool("job_mark_sent", job_id=j)
+            await e.r.flushall()
+            assert await recover_after_redis_loss(e.r, e.api, page=3) == 7   # 3개씩 끝까지
+            assert await e.r.xlen(RT.stream) == 7
+    asyncio.run(t())
+
+
+@real_redis
+def test_jobs_started_after_the_wipe_are_not_touched_by_an_open_recovery(tmp_path, redis_url):
+    """복구가 열려 있는 동안(보류 작업 있음) 새로 시작한 작업은 대상이 아니다 — Redis 소유 키 모드처럼
+    lease_sec=0이라 DB lease로는 살아 있는지 알 수 없는 작업도 다시 보내지 않는다."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            held = await e.job({"text": "held"})
+            await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream)
+            await e.api.tool("job_start", job_id=held, worker="dead", lease_sec=5)
+            await e.r.flushall()
+            assert await recover_after_redis_loss(e.r, e.api) == 0       # 복구 열림 (held 보류)
+            await asyncio.sleep(0.05)
+            new = await e.job({"text": "new"})
+            await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream)
+            await e.api.tool("job_start", job_id=new, worker="alive", lease_sec=0)
+            assert await recover_after_redis_loss(e.r, e.api) == 0
+            assert (await e.row(new))["state"] == "running" and (await e.row(new))["attempts"] == 1
+    asyncio.run(t())
