@@ -127,6 +127,15 @@ class JobRetryOut(BaseModel):
     reason: str | None = None
 
 
+class JobRecoverIn(BaseModel):
+    limit: int = 500
+
+
+class JobRecoverOut(BaseModel):
+    jobs: list[ReservedJob] = Field(description="다시 XADD할 작업 (sent로 표시됨)")
+    failed: list[str] = Field(description="마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업")
+
+
 class JobRow(BaseModel):
     found: bool
     job_id: str | None = None
@@ -583,6 +592,8 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("job_reserve_pending", JobReservePendingIn, JobListOut, SCH, "control", LEAD, summary="대기 의도 → 실행 허가. stream을 주면 그 레인만 (배정기가 레인별로 부름)"),
     ToolSpec("job_mark_sent", JobIdIn, JobMarkSentOut, SCH, "control", LEAD, summary="XADD 후 전송 완료 표시"),
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
+    ToolSpec("job_recover_orphans", JobRecoverIn, JobRecoverOut, SCH, "control", LEAD,
+             summary="Redis 통째 유실 뒤: reserved·sent·lease 끝난 running을 다시 보낼 목록. 마감·시도 한도는 실패 확정"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
              summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,

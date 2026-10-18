@@ -11,6 +11,15 @@
 
 ## 2026-10-18
 
+### 배정·회수·Redis 유실 복구 · (이번 커밋)
+자세히: [docs/changes/2026-10-18-dispatch-recovery.md](docs/changes/2026-10-18-dispatch-recovery.md) (브랜치 `fix/dispatch-recovery`)
+
+- 🐛 배정기가 둘 이상이면 같은 작업을 두 번 허가하고 끝난 작업을 reserved로 되돌릴 수 있었음 → 한 트랜잭션 + `WHERE state='pending'`
+- 🐛 `XAUTOCLAIM` 다음 탐색 위치를 버려 앞쪽 PEL 10개가 살아 있으면 뒤의 죽은 메시지를 못 찾음 → Stream별로 위치 보관
+- 🐛 Redis 초기화 뒤 worker가 `NOGROUP`만 반복 → group 다시 만듦
+- 🆕 `job_recover_orphans` + scheduler의 Redis 유실 감지(표시 키): reserved·sent·lease 끝난 running을 다시 보냄, 마감·시도 한도는 실패 확정
+- 테스트 115 → 119개
+
 ### 실시간 요약 리뷰 2차: 사용자 재시도 충돌, 저장 응답 유실 · `501442d`
 - 🐛 `job_retry`가 실패한 요약을 되살릴 때 후속 요약이 대기 중이면 `UNIQUE constraint failed`로 깨짐 → 후속 요약이 있거나 녹음이 끝났으면 되살리지 않고 이유를 돌려줌
 - 🐛 `summary_publish` 응답만 유실되면 요약은 저장됐는데 작업은 failed(시도 한도 초과) → 같은 idem_key로 저장을 다시 보내 확인 (LLM은 다시 안 부름), 다시 실행돼도 `transcript_range.already_published`면 완료

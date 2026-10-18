@@ -62,6 +62,7 @@ class Worker:
         self.borrow = borrow if borrow_slots > 0 else None
         self.borrow_slots = min(borrow_slots, self.concurrency - 1) if self.borrow else 0   # 자기 몫 최소 1개
         self.borrowed = 0                         # 지금 실행 중인 빌린 작업 수
+        self.claim_cursor: dict[str, str] = {}    # Stream별 XAUTOCLAIM 다음 탐색 위치 (한 번에 PEL을 COUNT×10개까지만 봄)
 
     # ── 메인 루프 ──
     async def run(self, stop: asyncio.Event) -> str:
@@ -83,6 +84,14 @@ class Worker:
                 msg = None if stop.is_set() else await self._next()
             except Exception as e:                        # Redis·네트워크 일시 장애: 루프는 죽지 않는다
                 slots.release()
+                if "NOGROUP" in str(e):                   # Redis가 초기화돼 consumer group이 사라짐 → 다시 만든다
+                    log("error", "consumer group 없음 (Redis 초기화?) → 다시 만들고 계속")
+                    self.claim_cursor.clear()
+                    try:
+                        await self._ensure_group()
+                        continue
+                    except Exception as e2:
+                        log("error", f"group 다시 만들기 실패({type(e2).__name__}: {e2})")
                 log("error", f"메시지 가져오기 실패({type(e).__name__}: {e}) → 1초 뒤 재시도")
                 await asyncio.sleep(1)
                 continue
@@ -155,8 +164,12 @@ class Worker:
         return how if cfg is self.cfg else f"빌림·{how}"
 
     async def _claim(self, cfg: StreamConfig):
-        _, claimed, _ = await self.r.xautoclaim(cfg.stream, S.GROUP, self.name,
-                                                min_idle_time=cfg.claim_idle_ms, start_id="0-0", count=1)
+        """방치 메시지 회수. Redis는 한 번에 PEL을 COUNT×10개까지만 살피고 다음 위치를 돌려준다 → 그 위치를 Stream별로
+        보관해 다음 호출에서 이어 찾는다 (앞쪽에 살아 있는 메시지가 많아도 뒤의 죽은 메시지까지 닿게). 끝까지 보면 0-0."""
+        start = self.claim_cursor.get(cfg.stream, "0-0")
+        nxt, claimed, _ = await self.r.xautoclaim(cfg.stream, S.GROUP, self.name,
+                                                  min_idle_time=cfg.claim_idle_ms, start_id=start, count=1)
+        self.claim_cursor[cfg.stream] = nxt
         if not claimed:
             return None
         msg_id, fields = claimed[0]

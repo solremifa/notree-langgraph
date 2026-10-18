@@ -35,7 +35,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # 저장소 루트 (파일 경로로 직접 띄워질 때 notree import)
-from notree.common.settings import KIND_DEADLINE_SEC  # noqa: E402
+from notree.common.settings import KIND_DEADLINE_SEC, STREAMS, max_attempts_for  # noqa: E402
 from notree.contracts import tools as C  # noqa: E402
 from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
 
@@ -387,17 +387,23 @@ def job_reserve_pending(limit: int = 10, stream: str | None = None) -> dict:
     # 대기 1개는 앞 요약이 끝난 뒤 허가되고, 시작할 때 그때까지 쌓인 전사를 한꺼번에 읽는다 (업무 규칙은 서비스에서)
     gate = (" AND NOT (kind='live_summary' AND EXISTS (SELECT 1 FROM jobs j2 WHERE j2.kind='live_summary' "
             "AND j2.lecture_id=jobs.lecture_id AND j2.state IN ('reserved','sent','running')))")
-    with db() as con:
+    # 조회와 허가를 한 쓰기 트랜잭션에, 갱신은 state='pending'일 때만 → 배정기가 둘 이상이어도 같은 작업을 두 번
+    # 허가하지 않고, 늦게 도착한 갱신이 끝난 작업을 되돌리지 못한다. 실제로 허가한 것만 돌려준다.
+    # (PG: UPDATE ... WHERE state='pending' RETURNING 또는 SELECT ... FOR UPDATE SKIP LOCKED)
+    with tx() as con:
         if stream is None:
             rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending'" + gate +
                                " ORDER BY created LIMIT ?", (limit,)).fetchall()
         else:
             rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' AND stream=?" + gate +
                                " ORDER BY created LIMIT ?", (stream, limit)).fetchall()
+        got = []
         for r in rows:
-            _set(con, r["job_id"], state="reserved")
-            _log(con, "job_reserve_pending", r["job_id"])
-        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in rows]))
+            if con.execute("UPDATE jobs SET state='reserved', updated_at=? WHERE job_id=? AND state='pending'",
+                           (time.time(), r["job_id"])).rowcount == 1:
+                got.append(r)
+                _log(con, "job_reserve_pending", r["job_id"])
+        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in got]))
 
 
 @tool
@@ -502,6 +508,37 @@ def job_release(job_id: str, worker: str, reason: str, permit: str | None = None
                           (reason, time.time(), job_id, worker))
         _log(con, "job_release", job_id)
         return ok(C.JobReleaseOut(released=cur.rowcount == 1))
+
+
+@tool
+def job_recover_orphans(limit: int = 500) -> dict:
+    """[scheduler] Redis가 통째로 사라진 뒤: Redis에만 있던 전달 상태를 DB에서 다시 만든다.
+    대상 = reserved·sent, 그리고 lease가 끝난 running (실행하던 worker도 메시지도 없다고 본다. DB 모드에서 lease가
+    살아 있는 running은 worker가 실행 중이므로 건드리지 않는다. Redis 소유 키 모드는 lease_sec=0이라 모두 대상 →
+    실행 중이던 것도 다시 계산될 수 있다 — 늦은 쓰기는 exec_epoch가 막는다).
+    다시 보내기 전에 확인: 마감(deadline_at)이 지났으면 실패 확정(다시 시도 가능), running인데 시도 한도를 다 썼으면 실패 확정.
+    돌려준 작업은 sent로 표시한다 → scheduler가 XADD."""
+    now = time.time()
+    cfg_of = {c.stream: c for c in STREAMS.values()}
+    with tx() as con:
+        rows = con.execute("SELECT * FROM jobs WHERE state IN ('reserved','sent') OR (state='running' AND "
+                           "COALESCE(lease_until, 0) < ?) ORDER BY created LIMIT ?", (now, limit)).fetchall()
+        resend, failed = [], []
+        for r in rows:
+            deadline = json.loads(r["payload"] or "{}").get("deadline_at")
+            cfg = cfg_of.get(r["stream"])
+            limit_n = max_attempts_for(r["kind"], cfg) if cfg else 3
+            reason = ("마감 시각 지남 (Redis 유실 복구)" if deadline is not None and deadline <= now else
+                      "시도 한도 초과 (Redis 유실 복구)" if r["state"] == "running" and r["attempts"] >= limit_n else None)
+            if reason:
+                _set(con, r["job_id"], state="failed", lease_until=None, fail_reason=reason, user_retryable=1)
+                failed.append(r["job_id"])
+            else:
+                _set(con, r["job_id"], state="sent", lease_until=None)
+                resend.append(r)
+            _log(con, "job_recover_orphans", r["job_id"])
+        return ok(C.JobRecoverOut(jobs=[C.ReservedJob(job_id=r["job_id"], kind=r["kind"], stream=r["stream"])
+                                        for r in resend], failed=failed))
 
 
 @tool

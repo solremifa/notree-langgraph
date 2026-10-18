@@ -31,6 +31,7 @@
 | `job_reserve_pending` | 작업 제어 | scheduler | worker 담당 |  |  | 구현 |
 | `job_mark_sent` | 작업 제어 | scheduler | worker 담당 |  |  | 구현 |
 | `job_resend_stale` | 작업 제어 | scheduler | worker 담당 |  |  | 구현 |
+| `job_recover_orphans` | 작업 제어 | scheduler | worker 담당 |  |  | 구현 |
 | `job_start` | 작업 제어 | worker | worker 담당 |  |  | 구현 |
 | `job_heartbeat` | 작업 제어 | worker | worker 담당 |  |  | 구현 |
 | `job_finish` | 작업 제어 | worker | worker 담당 |  |  | 구현 |
@@ -149,6 +150,25 @@ XADD 후 전송 완료 표시
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | `jobs` | `list[ReservedJob]` |  |
+
+### `job_recover_orphans`
+
+작업 제어 · 호출: scheduler · 정의: worker 담당
+
+Redis 통째 유실 뒤: reserved·sent·lease 끝난 running을 다시 보낼 목록. 마감·시도 한도는 실패 확정
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `limit` | `int` = 500 |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `jobs` | `list[ReservedJob]` | 다시 XADD할 작업 (sent로 표시됨) |
+| `failed` | `list[str]` | 마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업 |
 
 ### `job_start`
 
