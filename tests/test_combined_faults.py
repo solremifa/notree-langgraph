@@ -74,3 +74,31 @@ def test_resent_orphan_runs_with_a_new_epoch_after_redis_wipe(tmp_path, redis_ur
             stats = (await e.api.tool("tool_stats", thread_id=j))["counts"]
             assert stats.get("job_finish", 0) == 1
     asyncio.run(t())
+
+
+def test_pre_wipe_message_late_start_in_redis_liveness_mode(tmp_path, redis_url, monkeypatch):  # noqa: F811
+    """리뷰 4차 순서를 Redis 소유 키 모드에서: 초기화 전 전달 → 초기화 → 복구 시작(새 세대로 다시 보냄)
+    → 이전 세대 메시지가 늦게 도착. worker는 이전 세대 메시지로 DB 시작을 하지 않고(세대·시도 안 씀) ACK,
+    작업은 새 세대 메시지로 한 번 실행·완료. 멈춘 작업·남은 소유 키 없음."""
+    monkeypatch.setattr(S, "LIVENESS", "redis")
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            j = await e.job({"text": "late"})
+            old = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"][0]["gen"]
+            await e.api.tool("job_mark_sent", job_id=j)
+            await e.r.flushall()
+            assert await recover_after_redis_loss(e.r, e.api) == 1
+            await e.r.xadd(RT.stream, {"job_id": j, "gen": str(old)})
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+            for _ in range(40):
+                if (await e.r.xpending(RT.stream, S.GROUP))["pending"] == 0:
+                    break
+                await asyncio.sleep(0.1)
+            row = await e.row(j)
+            assert row["attempts"] == 1 and row["exec_epoch"] == 1
+            assert (await e.r.xpending(RT.stream, S.GROUP))["pending"] == 0
+            assert [k async for k in e.r.scan_iter("notree:own:*")] == []
+    asyncio.run(t())
