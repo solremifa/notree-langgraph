@@ -306,3 +306,38 @@ def test_generation_is_remembered_per_stream_not_just_per_message_id(redis_url):
         assert a[0] == b[0] == "5-0"
         assert w._pop_gen(QA, "5-0") == 2 and w._pop_gen(RT, "5-0") == 1
     asyncio.run(t())
+
+
+# ── 리뷰 5차: 전달 세대 없는 메시지 ──────────────────────────────
+def test_message_without_generation_is_refused_then_resent_with_one(tmp_path):
+    """운영 worker는 세대 없는 메시지로 시작하지 않는다 (어느 Redis 세대에서 왔는지 모름) → ACK.
+    작업은 sent로 남아 재전송이 세대를 붙여 다시 보내고, 그 메시지로 완료된다."""
+    from notree.scheduler.periodic import resend_stale
+
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            j = await e.job({"text": "legacy"})
+            await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream)
+            await e.api.tool("job_mark_sent", job_id=j)
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            await e.r.xadd(RT.stream, {"job_id": j})                     # 세대 없음 (예전 형식)
+            e.start_worker(cfg=RT)
+            await asyncio.sleep(1.0)
+            row = await e.row(j)
+            assert row["state"] == "sent" and row["attempts"] == 0      # 시작 안 함
+            assert await e.pending() == 0                               # ACK함
+            assert await resend_stale(e.r, e.api, reserved_sec=0, sent_sec=0) == 1
+            assert await e.wait_state(j, ("done",))
+    asyncio.run(t())
+
+
+def test_legacy_messages_are_accepted_only_when_explicitly_allowed(tmp_path):
+    async def t():
+        async with Env(tmp_path, allocator=False) as e:
+            j = await e.job({"text": "legacy"})
+            await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream)
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            await e.r.xadd(RT.stream, {"job_id": j})
+            e.start_worker(cfg=RT, allow_legacy=True)                    # 전환 기간·개발 도구에서만
+            assert await e.wait_state(j, ("done",))
+    asyncio.run(t())

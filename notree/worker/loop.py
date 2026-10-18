@@ -46,7 +46,8 @@ class Worker:
     def __init__(self, name: str, cfg: StreamConfig, redis, mcp: McpClient, *,
                  concurrency: int | None = None, block_ms: int = 1000, extras: dict | None = None,
                  shutdown_grace_sec: float | None = None,
-                 borrow: StreamConfig | None = None, borrow_slots: int = 0) -> None:
+                 borrow: StreamConfig | None = None, borrow_slots: int = 0,
+                 allow_legacy: bool | None = None) -> None:
         self.name = f"{cfg.key}-{name}"          # consumer 이름 = lease 소유자 이름
         self.cfg = cfg
         self.r = redis
@@ -62,6 +63,7 @@ class Worker:
         self.borrow = borrow if borrow_slots > 0 else None
         self.borrow_slots = min(borrow_slots, self.concurrency - 1) if self.borrow else 0   # 자기 몫 최소 1개
         self.borrowed = 0                         # 지금 실행 중인 빌린 작업 수
+        self.allow_legacy = S.ALLOW_LEGACY_MESSAGES if allow_legacy is None else allow_legacy   # 세대 없는 메시지 허용
         self.claim_cursor: dict[str, str] = {}    # Stream별 XAUTOCLAIM 다음 탐색 위치 (한 번에 PEL을 COUNT×10개까지만 봄)
         # (Stream, 메시지 ID) → 전달 세대. 메시지 ID는 Stream마다 따로 매겨져 빌린 레인과 겹칠 수 있다 → Stream도 키에 넣는다
         self.msg_gen: dict[tuple[str, str], int] = {}
@@ -225,6 +227,11 @@ class Worker:
         ACTOR.set(self.name)
         cfg = cfg or self.cfg                     # 이 메시지가 온 레인의 설정 (빌린 작업이면 빌려 온 레인)
         gen = self._pop_gen(cfg, msg_id)
+        if gen is None and not self.allow_legacy:  # 세대 없는 메시지: 어느 Redis 세대에서 왔는지 알 수 없음
+            await self._ack(msg_id, cfg)
+            log("skip", f"{job_id}: 전달 세대가 없는 메시지 → 시작 안 함, ACK (재전송이 세대를 붙여 다시 보냄. "
+                        f"전환 기간이면 NOTREE_ALLOW_LEGACY_MESSAGES=1)")
+            return
         st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec,
                                  **({"dispatch_gen": gen} if gen is not None else {}))
         if st["status"] == "stale_dispatch":     # Redis 유실 전에 보낸 메시지 → 복구가 새 세대로 다시 보냈거나 보낼 것

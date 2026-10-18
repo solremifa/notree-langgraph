@@ -15,6 +15,9 @@ REDIS_URL = os.getenv("NOTREE_REDIS_URL", "redis://localhost:6379/0")
 MCP_URL = os.getenv("NOTREE_MCP_URL", "http://127.0.0.1:8765/mcp")
 GROUP = os.getenv("NOTREE_GROUP", "workers")          # Redis consumer group 이름 (worker 종류별 Stream 공통)
 SHUTDOWN_GRACE_SEC = _f("NOTREE_SHUTDOWN_GRACE_SEC", 30)  # 종료 신호 후 하던 작업을 기다려 주는 시간
+# 전달 세대(gen)가 없는 메시지 허용 여부. 운영 worker는 기본 거절 (시작 안 하고 ACK → 재전송이 세대를 붙여 다시 보냄).
+# 세대 도입 전 메시지가 남은 전환 기간이나, 가짜 MCP로 도는 개발 도구(lane_bench)에서만 1로 켠다.
+ALLOW_LEGACY_MESSAGES = os.getenv("NOTREE_ALLOW_LEGACY_MESSAGES", "0") == "1"
 
 
 @dataclass(frozen=True)

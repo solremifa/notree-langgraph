@@ -11,6 +11,11 @@
 
 ## 2026-10-18
 
+### 전달 세대 없는 메시지는 기본 거절 · (이번 커밋)
+- 🔧 운영 worker는 `gen` 없는 메시지로 시작하지 않고 ACK (재전송이 세대를 붙여 다시 보냄). 예전 메시지 허용은 `NOTREE_ALLOW_LEGACY_MESSAGES=1` 또는 `Worker(allow_legacy=True)`로만
+- ⚠️ 세대 없이 XADD하는 도구는 허용 설정이 필요 (`lane_bench`는 `allow_legacy=True`로 바꿈)
+- 테스트 → 129개
+
 ### 전달 세대를 Stream별로 기억 · `8a74f28`
 - 🐛 worker가 메시지의 전달 세대를 메시지 ID만으로 기억 → Stream마다 ID가 따로 매겨져, 빌려 쓰는 worker는 두 Stream의 같은 ID를 함께 들 수 있음 → 한쪽 세대가 덮어써 정상 메시지를 이전 세대로 잘못 거절·ACK할 수 있었음 → (Stream, ID)로 기억. 실제 Redis에서 두 Stream에 같은 ID `5-0`으로 확인
 - 테스트 → 127개
