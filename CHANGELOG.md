@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### 전달 세대 없는 메시지는 기본 거절 · (이번 커밋)
+### 전달 세대 없는 메시지는 기본 거절 · `f7a957a`
 - 🔧 운영 worker는 `gen` 없는 메시지로 시작하지 않고 ACK (재전송이 세대를 붙여 다시 보냄). 예전 메시지 허용은 `NOTREE_ALLOW_LEGACY_MESSAGES=1` 또는 `Worker(allow_legacy=True)`로만
 - ⚠️ 세대 없이 XADD하는 도구는 허용 설정이 필요 (`lane_bench`는 `allow_legacy=True`로 바꿈)
 - 테스트 → 129개
