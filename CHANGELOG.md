@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### 통합 시험: 결합 장애 (실제 Redis) · (이번 커밋)
+### 통합 시험: 결합 장애 (실제 Redis) · `91cec9e`
 자세히: [docs/changes/2026-10-18-integration.md](docs/changes/2026-10-18-integration.md) (브랜치 `integ/2026-10-18` = summary-coalesce + dispatch-recovery + redis-heartbeat)
 
 - 🆕 결합 장애 시험 2개: 소유 키 모드에서 요약 중 Redis 초기화 + 새 커밋 + 유실 복구, 다시 보낸 작업의 펜싱 복원
