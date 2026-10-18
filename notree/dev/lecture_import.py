@@ -1,6 +1,7 @@
 """Notree 강의 노트 내보내기(.md)를 검색용 문서로 바꾼다.
 
     uv run python -m notree.dev.lecture_import data/lectures/*.md --out data/qa_docs.jsonl
+    uv run python -m notree.dev.lecture_import data/lectures --out data/qa_docs.jsonl     # 폴더 (PowerShell은 *를 펼치지 않음)
     uv run python -m notree.dev.lecture_import data/lectures/ml-1001-am.md --show      # 구간 제목만 훑기
 
 파일 이름이 `<과목>-<강의>.md`면 과목 id = `<과목>`, 강의 id = 파일 이름 (예: ml-1001-am.md → ml, ml-1001-am).
@@ -80,7 +81,11 @@ def main() -> None:
     ap.add_argument("--show", action="store_true", help="구간 번호와 제목만 출력")
     a = ap.parse_args()
     docs = []
-    for f in a.files:
+    files = []
+    for f in a.files:                        # 폴더면 안의 .md 전부, *가 남아 있으면(PowerShell) 직접 펼침
+        p = Path(f)
+        files += sorted(p.glob("*.md")) if p.is_dir() else sorted(Path().glob(f)) if "*" in f else [p]
+    for f in files:
         lec = parse_export(f)
         finals = sum(n["kind"] == "final" for n in lec["notes"])
         print(f"{lec['lecture']:<14} {lec['title'][:20]:<20} {lec['date']:<26} 최종 노트 {finals:3} · 요약 구간 {len(lec['notes']) - finals:3} · "

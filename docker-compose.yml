@@ -1,5 +1,12 @@
-# 진짜 Redis로 여러 프로세스를 띄워 보고 싶을 때:  docker compose up -d
+# 진짜 Redis로 여러 프로세스를 띄워 보고 싶을 때:  docker compose up -d redis
+# Q&A 검색(PG) 평가:                              docker compose up -d postgres   (NOTREE_PG_QA_DSN 기본값과 같은 주소)
 services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+  postgres:
+    image: postgres:16-alpine          # pg_trgm 포함
+    ports: ["127.0.0.1:55432:5432"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust # 로컬 개발 전용 (127.0.0.1에만 열림)
+      POSTGRES_DB: notree_qa

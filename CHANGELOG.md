@@ -9,6 +9,17 @@
 
 ---
 
+## 2026-10-18
+
+### 새 질문 세트로 검색 + 실제 답변 평가 도구 · (이번 커밋)
+자세히: [docs/changes/2026-10-17-qa-pg-search.md](docs/changes/2026-10-17-qa-pg-search.md#새-질문-세트-평가-2026-10-18) (브랜치 `feat/qa-pg-search`)
+
+- 🆕 `notree.dev.qa_fresh_eval`: 질문 파일만 LLM에 넣고 그래프 + PG 검색 + 실제 LLM으로 답변, 끝난 뒤 정답표로 자동 채점(기대 상태, 항목별 근거 전달·인용, 하한)과 의미 채점용 채점표 생성. 근거 3개·5개 비교(`--limits`), 웹 없음
+- 🆕 docker-compose에 `postgres`(127.0.0.1:55432, pg_trgm) — 사용자 PC에서 PG 검색 평가용
+- 🔧 `lecture_import`가 폴더와 따옴표 친 `*.md`도 받음 (PowerShell은 *를 펼치지 않음)
+- ⚠️ Redis만 띄우려면 `docker compose up -d redis` (그냥 `up -d`는 postgres도 띄움)
+- 테스트 111 → 112개
+
 ## 2026-10-17
 
 ### PG 검색이 느릴 때 서버·SQLite가 막히지 않게 · `9dfa49c`
