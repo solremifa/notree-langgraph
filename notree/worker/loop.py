@@ -4,8 +4,9 @@
 
 한 메시지의 처리 (process)
   이미 이 worker가 실행 중인 job → 손대지 않음 (보조 방어)
-  [LIVENESS=redis] 소유 키 SET NX 실패 → 손대지 않음 (다른 실행이 살아 있음. ACK도 안 함 — 지금의 보수적 규칙)
-                   성공하면 job_start(lease_sec=0)로 실행 세대만 올리고, heartbeat는 Redis Lua 한 번 (ownership.py)
+  [LIVENESS=redis] 소유 키가 살아 있음 → 손대지 않음 (다른 실행이 살아 있음. ACK도 안 함 — 지금의 보수적 규칙)
+                   없으면 job_start(lease_sec=0)로 DB가 실행 세대를 발급 → 그 세대를 담아 소유 키를 씀 (더 큰 세대만 덮어씀)
+                   → 못 쓰면 낡은 실행이라 시작 안 함. heartbeat는 Redis Lua 한 번 (ownership.py)
                    끝나면(죽은 경우 제외) 소유 키를 토큰 비교로 해제
   job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
              ├─ leased                  → 손대지 않음 (살아 있는 lease. 같은 worker라도)
@@ -206,7 +207,7 @@ class Worker:
         if S.LIVENESS != "redis":
             return await self._process(msg_id, job_id, how, cfg, None)
         own = Ownership(self.r, job_id, self.name, cfg, msg_id)
-        if not await own.acquire():
+        if await own.held():                      # 살아 있는 실행이 있음 → DB 시작도 하지 않는다 (세대를 올리지 않게)
             log("skip", f"{job_id}: 소유 키를 {(own.holder or '?').split('|')[0]}가 가짐 → 손대지 않음")
             return
         try:
@@ -220,10 +221,11 @@ class Worker:
 
     async def _process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig, own: Ownership | None) -> None:
         st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name,
-                                 **({"lease_sec": 0, "fence": own.fence} if own else {"lease_sec": cfg.lease_sec}))
-        if st["status"] == "stale_fence":         # 소유권을 잃은 뒤 늦게 온 시작이거나, Redis 초기화로 카운터가 작아짐
-            await own.raise_fence(st["fence_max"])
-            log("skip", f"{job_id}: 펜싱 번호 {own.fence} ≤ DB {st['fence_max']} → 시작 안 함 (카운터를 올림, 재배송 때 다시)")
+                                 lease_sec=0 if own else cfg.lease_sec)
+        if own and st["status"] == "started" and not await own.acquire(st["exec_epoch"]):
+            # 더 큰(또는 같은) 세대가 이미 키를 가짐 → 나는 낡은 실행. 아무것도 하지 않는다 (내 쓰기는 DB가 어차피 거절)
+            log("skip", f"{job_id}: 세대 {st['exec_epoch']}로 소유 키를 못 얻음 "
+                        f"({(own.holder or '?').split('|')[0]}가 더 큰 세대) → 시작 안 함")
             return
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)

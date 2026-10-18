@@ -83,13 +83,13 @@ def test_heartbeat_extends_only_for_current_owner(redis_url):
         m1 = await _one_message(r)
         a = O.Ownership(r, "job-1", "rt-A", RT, m1)
         b = O.Ownership(r, "job-1", "rt-B", RT, m1)
-        assert await a.acquire() and not await b.acquire()
+        assert await a.acquire(1) and not await b.acquire(1)       # 같은 세대는 못 덮어씀
         assert b.holder.startswith("rt-A:")
         await asyncio.sleep(0.4)
         assert await a.heartbeat() == 1
         assert await r.pttl(a.key) > 900                         # 키 연장됨
         assert (await r.xpending_range(RT.stream, S.GROUP, m1, m1, 1))[0]["time_since_delivered"] < 100   # 방치 시간 0
-        assert not await b.release() and await r.exists(a.key)   # 남의 토큰으로는 못 지움
+        assert not await b.release() and await r.exists(a.key)   # 키를 못 얻은 쪽은 못 지움
         assert await a.release() and not await r.exists(a.key)
         await r.aclose()
     asyncio.run(t())
@@ -101,11 +101,11 @@ def test_expired_owner_cannot_renew_or_delete_new_owners_key(redis_url):
         m1 = await _one_message(r)
         short = dataclasses.replace(RT, lease_sec=0.3)
         a = O.Ownership(r, "job-1", "rt-A", short, m1)
-        assert await a.acquire()
+        assert await a.acquire(1)
         await asyncio.sleep(0.4)                                   # A의 키 만료 (A는 멈춰 있었음)
         await r.xautoclaim(RT.stream, S.GROUP, "rt-B", min_idle_time=0, start_id="0-0", count=1)
         b = O.Ownership(r, "job-1", "rt-B", RT, m1)
-        assert await b.acquire()
+        assert await b.acquire(2)
         assert await a.heartbeat() == 0                            # 토큰 불일치
         assert not await a.release()
         assert (await r.get(a.key)) == b.value
@@ -119,7 +119,7 @@ def test_heartbeat_does_not_steal_back_a_reclaimed_message(redis_url):
         r = await _client(redis_url)
         m1 = await _one_message(r)
         a = O.Ownership(r, "job-1", "rt-A", RT, m1)
-        assert await a.acquire()
+        assert await a.acquire(1)
         await r.pexpire(a.key, 500)
         await r.xautoclaim(RT.stream, S.GROUP, "rt-B", min_idle_time=0, start_id="0-0", count=1)  # B가 회수
         assert await a.heartbeat() == -1
@@ -135,7 +135,7 @@ def test_heartbeat_fails_when_original_message_is_gone(redis_url):
         r = await _client(redis_url)
         m1 = await _one_message(r)
         a = O.Ownership(r, "job-1", "rt-A", RT, m1)
-        assert await a.acquire()
+        assert await a.acquire(1)
         await r.pexpire(a.key, 500)
         await r.xdel(RT.stream, m1)
         assert await a.heartbeat() == -2
@@ -355,68 +355,91 @@ def test_stopped_process_resumes_without_overwriting(tmp_path, redis_url):
     assert stats.get("job_heartbeat", 0) == 0 and pending == 0 and keys == []
 
 
-# ── 4. 소유권 획득 ↔ DB 시작 사이의 경쟁 (리뷰 2차) ──────────────────
-def test_late_job_start_from_a_former_owner_is_rejected(tmp_path, redis_url):
-    """A가 소유 키를 얻고 DB 시작이 늦어지는 동안 키가 만료되고 B가 키·DB 시작을 모두 마침.
-    A의 늦은 job_start는 거절돼야 한다 (Redis 소유자 B ≠ DB 실행자 A가 되면 안 됨)."""
+# ── 4. 소유권 획득 ↔ DB 시작 사이의 경쟁 (리뷰 2·3차) ─────────────────
+# 번호는 DB의 exec_epoch만 발급한다 (영속·단조). 소유 키는 그 세대를 담고, 더 큰 세대만 덮어쓸 수 있다.
+async def _setup_job(e):
+    j = (await e.api.tool("job_create", kind="echo", payload={}, user_id="u", stream=RT.stream))["job_id"]
+    await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+    return j, await e.r.xadd(RT.stream, {"job_id": j})
+
+
+async def _owner_and_executor(e, j):
+    v = await e.r.get(O.own_key(j))
+    return (v.split(":")[0] if v else None), (await e.row(j))["lease_owner"]
+
+
+def test_late_db_start_of_a_former_owner_takes_over_consistently(tmp_path, redis_url):
+    """B가 세대 1로 시작해 키를 가짐 → A의 늦은 DB 시작이 세대 2를 받음 → A가 키를 덮어씀.
+    Redis 소유자와 DB 실행자가 모두 A, B는 heartbeat에서 잃고 쓰기도 거절된다."""
     async def t():
         async with RealEnv(tmp_path, redis_url) as e:
-            j = (await e.api.tool("job_create", kind="echo", payload={}, user_id="u", stream=RT.stream))["job_id"]
-            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
-            m = await e.r.xadd(RT.stream, {"job_id": j})
-            short = dataclasses.replace(RT, lease_sec=0.3)
-            a = O.Ownership(e.r, j, "rt-A", short, m)
-            assert await a.acquire()
-            await asyncio.sleep(0.4)                                    # A의 DB 시작이 늦어지는 사이 키 만료
-            b = O.Ownership(e.r, j, "rt-B", RT, m)
-            assert await b.acquire()
-            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0, fence=b.fence)
-            assert sb["status"] == "started"
-            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0, fence=a.fence)   # 늦게 도착
-            assert sa["status"] == "stale_fence" and sa["fence_max"] == b.fence
-            fin = await e.api.tool("job_finish", job_id=j, worker="rt-B", permit=sb["permit"])
-            assert fin["finished"]                                      # B의 쓰기는 그대로 유효
+            j, m = await _setup_job(e)
+            a, b = O.Ownership(e.r, j, "rt-A", RT, m), O.Ownership(e.r, j, "rt-B", RT, m)
+            assert not await a.held() and not await b.held()         # 둘 다 비어 있는 것을 봄
+            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0)
+            assert await b.acquire(sb["exec_epoch"])
+            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0)   # 늦게 도착 → 세대 2
+            assert await a.acquire(sa["exec_epoch"])
+            assert await _owner_and_executor(e, j) == ("rt-A", "rt-A")
+            assert await b.heartbeat() == 0
+            assert not (await e.api.tool("job_finish", job_id=j, worker="rt-B", permit=sb["permit"]))["finished"]
+            assert (await e.api.tool("job_finish", job_id=j, worker="rt-A", permit=sa["permit"]))["finished"]
     asyncio.run(t())
 
 
-def test_fence_recovers_after_redis_wipe(tmp_path, redis_url):
-    """Redis가 초기화되면 펜싱 카운터가 1부터 다시 시작한다 → DB가 stale_fence와 함께 알려 준 값까지 올리고 다시 얻는다."""
+def test_stale_epoch_cannot_take_the_key(tmp_path, redis_url):
+    """A가 세대 1을 받고 키 쓰기가 늦어짐 → B가 세대 2로 키를 씀 → A의 키 쓰기는 거절 (낡은 실행은 시작 안 함)."""
     async def t():
         async with RealEnv(tmp_path, redis_url) as e:
-            j = (await e.api.tool("job_create", kind="echo", payload={}, user_id="u", stream=RT.stream))["job_id"]
-            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
-            m = await e.r.xadd(RT.stream, {"job_id": j})
-            for _ in range(3):                                          # 펜스 3까지 씀
-                o = O.Ownership(e.r, j, "rt-A", RT, m)
-                assert await o.acquire()
-                st = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0, fence=o.fence)
-                assert st["status"] == "started"
-                await o.release()
+            j, m = await _setup_job(e)
+            a, b = O.Ownership(e.r, j, "rt-A", RT, m), O.Ownership(e.r, j, "rt-B", RT, m)
+            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0)
+            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0)
+            assert await b.acquire(sb["exec_epoch"])
+            assert not await a.acquire(sa["exec_epoch"])
+            assert await _owner_and_executor(e, j) == ("rt-B", "rt-B")
+    asyncio.run(t())
+
+
+def test_number_issued_before_a_redis_wipe_cannot_override(tmp_path, redis_url):
+    """리뷰 3차 순서: A가 번호를 받고 DB 시작(키 쓰기)이 늦어짐 → Redis 초기화 → B가 시작 → A가 도착.
+    번호가 DB의 세대라 초기화로 되돌아가지 않는다 → A의 세대가 B보다 작아 키를 못 얻고, DB도 A의 쓰기를 거절."""
+    async def t():
+        async with RealEnv(tmp_path, redis_url) as e:
+            j, m = await _setup_job(e)
+            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0)   # A: 세대 1, 키 쓰기 지연
             await e.r.flushall()
             await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
-            o = O.Ownership(e.r, j, "rt-C", RT, m)
-            assert await o.acquire() and o.fence == 1
-            st = await e.api.tool("job_start", job_id=j, worker="rt-C", lease_sec=0, fence=o.fence)
-            assert st["status"] == "stale_fence" and st["fence_max"] == 3
-            await o.raise_fence(st["fence_max"])
-            await o.release()
-            o = O.Ownership(e.r, j, "rt-C", RT, m)
-            assert await o.acquire() and o.fence == 4
-            assert (await e.api.tool("job_start", job_id=j, worker="rt-C", lease_sec=0, fence=o.fence))["status"] == "started"
+            b = O.Ownership(e.r, j, "rt-B", RT, m)
+            assert not await b.held()
+            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0)   # B: 세대 2
+            assert await b.acquire(sb["exec_epoch"])
+            a = O.Ownership(e.r, j, "rt-A", RT, m)
+            assert not await a.acquire(sa["exec_epoch"])               # 1 < 2
+            assert await _owner_and_executor(e, j) == ("rt-B", "rt-B")
+            assert not (await e.api.tool("job_finish", job_id=j, worker="rt-A", permit=sa["permit"]))["finished"]
     asyncio.run(t())
 
 
-def test_worker_heals_a_stale_fence_and_finishes(tmp_path, redis_url, redis_mode):
-    """DB에 큰 펜스가 남아 있는 작업(Redis 초기화 뒤 상황)을 worker가 스스로 올려 잡고 끝낸다."""
+def test_wipe_after_the_new_owner_wrote_costs_a_rerun_not_safety(tmp_path, redis_url):
+    """남는 비용: B가 세대 2로 키를 쓴 뒤 Redis 초기화 → 비어 있는 키를 A(세대 1)가 얻을 수 있다.
+    그래도 A의 DB 쓰기는 거절되고 B는 키를 잃어 멈춘다 → 둘 다 쓰지 못함. 키가 풀리면 새 세대(3)로 다시 실행된다."""
     async def t():
         async with RealEnv(tmp_path, redis_url) as e:
-            j = await e.job({"text": "fence"})
-            import sqlite3
-            con = sqlite3.connect(e.db)
-            con.execute("UPDATE jobs SET fence_max=7 WHERE job_id=?", (j,))
-            con.commit()
-            con.close()
-            e.start_worker(cfg=RT)
-            assert await e.wait_state(j, ("done",), timeout=20)
-            assert await e.own_keys() == []
+            j, m = await _setup_job(e)
+            sa = await e.api.tool("job_start", job_id=j, worker="rt-A", lease_sec=0)
+            sb = await e.api.tool("job_start", job_id=j, worker="rt-B", lease_sec=0)
+            b = O.Ownership(e.r, j, "rt-B", RT, m)
+            assert await b.acquire(sb["exec_epoch"])
+            await e.r.flushall()
+            await e.r.xgroup_create(RT.stream, S.GROUP, id="0", mkstream=True)
+            a = O.Ownership(e.r, j, "rt-A", RT, m)
+            assert await a.acquire(sa["exec_epoch"])                   # 빈 키라 얻음
+            assert await b.heartbeat() == 0                            # 진짜 실행자는 잃고 멈춤
+            assert not (await e.api.tool("job_finish", job_id=j, worker="rt-A", permit=sa["permit"]))["finished"]
+            assert await a.release()                                   # 낡은 실행이 멈추며 해제
+            sc = await e.api.tool("job_start", job_id=j, worker="rt-C", lease_sec=0)
+            c = O.Ownership(e.r, j, "rt-C", RT, m)
+            assert sc["exec_epoch"] == 3 and await c.acquire(3)
+            assert (await e.api.tool("job_finish", job_id=j, worker="rt-C", permit=sc["permit"]))["finished"]
     asyncio.run(t())

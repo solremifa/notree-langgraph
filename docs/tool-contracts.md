@@ -149,7 +149,7 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: worker · 정의: worker 담당
 
-실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드)
+실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)
 
 입력
 
@@ -158,14 +158,13 @@ XADD 후 전송 완료 표시
 | `job_id` | `str` |  |
 | `worker` | `str` |  |
 | `lease_sec` | `float` | DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 (NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch) |
-| `fence` | `int | null` = None | Redis 소유 키를 얻을 때 받은 펜싱 번호. 이 작업에서 본 가장 큰 번호 이하면 stale_fence로 거절 (소유권을 잃은 뒤 늦게 도착한 시작 요청) |
 
 출력 (`data`)
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `status` | `"started" | "done" | "failed" | "leased" | "unknown" | "stale_fence"` |  |
-| `fence_max` | `int | null` = None | stale_fence일 때 DB가 본 가장 큰 펜싱 번호 (Redis 카운터를 여기까지 올린다) |
+| `status` | `"started" | "done" | "failed" | "leased" | "unknown"` |  |
+| `exec_epoch` | `int | null` = None | started일 때 이번 실행 세대 (영속·단조). Redis 소유 키 모드는 이 값을 키에 담는다 |
 | `kind` | `str | null` = None |  |
 | `payload` | `dict[str, any] | null` = None |  |
 | `attempt` | `int | null` = None | 1부터. 이번이 몇 번째 시도인지 |

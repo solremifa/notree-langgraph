@@ -11,6 +11,14 @@
 
 ## 2026-10-18
 
+### Redis 소유권 리뷰 3차: 번호는 DB 실행 세대만 · (이번 커밋)
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-23차-소유권-획득--db-시작-경쟁--번호는-db만-발급)
+
+- 🐛 Redis가 발급했지만 DB가 아직 못 본 펜싱 번호가 Redis 초기화를 건너 늦게 도착하면 허용돼 실행자를 덮음 (재현) → Redis 펜싱 카운터를 없애고 DB의 `exec_epoch`만 번호로 사용
+- 🔧 순서 변경: 소유 키 확인(held) → `job_start`가 세대 발급 → 세대를 담아 키 쓰기(더 큰 세대만 덮어씀)
+- ⚠️ 계약: `job_start.fence`·`stale_fence`·`fence_max` 삭제 (2차에서 추가했던 것), `job_start` 응답에 `exec_epoch`
+- 테스트 114 → 115개
+
 ### Redis 소유권 리뷰 2차: 펜싱 번호로 늦은 job_start 거절 · `5ccfa4a`
 자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-2차-소유권-획득--db-시작-경쟁-펜싱-번호)
 
