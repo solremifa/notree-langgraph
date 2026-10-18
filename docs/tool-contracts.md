@@ -155,12 +155,14 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: scheduler · 정의: worker 담당
 
-Redis 통째 유실 뒤: reserved·sent·lease 끝난 running을 다시 보낼 목록. 마감·시도 한도는 실패 확정
+Redis 통째 유실 뒤: 기준 시각 전의 reserved·sent·lease 끝난 running을 다시 보낼 목록 (살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 다 처리되면 복구 종료
 
 입력
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
+| `start` | `bool` = False | Redis 초기화를 방금 발견함 → 복구 기준 시각을 지금으로 기록 |
+| `after` | `str | null` = None | 이전 쪽의 next_after (job_id 순서로 이어서) |
 | `limit` | `int` = 500 |  |
 
 출력 (`data`)
@@ -169,6 +171,9 @@ Redis 통째 유실 뒤: reserved·sent·lease 끝난 running을 다시 보낼 �
 |---|---|---|
 | `jobs` | `list[ReservedJob]` | 다시 XADD할 작업 (sent로 표시됨) |
 | `failed` | `list[str]` | 마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업 |
+| `held` | `int` = 0 | lease가 아직 살아 있어 보류한 running (다음 주기에 다시 확인) |
+| `open` | `bool` = False | 복구가 아직 안 끝남 (대상이 남아 있음) |
+| `next_after` | `str | null` = None | 이 쪽이 꽉 찼으면 다음 쪽 시작점 |
 
 ### `job_start`
 

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS qa_docs(
 CREATE TABLE IF NOT EXISTS qa_questions(
   question_id TEXT PRIMARY KEY, user_id TEXT, course_id TEXT, question TEXT, job_id TEXT,
   generation INTEGER DEFAULT 1, state TEXT, answer TEXT, answer_id TEXT, idem_key TEXT, created REAL, updated_at REAL);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS lectures(
   lecture_id TEXT PRIMARY KEY, user_id TEXT, state TEXT, generation INTEGER DEFAULT 1,
   saved_until INTEGER DEFAULT 0, processed_until INTEGER DEFAULT 0, attempted_until INTEGER DEFAULT 0,
@@ -517,20 +518,33 @@ def job_release(job_id: str, worker: str, reason: str, permit: str | None = None
 
 
 @tool
-def job_recover_orphans(limit: int = 500) -> dict:
-    """[scheduler] Redis가 통째로 사라진 뒤: Redis에만 있던 전달 상태를 DB에서 다시 만든다.
-    대상 = reserved·sent, 그리고 lease가 끝난 running (실행하던 worker도 메시지도 없다고 본다. DB 모드에서 lease가
-    살아 있는 running은 worker가 실행 중이므로 건드리지 않는다. Redis 소유 키 모드는 lease_sec=0이라 모두 대상 →
-    실행 중이던 것도 다시 계산될 수 있다 — 늦은 쓰기는 exec_epoch가 막는다).
-    다시 보내기 전에 확인: 마감(deadline_at)이 지났으면 실패 확정(다시 시도 가능), running인데 시도 한도를 다 썼으면 실패 확정.
-    돌려준 작업은 sent로 표시한다 → scheduler가 XADD."""
+def job_recover_orphans(start: bool = False, after: str | None = None, limit: int = 500) -> dict:
+    """[scheduler] Redis 통째 유실 뒤 전달 상태를 DB에서 다시 만든다. '발견'과 '완료'를 나눈다.
+      start=True : Redis 초기화를 발견함 → 복구 기준 시각(recovery_since)을 지금으로 기록 (이미 열려 있어도 새로)
+      대상       : 기준 시각 **전에** 마지막으로 바뀐 reserved·sent·running (그 뒤에 시작·전송된 작업은 새 Redis에 있음)
+                   running은 lease가 끝났으면 다시 보내고, 아직 살아 있으면 보류 → 다음 주기에 다시 확인
+                   (DB 모드: lease가 살아 있으면 worker가 실행 중. Redis 소유 키 모드: lease_sec=0이라 바로 대상)
+      다시 보내기 전: 마감이 지났으면 실패 확정(다시 시도 가능), running인데 시도 한도를 다 썼으면 실패 확정
+      쪽 나누기  : job_id 순서로 limit개씩, next_after로 이어서 끝까지
+      완료       : 대상이 하나도 남지 않으면 기준 시각을 지움 (open=false)
+    다시 보낼 작업은 sent·updated_at=지금으로 표시 → 기준 시각 뒤로 넘어가 다시 대상이 되지 않는다."""
     now = time.time()
     cfg_of = {c.stream: c for c in STREAMS.values()}
     with tx() as con:
-        rows = con.execute("SELECT * FROM jobs WHERE state IN ('reserved','sent') OR (state='running' AND "
-                           "COALESCE(lease_until, 0) < ?) ORDER BY created LIMIT ?", (now, limit)).fetchall()
-        resend, failed = [], []
+        if start:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('recovery_since', ?)", (str(now),))
+        row = con.execute("SELECT value FROM meta WHERE key='recovery_since'").fetchone()
+        if not row:
+            return ok(C.JobRecoverOut(jobs=[], failed=[], held=0, open=False))
+        since = float(row["value"])
+        cond = "state IN ('reserved','sent','running') AND COALESCE(updated_at, 0) < ?"
+        rows = con.execute(f"SELECT * FROM jobs WHERE {cond} AND job_id > ? ORDER BY job_id LIMIT ?",
+                           (since, after or "", limit)).fetchall()
+        resend, failed, held = [], [], 0
         for r in rows:
+            if r["state"] == "running" and (r["lease_until"] or 0) >= now:
+                held += 1                                     # 살아 있는 lease → 다음 주기에 다시 확인
+                continue
             deadline = json.loads(r["payload"] or "{}").get("deadline_at")
             cfg = cfg_of.get(r["stream"])
             limit_n = max_attempts_for(r["kind"], cfg) if cfg else 3
@@ -543,8 +557,13 @@ def job_recover_orphans(limit: int = 500) -> dict:
                 _set(con, r["job_id"], state="sent", lease_until=None)
                 resend.append(r)
             _log(con, "job_recover_orphans", r["job_id"])
+        nxt = rows[-1]["job_id"] if len(rows) == limit else None
+        remaining = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {cond}", (since,)).fetchone()[0]
+        if remaining == 0:
+            con.execute("DELETE FROM meta WHERE key='recovery_since'")
         return ok(C.JobRecoverOut(jobs=[C.ReservedJob(job_id=r["job_id"], kind=r["kind"], stream=r["stream"])
-                                        for r in resend], failed=failed))
+                                        for r in resend], failed=failed, held=held, open=remaining > 0,
+                                  next_after=nxt))
 
 
 @tool
@@ -552,7 +571,8 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
     """[api] 사용자의 '다시 시도'. 다시 해도 되는 실패만 pending으로 되살린다. 체크포인트는 그대로라 이어서 실행된다.
     마감이 있던 작업은 deadline_at으로 새 마감을 준다. 안 주면 Q&A·채점은 지금부터 정책 마감(90초),
     그 밖의 작업은 지난 마감 그대로라 바로 다시 실패한다."""
-    with db() as con:
+    # 검사와 변경을 한 쓰기 트랜잭션에 (BEGIN IMMEDIATE) → 검사 뒤 커밋이 후속 요약을 끼워 넣는 경쟁이 없다
+    with tx() as con:
         r = con.execute("SELECT state, user_retryable, payload, kind, lecture_id FROM jobs WHERE job_id=?",
                         (job_id,)).fetchone()
         if not r:
@@ -574,8 +594,14 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
             deadline_at = time.time() + KIND_DEADLINE_SEC[r["kind"]]
         if deadline_at is not None:
             payload["deadline_at"] = deadline_at
-        _set(con, job_id, state="pending", attempts=0, lease_owner=None, lease_until=None, fail_reason=None,
-             user_retryable=None, payload=json.dumps(payload, ensure_ascii=False))
+        try:                                                 # failed일 때만 (다른 경로가 먼저 바꿨으면 0행)
+            n = con.execute("UPDATE jobs SET state='pending', attempts=0, lease_owner=NULL, lease_until=NULL, "
+                            "fail_reason=NULL, user_retryable=NULL, payload=?, updated_at=? WHERE job_id=? AND state='failed'",
+                            (json.dumps(payload, ensure_ascii=False), time.time(), job_id)).rowcount
+        except sqlite3.IntegrityError:                       # 마지막 방어: 강의당 대기 요약 1개 (jobs_one_pending_summary)
+            return ok(C.JobRetryOut(revived=False, reason="후속 요약이 이미 있음 → 그 요약이 실패 구간부터 함께 처리함"))
+        if n != 1:
+            return ok(C.JobRetryOut(revived=False, reason="그사이 상태가 바뀜"))
         _log(con, "job_retry", job_id)
         return ok(C.JobRetryOut(revived=True))
 
