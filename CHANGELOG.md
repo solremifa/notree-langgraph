@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### Redis 소유권 리뷰 3차: 번호는 DB 실행 세대만 · (이번 커밋)
+### Redis 소유권 리뷰 3차: 번호는 DB 실행 세대만 · `43c43b3`
 자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md#리뷰-23차-소유권-획득--db-시작-경쟁--번호는-db만-발급)
 
 - 🐛 Redis가 발급했지만 DB가 아직 못 본 펜싱 번호가 Redis 초기화를 건너 늦게 도착하면 허용돼 실행자를 덮음 (재현) → Redis 펜싱 카운터를 없애고 DB의 `exec_epoch`만 번호로 사용
