@@ -11,6 +11,11 @@
 
 ## 2026-10-18
 
+### main 머지 후 문서: 상태·시험 환경·요약 한계 · (이번 커밋)
+- 🔧 `docs/status.md`: 요약 합치기·배정 복구·전달 세대·Redis 모드(기본 db) 반영, 팀 결정 표에 Redis 모드 활성화와 요약 추가 복구를 별도 결정으로
+- 🔧 README: 실제 Redis 시험은 `redis-server`가 없으면 건너뜀(`pytest -rs`로 확인), 프록시 환경 문제 해결(socksio, NO_PROXY)
+- 🔧 요약 문서: 실시간 요약 총 1회 유지, 실패 구간은 새 전사가 없으면 다시 요약되지 않으며 최종 노트 자동 보완은 미보장
+
 ### 전달 세대 없는 메시지는 기본 거절 · `f7a957a`
 - 🔧 운영 worker는 `gen` 없는 메시지로 시작하지 않고 ACK (재전송이 세대를 붙여 다시 보냄). 예전 메시지 허용은 `NOTREE_ALLOW_LEGACY_MESSAGES=1` 또는 `Worker(allow_legacy=True)`로만
 - ⚠️ 세대 없이 XADD하는 도구는 허용 설정이 필요 (`lane_bench`는 `allow_legacy=True`로 바꿈)
