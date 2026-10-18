@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### Redis 유실 복구 리뷰 3차: '발견'과 '완료' 분리 · (이번 커밋)
+### Redis 유실 복구 리뷰 3차: '발견'과 '완료' 분리 · `b712b2a`
 - 🐛 표시 키를 복구 완료로 써서, 첫 복구 때 lease가 살아 있던 고립 작업이 영영 running에 남음 → 표시 키는 발견, 완료는 DB(`meta.recovery_since`)가 판단해 열려 있는 동안 매 주기 재확인
 - 🐛 한 번에 500건만 처리 → job_id 순서로 쪽을 나눠 끝까지
 - ⚠️ `job_recover_orphans`에 `start`·`after` 인자, 응답에 `held`·`open`·`next_after`
