@@ -17,12 +17,17 @@ from notree.common.log import ACTOR, log
 from notree.worker.mcp_client import McpClient
 
 
+def _fields(j: dict) -> dict:
+    """XADD 필드: 작업 ID와 전달 세대 (세대가 있으면). worker는 세대를 job_start에 넘겨 Redis 유실 전 메시지를 거른다."""
+    return {"job_id": j["job_id"], **({"gen": str(j["gen"])} if j.get("gen") is not None else {})}
+
+
 async def resend_stale(r, mcp: McpClient, reserved_sec: float = S.RESEND_RESERVED_SEC,
                        sent_sec: float = S.RESEND_SENT_SEC) -> int:
     jobs = (await mcp.tool("job_resend_stale", reserved_older_than_sec=reserved_sec,
                            sent_older_than_sec=sent_sec))["jobs"]
     for j in jobs:
-        msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
+        msg_id = await r.xadd(j["stream"], _fields(j))
         log("resend", f"{j['job_id']} [{j['kind']}] 멈춰 있음 → 다시 XADD {j['stream']} {msg_id}")
     return len(jobs)
 
@@ -41,7 +46,7 @@ async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
         res = await mcp.tool("job_recover_orphans", start=start, after=after, limit=page)
         start = False                                   # 기준 시각은 첫 쪽에서만 새로
         for j in res["jobs"]:
-            msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
+            msg_id = await r.xadd(j["stream"], _fields(j))
             log("recover", f"{j['job_id']} [{j['kind']}] Redis 유실 복구 → 다시 XADD {j['stream']} {msg_id}")
         sent += len(res["jobs"])
         if res["failed"]:

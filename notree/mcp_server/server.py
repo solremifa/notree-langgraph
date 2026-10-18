@@ -101,6 +101,7 @@ ADDED_COLUMNS = [
     ("jobs", "user_id TEXT"), ("jobs", "updated_at REAL"), ("jobs", "user_retryable INTEGER"),
     ("jobs", "exec_epoch INTEGER DEFAULT 0"),   # 실행 세대: job_start마다 +1, 절대 되돌리지 않음 (job_retry도)
     ("jobs", "lecture_id TEXT"),                 # 실시간 요약 합치기용 (강의당 대기 1개)
+    ("jobs", "dispatch_gen INTEGER"),            # 마지막으로 Redis에 보낸 전달 세대 (Redis 유실 복구 판정)
     ("notes", "user_id TEXT"),
 ]
 
@@ -350,6 +351,12 @@ def checkpoint_cleanup(older_than_sec: float = 7 * 24 * 3600) -> dict:
 # ── 작업 · 실행 허가 · lease ─────────────────────────────────────
 # 실제 설계에서 job_create·job_retry는 api가, job_reserve_pending·job_mark_sent·job_resend_stale는 scheduler가
 # PG에 직접 하는 일이다. 이 PoC는 DB를 MCP 서버 하나에 모아 두어 같은 서버의 도구로 흉내 낸다.
+def _gen(con) -> int:
+    """현재 전달 세대. Redis 유실을 발견할 때마다(job_recover_orphans start) 1씩 오른다. 메시지와 jobs.dispatch_gen에 기록."""
+    r = con.execute("SELECT value FROM meta WHERE key='dispatch_gen'").fetchone()
+    return int(r["value"]) if r else 1
+
+
 def _set(con, job_id: str, **cols) -> int:
     cols["updated_at"] = time.time()
     sets = ", ".join(f"{k}=?" for k in cols)
@@ -398,13 +405,13 @@ def job_reserve_pending(limit: int = 10, stream: str | None = None) -> dict:
         else:
             rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' AND stream=?" + gate +
                                " ORDER BY created LIMIT ?", (stream, limit)).fetchall()
-        got = []
+        got, gen = [], _gen(con)
         for r in rows:
-            if con.execute("UPDATE jobs SET state='reserved', updated_at=? WHERE job_id=? AND state='pending'",
-                           (time.time(), r["job_id"])).rowcount == 1:
+            if con.execute("UPDATE jobs SET state='reserved', dispatch_gen=?, updated_at=? WHERE job_id=? AND state='pending'",
+                           (gen, time.time(), r["job_id"])).rowcount == 1:
                 got.append(r)
                 _log(con, "job_reserve_pending", r["job_id"])
-        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in got]))
+        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r), gen=gen) for r in got]))
 
 
 @tool
@@ -422,19 +429,20 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
     """[scheduler] 허가 후 XADD 전에 죽었거나, 메시지가 유실돼 멈춘 의도를 다시 보낼 목록 (팀 결정 6번).
     돌려준 작업은 updated_at을 갱신해 다음 주기에 또 나오지 않게 한다. 중복 메시지는 job_start가 걸러 낸다."""
     now = time.time()
-    with db() as con:
+    with tx() as con:
         rows = con.execute(
             "SELECT job_id, kind, stream FROM jobs WHERE (state='reserved' AND updated_at < ?) "
             "OR (state='sent' AND updated_at < ?) ORDER BY updated_at LIMIT ?",
             (now - reserved_older_than_sec, now - sent_older_than_sec, limit)).fetchall()
+        gen = _gen(con)
         for r in rows:
-            _set(con, r["job_id"], state="sent")
+            _set(con, r["job_id"], state="sent", dispatch_gen=gen)
             _log(con, "job_resend_stale", r["job_id"])
-        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r)) for r in rows]))
+        return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r), gen=gen) for r in rows]))
 
 
 @tool
-def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
+def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | None = None) -> dict:
     """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
     lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지).
     lease_sec=0 (LIVENESS=redis): DB lease로 실행 중을 판단하지 않는다. 실행 세대만 올려 이전 실행자의 permit을 무효로 만들고,
@@ -447,6 +455,8 @@ def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
             return ok(C.JobStartOut(status="unknown"))
         if r["state"] in ("done", "failed"):
             return ok(C.JobStartOut(status=r["state"]))
+        if dispatch_gen is not None and dispatch_gen < _gen(con):   # Redis 유실 전 메시지의 늦은 시작 → 복구가 새로 보낸다
+            return ok(C.JobStartOut(status="stale_dispatch"))
         if r["state"] == "running" and (r["lease_until"] or 0) > now:
             return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
                                     lease_left_sec=round(r["lease_until"] - now, 1)))
@@ -516,26 +526,25 @@ def job_release(job_id: str, worker: str, reason: str, permit: str | None = None
 @tool
 def job_recover_orphans(start: bool = False, after: str | None = None, limit: int = 500) -> dict:
     """[scheduler] Redis 통째 유실 뒤 전달 상태를 DB에서 다시 만든다. '발견'과 '완료'를 나눈다.
-      start=True : Redis 초기화를 발견함 → 복구 기준 시각(recovery_since)을 지금으로 기록 (이미 열려 있어도 새로)
-      대상       : 기준 시각 **전에** 마지막으로 바뀐 reserved·sent·running (그 뒤에 시작·전송된 작업은 새 Redis에 있음)
-                   running은 lease가 끝났으면 다시 보내고, 아직 살아 있으면 보류 → 다음 주기에 다시 확인
+      start=True : Redis 초기화를 발견함 → 전달 세대(dispatch_gen)를 1 올린다 (영속)
+      대상       : 마지막 전달이 **이전 세대**인 reserved·sent·running — 그 메시지는 사라진 Redis에 있었다.
+                   updated_at(최근에 DB에서 바뀜)은 새 Redis에 메시지가 있다는 증거가 아니라 쓰지 않는다
+                   running은 lease가 끝났으면 다시 보내고, 살아 있으면 보류 → 다음 주기에 다시 확인
                    (DB 모드: lease가 살아 있으면 worker가 실행 중. Redis 소유 키 모드: lease_sec=0이라 바로 대상)
+      늦은 시작  : 이전 세대 메시지의 job_start는 stale_dispatch로 거절된다 → 상태가 안 바뀌어 대상에 그대로 남는다
       다시 보내기 전: 마감이 지났으면 실패 확정(다시 시도 가능), running인데 시도 한도를 다 썼으면 실패 확정
       쪽 나누기  : job_id 순서로 limit개씩, next_after로 이어서 끝까지
-      완료       : 대상이 하나도 남지 않으면 기준 시각을 지움 (open=false)
-    다시 보낼 작업은 sent·updated_at=지금으로 표시 → 기준 시각 뒤로 넘어가 다시 대상이 되지 않는다."""
+      완료       : 대상이 하나도 남지 않으면 open=false
+    다시 보낼 작업은 sent·dispatch_gen=지금 세대로 표시 → 대상에서 빠진다."""
     now = time.time()
     cfg_of = {c.stream: c for c in STREAMS.values()}
     with tx() as con:
         if start:
-            con.execute("INSERT OR REPLACE INTO meta VALUES('recovery_since', ?)", (str(now),))
-        row = con.execute("SELECT value FROM meta WHERE key='recovery_since'").fetchone()
-        if not row:
-            return ok(C.JobRecoverOut(jobs=[], failed=[], held=0, open=False))
-        since = float(row["value"])
-        cond = "state IN ('reserved','sent','running') AND COALESCE(updated_at, 0) < ?"
+            con.execute("INSERT OR REPLACE INTO meta VALUES('dispatch_gen', ?)", (str(_gen(con) + 1),))
+        gen = _gen(con)
+        cond = "state IN ('reserved','sent','running') AND COALESCE(dispatch_gen, 0) < ?"
         rows = con.execute(f"SELECT * FROM jobs WHERE {cond} AND job_id > ? ORDER BY job_id LIMIT ?",
-                           (since, after or "", limit)).fetchall()
+                           (gen, after or "", limit)).fetchall()
         resend, failed, held = [], [], 0
         for r in rows:
             if r["state"] == "running" and (r["lease_until"] or 0) >= now:
@@ -550,14 +559,12 @@ def job_recover_orphans(start: bool = False, after: str | None = None, limit: in
                 _set(con, r["job_id"], state="failed", lease_until=None, fail_reason=reason, user_retryable=1)
                 failed.append(r["job_id"])
             else:
-                _set(con, r["job_id"], state="sent", lease_until=None)
+                _set(con, r["job_id"], state="sent", lease_until=None, dispatch_gen=gen)
                 resend.append(r)
             _log(con, "job_recover_orphans", r["job_id"])
         nxt = rows[-1]["job_id"] if len(rows) == limit else None
-        remaining = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {cond}", (since,)).fetchone()[0]
-        if remaining == 0:
-            con.execute("DELETE FROM meta WHERE key='recovery_since'")
-        return ok(C.JobRecoverOut(jobs=[C.ReservedJob(job_id=r["job_id"], kind=r["kind"], stream=r["stream"])
+        remaining = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {cond}", (gen,)).fetchone()[0]
+        return ok(C.JobRecoverOut(jobs=[C.ReservedJob(job_id=r["job_id"], kind=r["kind"], stream=r["stream"], gen=gen)
                                         for r in resend], failed=failed, held=held, open=remaining > 0,
                                   next_after=nxt))
 

@@ -211,3 +211,76 @@ def test_jobs_started_after_the_wipe_are_not_touched_by_an_open_recovery(tmp_pat
             assert await recover_after_redis_loss(e.r, e.api) == 0
             assert (await e.row(new))["state"] == "running" and (await e.row(new))["attempts"] == 1
     asyncio.run(t())
+
+
+# ── 리뷰 4차: '최근 DB에서 시작됨' ≠ '새 Redis에 메시지가 있음' ─────────────
+@real_redis
+def test_late_start_of_a_pre_wipe_message_does_not_escape_recovery(tmp_path, redis_url):
+    """worker가 초기화 전 Redis에서 메시지를 읽음 → job_start 지연 → Redis 초기화 → 복구 시작 → 늦은 job_start 도착
+    → worker가 그 뒤 멈춤. 이전 전달 세대의 시작은 거절돼야 하고, 작업은 새 Redis로 다시 보내져 끝나야 한다."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            j = await e.job({"text": "late"})
+            got = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"]
+            old_gen = got[0].get("gen")
+            await e.api.tool("job_mark_sent", job_id=j)                  # 초기화 전 Redis에 전달됨 (worker가 읽음)
+            await e.r.flushall()
+            await recover_after_redis_loss(e.r, e.api)                   # 복구 시작
+            st = await e.api.tool("job_start", job_id=j, worker="late", lease_sec=0.3, dispatch_gen=old_gen)
+            assert st["status"] == "stale_dispatch"                      # 이전 전달의 시작은 거절
+            await asyncio.sleep(0.4)                                     # (그 worker는 여기서 멈췄다고 가정)
+            await recover_after_redis_loss(e.r, e.api)
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+    asyncio.run(t())
+
+
+@real_redis
+def test_old_start_before_recovery_is_held_then_resent(tmp_path, redis_url):
+    """늦은 시작이 복구 시작보다 **먼저** 도착한 경우: running(이전 세대)으로 남아 있다가, DB 모드 lease가 끝나면 다시 보낸다."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            j = await e.job({"text": "early"})
+            got = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"]
+            await e.api.tool("job_mark_sent", job_id=j)
+            await e.r.flushall()
+            st = await e.api.tool("job_start", job_id=j, worker="dead", lease_sec=0.5, dispatch_gen=got[0].get("gen"))
+            assert st["status"] == "started"                             # 아직 복구 전이라 받아들여짐
+            assert await recover_after_redis_loss(e.r, e.api) == 0       # lease가 살아 있어 보류
+            await asyncio.sleep(0.6)
+            assert await recover_after_redis_loss(e.r, e.api) == 1       # 이전 세대 전달 → 다시 보냄
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+    asyncio.run(t())
+
+
+@real_redis
+def test_stale_generation_message_in_the_new_redis_is_dropped(tmp_path, redis_url):
+    """배정기 경쟁으로 이전 세대 메시지가 새 Redis에 들어온 경우: worker는 시작하지 않고 ACK만, 작업은 새 세대 메시지로 1번 완료."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+
+    async def t():
+        async with RealEnv(tmp_path, redis_url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)
+            j = await e.job({"text": "race"})
+            old = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"][0]["gen"]
+            await e.r.flushall()
+            assert await recover_after_redis_loss(e.r, e.api) == 1         # 새 세대로 다시 보냄
+            await e.r.xadd(RT.stream, {"job_id": j, "gen": str(old)})       # 늦게 도착한 이전 세대 메시지
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+            row = await e.row(j)
+            assert row["attempts"] == 1                                     # 이전 세대 메시지로는 시작 안 함
+            for _ in range(40):                                             # 함께 읽힌 중복은 "실행 중"이라 남았다가
+                if (await e.r.xpending(RT.stream, S.GROUP))["pending"] == 0:   # 회수 기준 뒤 다시 와서 ACK됨
+                    break
+                await asyncio.sleep(0.1)
+            assert (await e.r.xpending(RT.stream, S.GROUP))["pending"] == 0
+            assert (await e.row(j))["attempts"] == 1
+    asyncio.run(t())
