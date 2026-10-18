@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### 실시간 요약 범위 합치기 (PoC) · (이번 커밋)
+### 실시간 요약 범위 합치기 (PoC) · `3b1c00e`
 자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md) (브랜치 `feat/summary-coalesce`)
 
 - 🆕 실시간 요약 PoC 경로: `lecture_start`·`transcript_commit`·`lecture_end`·`lecture_get`·`summary_recover`, `transcript_range`·`summary_publish` 구현, `live_summary` 핸들러(가짜 LLM)
