@@ -546,7 +546,8 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
     """[api] 사용자의 '다시 시도'. 다시 해도 되는 실패만 pending으로 되살린다. 체크포인트는 그대로라 이어서 실행된다.
     마감이 있던 작업은 deadline_at으로 새 마감을 준다. 안 주면 Q&A·채점은 지금부터 정책 마감(90초),
     그 밖의 작업은 지난 마감 그대로라 바로 다시 실패한다."""
-    with db() as con:
+    # 검사와 변경을 한 쓰기 트랜잭션에 (BEGIN IMMEDIATE) → 검사 뒤 커밋이 후속 요약을 끼워 넣는 경쟁이 없다
+    with tx() as con:
         r = con.execute("SELECT state, user_retryable, payload, kind, lecture_id FROM jobs WHERE job_id=?",
                         (job_id,)).fetchone()
         if not r:
@@ -568,8 +569,14 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
             deadline_at = time.time() + KIND_DEADLINE_SEC[r["kind"]]
         if deadline_at is not None:
             payload["deadline_at"] = deadline_at
-        _set(con, job_id, state="pending", attempts=0, lease_owner=None, lease_until=None, fail_reason=None,
-             user_retryable=None, payload=json.dumps(payload, ensure_ascii=False))
+        try:                                                 # failed일 때만 (다른 경로가 먼저 바꿨으면 0행)
+            n = con.execute("UPDATE jobs SET state='pending', attempts=0, lease_owner=NULL, lease_until=NULL, "
+                            "fail_reason=NULL, user_retryable=NULL, payload=?, updated_at=? WHERE job_id=? AND state='failed'",
+                            (json.dumps(payload, ensure_ascii=False), time.time(), job_id)).rowcount
+        except sqlite3.IntegrityError:                       # 마지막 방어: 강의당 대기 요약 1개 (jobs_one_pending_summary)
+            return ok(C.JobRetryOut(revived=False, reason="후속 요약이 이미 있음 → 그 요약이 실패 구간부터 함께 처리함"))
+        if n != 1:
+            return ok(C.JobRetryOut(revived=False, reason="그사이 상태가 바뀜"))
         _log(con, "job_retry", job_id)
         return ok(C.JobRetryOut(revived=True))
 

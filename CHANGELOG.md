@@ -11,6 +11,9 @@
 
 ## 2026-10-18
 
+### 실시간 요약 리뷰 3차: job_retry 원자성 · `1dc797d`
+- 🐛 사용자 재시도의 "후속 요약 없음" 확인과 상태 변경이 한 트랜잭션이 아니어서, 그사이 커밋이 후속 요약을 넣으면 `UNIQUE constraint failed` → 한 쓰기 트랜잭션 + `WHERE state='failed'`, 제약 충돌도 "되살리지 않음"으로 응답. MCP 서버 2개로 동시 30회 재현 뒤 고침
+- 테스트 115 → 116개
 ### 배정·회수·Redis 유실 복구 · `6b98185`
 자세히: [docs/changes/2026-10-18-dispatch-recovery.md](docs/changes/2026-10-18-dispatch-recovery.md) (브랜치 `fix/dispatch-recovery`)
 
