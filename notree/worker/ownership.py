@@ -26,6 +26,7 @@
       3. XCLAIM이 그 메시지를 실제로 돌려줬다 (Stream에서 지워진 메시지면 거절 — 키만 연장하지 않음)
   - 시간 관계: heartbeat_sec < lease_sec(키 TTL) < claim_idle(회수 기준)
   - 키 해제도 토큰 비교. Redis에 TTL보다 오래 닿지 못하면 잃은 것으로 보고 작업을 취소한다
+    (오류뿐 아니라 응답이 멈춘 경우도: heartbeat 한 번은 남은 TTL까지만 기다린다)
   - 최종 쓰기는 DB의 exec_epoch(permit)로 막는다
 
 남는 비용 (안전 문제는 아님): Redis가 초기화된 직후에는 키가 비어 있어서 낡은 세대도 키를 얻을 수 있다. 그 실행은
@@ -124,9 +125,10 @@ class RedisLease(Lease):
         c, last_ok = self.ctx, time.monotonic()
         while True:
             await asyncio.sleep(c.cfg.heartbeat_sec)
-            try:
-                res = await self.own.heartbeat()
-            except Exception as e:                        # Redis 일시 장애: TTL 안이면 다음 박동에 다시
+            left = c.cfg.lease_sec - (time.monotonic() - last_ok)
+            try:                                          # 응답이 멈춰도 기다리는 건 키의 남은 TTL까지 (리뷰 6차 ⑤)
+                res = await asyncio.wait_for(self.own.heartbeat(), timeout=max(left, 0.01))
+            except Exception as e:                        # Redis 일시 장애·무응답: TTL 안이면 다음 박동에 다시
                 if time.monotonic() - last_ok < c.cfg.lease_sec:
                     log("lease", f"heartbeat 실패({type(e).__name__}) → 다음 주기에 재시도")
                     continue
