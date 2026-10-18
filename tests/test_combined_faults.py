@@ -3,7 +3,7 @@
 Redis 소유 키 모드에서 실시간 요약이 실행 중일 때 Redis가 통째로 초기화되고(FLUSHALL), 그사이 새 전사가 들어온다.
   - 실행 중이던 worker는 heartbeat가 실패해 소유권을 잃고, 늦은 저장은 거절된다 (exec_epoch)
   - scheduler가 Redis 유실을 알아채 고립된 작업을 정리한다 (실시간 요약은 총 1회라 실패 확정)
-  - worker는 consumer group을 다시 만들고, 펜싱 카운터가 작아진 것은 stale_fence → 올림으로 복원한다
+  - worker는 consumer group을 다시 만들고, 다시 보낸 작업은 DB가 새 실행 세대를 발급해 소유 키를 다시 쓴다
   - 후속 요약이 처리 위치부터 읽어 전사 전체를 한 번에 요약한다 → 구간 빠짐·겹침·중복 저장 없음, 멈춘 작업 없음
 """
 import asyncio
@@ -53,9 +53,9 @@ def test_redis_wipe_during_summary_in_redis_liveness_mode(tmp_path, redis_url, m
     asyncio.run(t())
 
 
-def test_resent_orphan_heals_its_fence_after_redis_wipe(tmp_path, redis_url, monkeypatch):  # noqa: F811
-    """시도가 남은 작업(echo, 총 2회)이 실행 중일 때 Redis 초기화 → 다시 보내짐 → 펜싱 카운터가 1로 돌아가 stale_fence
-    → 카운터를 올리고 재배송 때 다시 잡아 완료. 첫 실행은 소유권을 잃고 저장하지 않는다 (완료 1번)."""
+def test_resent_orphan_runs_with_a_new_epoch_after_redis_wipe(tmp_path, redis_url, monkeypatch):  # noqa: F811
+    """시도가 남은 작업(echo, 총 2회)이 실행 중일 때 Redis 초기화 → 유실 복구가 다시 보냄 → DB가 세대 2를 발급해 소유 키를 씀
+    → 완료. 첫 실행은 소유 키가 사라져 잃고 저장하지 않는다 (완료 1번). 번호가 DB 세대라 초기화로 되돌아가지 않는다."""
     monkeypatch.setattr(S, "LIVENESS", "redis")
 
     async def t():

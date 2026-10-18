@@ -65,13 +65,11 @@ class JobStartIn(BaseModel):
     worker: str
     lease_sec: float = Field(description="DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 "
                                          "(NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch)")
-    fence: int | None = Field(None, description="Redis 소유 키를 얻을 때 받은 펜싱 번호. 이 작업에서 본 가장 큰 번호 이하면 "
-                                                "stale_fence로 거절 (소유권을 잃은 뒤 늦게 도착한 시작 요청)")
 
 
 class JobStartOut(BaseModel):
-    status: Literal["started", "done", "failed", "leased", "unknown", "stale_fence"]
-    fence_max: int | None = Field(None, description="stale_fence일 때 DB가 본 가장 큰 펜싱 번호 (Redis 카운터를 여기까지 올린다)")
+    status: Literal["started", "done", "failed", "leased", "unknown"]
+    exec_epoch: int | None = Field(None, description="started일 때 이번 실행 세대 (영속·단조). Redis 소유 키 모드는 이 값을 키에 담는다")
     kind: str | None = None
     payload: dict[str, Any] | None = None
     attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")
@@ -607,7 +605,7 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
                      "쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 다 처리되면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
              summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. "
-                     "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드)"),
+                     "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,
              summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음"),
     ToolSpec("job_finish", JobWorkerIn, JobFinishOut, W, "control", LEAD,
