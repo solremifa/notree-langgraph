@@ -284,3 +284,25 @@ def test_stale_generation_message_in_the_new_redis_is_dropped(tmp_path, redis_ur
             assert (await e.r.xpending(RT.stream, S.GROUP))["pending"] == 0
             assert (await e.row(j))["attempts"] == 1
     asyncio.run(t())
+
+
+@real_redis
+def test_generation_is_remembered_per_stream_not_just_per_message_id(redis_url):
+    """Stream 메시지 ID는 Stream마다 따로 매겨진다 → 빌려 쓰는 worker가 두 Stream에서 같은 ID를 함께 들 수 있다.
+    세대를 ID만으로 기억하면 한쪽이 덮어써 정상 메시지를 '이전 세대'로 잘못 거절할 수 있다."""
+    QA = dataclasses.replace(S.QA, claim_idle_ms=60000)
+
+    async def t():
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        await r.flushall()
+        for cfg in (QA, RT):
+            await r.xgroup_create(cfg.stream, S.GROUP, id="0", mkstream=True)
+        await r.xadd(QA.stream, {"job_id": "qa-job", "gen": "2"}, id="5-0")
+        await r.xadd(RT.stream, {"job_id": "rt-job", "gen": "1"}, id="5-0")    # 같은 ID, 다른 Stream·세대
+        w = Worker("A", QA, r, mcp=None, block_ms=0, borrow=RT, borrow_slots=1)
+        a = await w._read(QA, None)
+        b = await w._read(RT, None)
+        await r.aclose()
+        assert a[0] == b[0] == "5-0"
+        assert w._pop_gen(QA, "5-0") == 2 and w._pop_gen(RT, "5-0") == 1
+    asyncio.run(t())
