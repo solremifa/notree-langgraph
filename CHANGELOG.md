@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### 실시간 요약 리뷰 반영: 작업↔강의 연결 확인, 재전송 재등록 막기 · (이번 커밋)
+### 실시간 요약 리뷰 반영: 작업↔강의 연결 확인, 재전송 재등록 막기 · `a1face6`
 자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md#리뷰-반영-3b1c00e-이후)
 
 - 🐛 P1 `summary_publish`가 permit의 작업이 그 강의를 요약하는 작업인지 확인하지 않아, 다른 작업의 유효한 permit으로 남의 강의 요약을 바꿀 수 있었음 → 종류·lecture_id·사용자·현재 실행권 확인 (duplicate 경로 포함)
