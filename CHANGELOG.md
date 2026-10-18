@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### heartbeat를 Redis 소유 키로 (시험 구현, 기본값은 db) · (이번 커밋)
+### heartbeat를 Redis 소유 키로 (시험 구현, 기본값은 db) · `ae42b20`
 자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md) (브랜치 `feat/redis-heartbeat`)
 
 - 🆕 `NOTREE_LIVENESS=redis`: 소유 키 `SET NX` + Lua heartbeat 한 번(토큰 일치·PEL 소유자 나·원본 메시지 존재일 때만 갱신). DB heartbeat 없음, 늦은 쓰기는 `exec_epoch`
