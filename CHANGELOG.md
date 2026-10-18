@@ -11,7 +11,7 @@
 
 ## 2026-10-18
 
-### 배정·회수·Redis 유실 복구 · (이번 커밋)
+### 배정·회수·Redis 유실 복구 · `6b98185`
 자세히: [docs/changes/2026-10-18-dispatch-recovery.md](docs/changes/2026-10-18-dispatch-recovery.md) (브랜치 `fix/dispatch-recovery`)
 
 - 🐛 배정기가 둘 이상이면 같은 작업을 두 번 허가하고 끝난 작업을 reserved로 되돌릴 수 있었음 → 한 트랜잭션 + `WHERE state='pending'`
