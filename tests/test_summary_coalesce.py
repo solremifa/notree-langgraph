@@ -409,3 +409,38 @@ def test_id_collision_is_not_mistaken_for_a_pending_summary(tmp_path, monkeypatc
     with pytest.raises(sqlite3.IntegrityError, match="jobs.job_id"):
         with srv.tx() as con:
             srv._enqueue_summary(con, con.execute("SELECT * FROM lectures WHERE lecture_id='M'").fetchone())
+
+
+def test_every_publish_response_lost_still_ends_as_done(tmp_path):
+    """리뷰 7차 ④: 저장은 매번 되는데(첫 번째는 저장, 나머지는 duplicate) 응답 4번을 모두 잃음 → 작업은 failed가 아니라 done.
+    job_fail이 같은 트랜잭션에서 이 작업의 요약이 저장됐는지 보고 완료로 바꾼다. LLM은 1번 (총 1회 정책 유지)."""
+    async def t():
+        async with Env(tmp_path) as e:
+            mcp = LostResponseMcp(e.m_w, {"summary_publish": 99})
+            e.start_worker(cfg=RT, mcp=mcp)
+            await e.api.tool("lecture_start", lecture_id=L, user_id=U)
+            j = (await e.api.tool("transcript_commit", lecture_id=L, user_id=U, segments=segs(1, 2)))["enqueued_job_id"]
+            assert await e.wait_state(j)
+            assert (await e.row(j))["state"] == "done", await e.row(j)
+            assert 99 - mcp.lose["summary_publish"] == 4                # 최초 + 재전송 3회 모두 응답 유실
+            assert ranges(e) == [(1, 2)] and LS.CALLS == [(1, 2)]
+    asyncio.run(t())
+
+
+def test_redis_loss_recovery_does_not_fail_a_job_whose_result_is_saved(tmp_path, monkeypatch):
+    """리뷰 7차 ②와 같은 경계: Redis 유실 복구가 시도 한도를 다 쓴 running을 실패 확정할 때도, 결과가 저장돼 있으면 완료."""
+    from notree.mcp_server import server as srv
+    monkeypatch.setattr(srv, "DB", tmp_path / "rec.db")
+    srv._init_db()
+    with srv.tx() as con:
+        for jid, saved in (("op-saved", True), ("op-unsaved", False)):
+            con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, attempts, lease_until, created, updated_at) "
+                        "VALUES(?, 'live_summary', '{}', 'notree:rt', 'running', 9, 0, 0, 0)", (jid,))
+            if saved:
+                con.execute("INSERT INTO summaries VALUES(?, 'L', 1, 1, 2, 1, '요약', 0)", (jid,))
+    res = srv.job_recover_orphans(start=True)
+    data = res.get("data", res)
+    assert data["done_instead"] == ["op-saved"] and data["failed"] == ["op-unsaved"], data
+    with srv.tx() as con:
+        st = dict(con.execute("SELECT job_id, state FROM jobs").fetchall())
+    assert st == {"op-saved": "done", "op-unsaved": "failed"}

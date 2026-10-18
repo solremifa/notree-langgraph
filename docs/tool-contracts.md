@@ -155,7 +155,7 @@ XADD 후 전송 완료 표시
 
 작업 제어 · 호출: scheduler · 정의: worker 담당
 
-Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 (살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료
+Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 (살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정(결과가 저장돼 있으면 완료). 대상이 없으면 복구 종료
 
 입력
 
@@ -171,6 +171,7 @@ Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·le
 |---|---|---|
 | `jobs` | `list[ReservedJob]` | 다시 XADD할 작업 (sent로 표시됨) |
 | `failed` | `list[str]` | 마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업 |
+| `done_instead` | `list[str]` = None | 마감·시도 한도에 걸렸지만 결과가 이미 저장돼 있어 완료로 확정한 작업 |
 | `held` | `int` = 0 | lease가 아직 살아 있어 보류한 running (다음 주기에 다시 확인) |
 | `open` | `bool` = False | 복구가 아직 안 끝남 (대상이 남아 있음) |
 | `next_after` | `str | null` = None | 이 쪽이 꽉 찼으면 다음 쪽 시작점 |
@@ -247,7 +248,7 @@ lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Re
 
 작업 제어 · 호출: worker · 정의: worker 담당 · permit 필요
 
-실패 확정. failed=true를 확인한 뒤에만 XACK
+실패 확정. 같은 트랜잭션에서 이 작업의 결과가 이미 저장됐는지 보고, 저장돼 있으면 완료로 확정(done_instead). failed 또는 done_instead를 확인한 뒤에만 XACK
 
 입력
 
@@ -263,6 +264,7 @@ lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Re
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | `failed` | `bool` |  |
+| `done_instead` | `bool` = False | 이 작업의 결과가 이미 저장돼 있어 실패 대신 완료(done)로 확정함 (저장 직후 응답만 잃은 경우). 이때도 XACK 해도 된다 |
 
 ### `job_release`
 

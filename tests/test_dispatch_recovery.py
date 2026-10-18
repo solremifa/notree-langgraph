@@ -391,6 +391,50 @@ def test_restore_from_an_old_snapshot_is_detected_as_loss(tmp_path):
 
 
 @real_redis
+def test_restart_during_the_recovery_scan_is_not_marked_as_checked(tmp_path):
+    """리뷰 7차 ①: 스캔 시작 때는 기존 Redis(유실 아님) → 스캔 도중 재시작(비어 있음) → 끝에서 새 run_id로 표시하면
+    복구하지 않은 새 Redis를 '확인함'으로 표시해 다음 스캔도 0건. 표시 키에는 스캔 **시작 때** 본 run_id를 남겨야 한다."""
+    from notree.scheduler.periodic import recover_after_redis_loss
+    port = _free_port()
+    proc = _redis_proc(port, tmp_path)
+    url = f"redis://127.0.0.1:{port}/0"
+
+    class RestartDuringScan:
+        def __init__(self, mcp, r):
+            self.mcp, self.r, self.armed = mcp, r, False
+
+        async def tool(self, name, **args):
+            nonlocal proc
+            res = await self.mcp.tool(name, **args)
+            if name == "job_recover_orphans" and self.armed:
+                self.armed = False
+                await self.r.connection_pool.disconnect()
+                proc.terminate(); proc.wait(5)                           # 스캔 도중 Redis 재시작 → 비어 있음
+                proc = _redis_proc(port, tmp_path)
+            return res
+
+    async def t():
+        async with RealEnv(tmp_path, url, allocator=False) as e:
+            await recover_after_redis_loss(e.r, e.api)                   # 표시 키 (기존 Redis)
+            j = await e.job({"text": "before-restart"})
+            got = (await e.api.tool("job_reserve_pending", limit=5, stream=RT.stream))["jobs"]
+            await e.r.xadd(RT.stream, {"job_id": j, "gen": str(got[0]["gen"])})
+            await e.api.tool("job_mark_sent", job_id=j)
+            mcp = RestartDuringScan(e.api, e.r)
+            mcp.armed = True
+            assert await recover_after_redis_loss(e.r, mcp) == 0         # 시작 땐 유실 아님 → 이번 스캔은 0건
+            assert await e.r.xlen(RT.stream) == 0                        # 새 Redis: 메시지 없음
+            assert await recover_after_redis_loss(e.r, e.api) == 1       # 다음 스캔이 유실을 발견하고 다시 보냄
+            e.start_worker(cfg=RT)
+            assert await e.wait_state(j, ("done",), timeout=15)
+
+    try:
+        asyncio.run(t())
+    finally:
+        proc.terminate(); proc.wait(5)
+
+
+@real_redis
 def test_compose_redis_settings_come_back_empty_after_restart(tmp_path):
     """docker-compose.yml의 redis command 인자 그대로 띄우고, 데이터를 쓴 뒤 정상 종료(SHUTDOWN) → 재시작하면 비어 있어야 한다
     (스냅숏·AOF를 남기지 않음). 설정 파일을 읽어 쓰므로 설정이 바뀌면 이 시험도 따라간다."""

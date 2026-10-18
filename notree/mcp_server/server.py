@@ -500,13 +500,32 @@ def job_finish(job_id: str, worker: str, permit: str | None = None) -> dict:
         return ok(C.JobFinishOut(finished=cur.rowcount == 1))
 
 
+def _result_saved(con, job_id: str, kind: str) -> bool:
+    """이 작업(idem_key = job_id)이 업무 결과를 이미 저장했나. 실패를 확정하는 트랜잭션 안에서 부른다 (리뷰 7차 ②④).
+    결과를 저장하는 작업 종류를 새로 만들면 여기에 그 결과 테이블을 더한다."""
+    if kind == "qa":
+        return con.execute("SELECT 1 FROM qa_questions WHERE job_id=? AND state='answered' AND idem_key=?",
+                           (job_id, job_id)).fetchone() is not None
+    if kind == "live_summary":
+        return con.execute("SELECT 1 FROM summaries WHERE idem_key=?", (job_id,)).fetchone() is not None
+    return False
+
+
 @tool
 def job_fail(job_id: str, worker: str, reason: str, user_retryable: bool, permit: str | None = None) -> dict:
-    """[worker] 실패 확정. failed=true를 확인한 뒤에만 XACK. user_retryable은 화면의 '다시 시도' 버튼 근거."""
+    """[worker] 실패 확정. failed=true(또는 done_instead=true)를 확인한 뒤에만 XACK. user_retryable은 '다시 시도' 버튼 근거.
+    결과 존재 여부와 최종 상태를 한 트랜잭션에서 정한다: 결과가 이미 저장돼 있으면(저장 직후 응답만 잃음) 실패 대신 완료.
+    worker가 따로 '저장됐나'를 물으면 그 확인이 실패할 때 '확인 불가'를 '미저장'으로 오인할 수 있어서 여기서 한다."""
     claims = _claims(permit, job_id)
     with tx() as con:
         if not _is_live(con, claims, job_id):
             return ok(C.JobFailOut(failed=False))
+        kind = con.execute("SELECT kind FROM jobs WHERE job_id=?", (job_id,)).fetchone()["kind"]
+        if _result_saved(con, job_id, kind):
+            cur = con.execute("UPDATE jobs SET state='done', lease_until=NULL, updated_at=? "
+                              "WHERE job_id=? AND lease_owner=? AND state='running'", (time.time(), job_id, worker))
+            _log(con, "job_fail", job_id)
+            return ok(C.JobFailOut(failed=False, done_instead=cur.rowcount == 1))
         cur = con.execute("UPDATE jobs SET state='failed', lease_until=NULL, fail_reason=?, user_retryable=?, "
                           "updated_at=? WHERE job_id=? AND lease_owner=? AND state='running'",
                           (reason, int(user_retryable), time.time(), job_id, worker))
@@ -538,6 +557,7 @@ def job_recover_orphans(start: bool = False, after: str | None = None, limit: in
                    (DB 모드: lease가 살아 있으면 worker가 실행 중. Redis 소유 키 모드: lease_sec=0이라 바로 대상)
       늦은 시작  : 이전 세대 메시지의 job_start는 stale_dispatch로 거절된다 → 상태가 안 바뀌어 대상에 그대로 남는다
       다시 보내기 전: 마감이 지났으면 실패 확정(다시 시도 가능), running인데 시도 한도를 다 썼으면 실패 확정
+                   — 단 그 작업의 결과가 이미 저장돼 있으면 완료로 확정 (_result_saved)
       쪽 나누기  : job_id 순서로 limit개씩, next_after로 이어서 끝까지
       완료       : 대상이 하나도 남지 않으면 open=false
     다시 보낼 작업은 sent·dispatch_gen=지금 세대로 표시 → 대상에서 빠진다."""
@@ -550,7 +570,7 @@ def job_recover_orphans(start: bool = False, after: str | None = None, limit: in
         cond = "state IN ('reserved','sent','running') AND COALESCE(dispatch_gen, 0) < ?"
         rows = con.execute(f"SELECT * FROM jobs WHERE {cond} AND job_id > ? ORDER BY job_id LIMIT ?",
                            (gen, after or "", limit)).fetchall()
-        resend, failed, held = [], [], 0
+        resend, failed, done, held = [], [], [], 0
         for r in rows:
             if r["state"] == "running" and (r["lease_until"] or 0) >= now:
                 held += 1                                     # 살아 있는 lease → 다음 주기에 다시 확인
@@ -560,7 +580,10 @@ def job_recover_orphans(start: bool = False, after: str | None = None, limit: in
             limit_n = max_attempts_for(r["kind"], cfg) if cfg else 3
             reason = ("마감 시각 지남 (Redis 유실 복구)" if deadline is not None and deadline <= now else
                       "시도 한도 초과 (Redis 유실 복구)" if r["state"] == "running" and r["attempts"] >= limit_n else None)
-            if reason:
+            if reason and _result_saved(con, r["job_id"], r["kind"]):   # 저장은 됐는데 완료 표시 전에 Redis를 잃음
+                _set(con, r["job_id"], state="done", lease_until=None)
+                done.append(r["job_id"])
+            elif reason:
                 _set(con, r["job_id"], state="failed", lease_until=None, fail_reason=reason, user_retryable=1)
                 failed.append(r["job_id"])
             else:
@@ -570,7 +593,7 @@ def job_recover_orphans(start: bool = False, after: str | None = None, limit: in
         nxt = rows[-1]["job_id"] if len(rows) == limit else None
         remaining = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {cond}", (gen,)).fetchone()[0]
         return ok(C.JobRecoverOut(jobs=[C.ReservedJob(job_id=r["job_id"], kind=r["kind"], stream=r["stream"], gen=gen)
-                                        for r in resend], failed=failed, held=held, open=remaining > 0,
+                                        for r in resend], failed=failed, done_instead=done, held=held, open=remaining > 0,
                                   next_after=nxt))
 
 

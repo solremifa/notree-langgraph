@@ -109,6 +109,8 @@ class JobFailIn(BaseModel):
 
 class JobFailOut(BaseModel):
     failed: bool
+    done_instead: bool = Field(False, description="이 작업의 결과가 이미 저장돼 있어 실패 대신 완료(done)로 확정함 "
+                                                  "(저장 직후 응답만 잃은 경우). 이때도 XACK 해도 된다")
 
 
 class JobReleaseIn(BaseModel):
@@ -140,6 +142,8 @@ class JobRecoverIn(BaseModel):
 class JobRecoverOut(BaseModel):
     jobs: list[ReservedJob] = Field(description="다시 XADD할 작업 (sent로 표시됨)")
     failed: list[str] = Field(description="마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업")
+    done_instead: list[str] = Field(default_factory=list,
+                                    description="마감·시도 한도에 걸렸지만 결과가 이미 저장돼 있어 완료로 확정한 작업")
     held: int = Field(0, description="lease가 아직 살아 있어 보류한 running (다음 주기에 다시 확인)")
     open: bool = Field(False, description="복구가 아직 안 끝남 (대상이 남아 있음)")
     next_after: str | None = Field(None, description="이 쪽이 꽉 찼으면 다음 쪽 시작점")
@@ -605,7 +609,7 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
     ToolSpec("job_recover_orphans", JobRecoverIn, JobRecoverOut, SCH, "control", LEAD,
              summary="Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 "
-                     "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료"),
+                     "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정(결과가 저장돼 있으면 완료). 대상이 없으면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
              summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. "
                      "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)"),
@@ -613,7 +617,8 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
              summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음"),
     ToolSpec("job_finish", JobWorkerIn, JobFinishOut, W, "control", LEAD,
              summary="완료 표시. finished=true를 확인한 뒤에만 XACK"),
-    ToolSpec("job_fail", JobFailIn, JobFailOut, W, "control", LEAD, summary="실패 확정. failed=true를 확인한 뒤에만 XACK"),
+    ToolSpec("job_fail", JobFailIn, JobFailOut, W, "control", LEAD, summary="실패 확정. 같은 트랜잭션에서 이 작업의 결과가 이미 저장됐는지 보고, 저장돼 있으면 "
+                     "완료로 확정(done_instead). failed 또는 done_instead를 확인한 뒤에만 XACK"),
     ToolSpec("job_release", JobReleaseIn, JobReleaseOut, W, "control", LEAD, summary="일시적 실패: lease 반납, 재배송 대기"),
     ToolSpec("job_retry", JobRetryIn, JobRetryOut, API, "control", LEAD, summary="사용자의 '다시 시도': failed → pending (결정 7)"),
     ToolSpec("job_get", JobIdIn, JobRow, DEV, "dev", LEAD, summary="작업 상태 조회"),

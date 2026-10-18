@@ -53,12 +53,17 @@ async def redis_lost(r) -> bool:
     return (await r.get(REDIS_MARKER)) != await redis_run_id(r)
 
 
+async def _lost_since(r) -> tuple[bool, str]:
+    run_id = await redis_run_id(r)
+    return (await r.get(REDIS_MARKER)) != run_id, run_id
+
+
 async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
     """매 주기. Redis 유실을 '발견'하면(redis_lost) DB의 전달 세대를 올리고(start) 표시 키(= 지금 run_id)를 둔다.
     복구가 '끝났는지'는 DB가 안다 (보류된 running이 남아 있으면 open) → 열려 있는 동안 매 주기 다시 확인한다.
     쪽 단위로 끝까지 돈다. 다시 보낸 작업 수.
     처음 배포할 때도 한 번 시작된다 (새 Redis와 지워진 Redis를 구분할 수 없음) — 중복 메시지는 job_start가 걸러 낸다."""
-    start = await redis_lost(r)
+    start, seen = await _lost_since(r)              # seen = 이번 스캔이 확인하는 Redis 프로세스
     sent, after = 0, None
     while True:
         res = await mcp.tool("job_recover_orphans", start=start, after=after, limit=page)
@@ -74,7 +79,10 @@ async def recover_after_redis_loss(r, mcp: McpClient, page: int = 500) -> int:
         after = res["next_after"]
     if res.get("held"):
         log("recover", f"lease가 살아 있는 작업 {res['held']}개는 보류 → 다음 주기에 다시 확인")
-    await r.set(REDIS_MARKER, await redis_run_id(r))   # 세대를 DB에 올린 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시)
+    # 표시 키에는 스캔을 **시작할 때** 본 run_id를 남긴다 (리뷰 7차 ①). 스캔 도중 Redis가 재시작했다면 이 쓰기는 새 Redis에
+    # 들어가지만 값이 새 run_id와 달라 다음 주기에 유실로 잡힌다. 끝에서 run_id를 다시 읽어 쓰면 복구하지 않은 새 Redis를
+    # '확인함'으로 표시하게 된다. 세대를 DB에 올린 뒤에 둔다 (그 전에 죽으면 다음 주기에 다시)
+    await r.set(REDIS_MARKER, seen)
     return sent
 
 
@@ -98,6 +106,12 @@ async def run_periodic(r, mcp: McpClient, stop: asyncio.Event | None = None, *,
                        keep_sec: float = S.CHECKPOINT_KEEP_SEC) -> None:
     ACTOR.set("scheduler")
     stop = stop or asyncio.Event()
+    try:
+        if await redis_run_id(r) == NO_RUN_ID:
+            log("warn", "Redis INFO를 쓸 수 없음 → 유실 판단은 표시 키가 있나만 본다. 스냅숏·AOF 복원과 재시작 도중 유실은 "
+                        "감지하지 못하므로 운영에서는 INFO 허용 + 비영속(save \"\", appendonly no)이 조건")
+    except Exception:
+        pass
     loop = asyncio.get_running_loop()
     next_resend = next_cleanup = loop.time()
     while not stop.is_set():

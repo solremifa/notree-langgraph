@@ -15,11 +15,7 @@
      그 밖의 예외는 RetryableError처럼 취급되고, 시도 한도를 넘으면 실패 확정된다.
      MCP 도구의 거절은 ctx.tool()이 서버가 준 retryable 값을 보고 알아서 둘 중 하나로 바꿔 던진다.
   5. ACK·완료 표시·lease는 신경 쓰지 않는다 (루프가 한다).
-  6. 결과를 저장한 뒤 응답만 잃을 수 있는 핸들러는 done_check를 함께 등록한다:
-       @handler("qa", done_check=qa_saved)   # async (ctx) -> bool : 이 작업(ctx.job_id)의 결과가 이미 저장됐나
-     루프는 다음 시도가 없는 실패(시도 한도·마감 초과)를 확정하기 전에 이것을 불러, 저장돼 있으면 완료로 확정한다.
-     읽기만 해야 한다 (LLM 호출·저장 금지).
-  7. payload에 deadline_at(unix 초)이 있으면 루프가 남은 시간만큼만 실행한다 (Q&A 90초 약속, 팀 결정 2번).
+  6. payload에 deadline_at(unix 초)이 있으면 루프가 남은 시간만큼만 실행한다 (Q&A 90초 약속, 팀 결정 2번).
      핸들러가 더 잘게 쓰고 싶으면 ctx.time_left()를 본다.
 """
 import time
@@ -89,18 +85,14 @@ class JobContext:
 
 
 Handler = Callable[[JobContext], Awaitable[None]]
-DoneCheck = Callable[[JobContext], Awaitable[bool]]
 HANDLERS: dict[str, Handler] = {}
-DONE_CHECKS: dict[str, DoneCheck] = {}
 
 
-def handler(kind: str, done_check: DoneCheck | None = None) -> Callable[[Handler], Handler]:
+def handler(kind: str) -> Callable[[Handler], Handler]:
     def deco(fn: Handler) -> Handler:
         if kind in HANDLERS:
             raise ValueError(f"핸들러 중복: {kind}")
         HANDLERS[kind] = fn
-        if done_check is not None:
-            DONE_CHECKS[kind] = done_check
         return fn
     return deco
 

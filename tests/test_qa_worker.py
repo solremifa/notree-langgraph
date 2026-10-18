@@ -354,3 +354,37 @@ def test_deadline_passing_right_after_the_save_still_finishes_the_job(tmp_path):
             assert row["state"] == "done" and row["attempts"] == 1, row
             assert (await e.api.tool("qa_get", question_id=q["question_id"], user_id=USER))["state"] == "answered"
     run(t())
+
+
+class SaveLostThenFailUnconfirmed(LoseEveryCompleteResponse):
+    """리뷰 7차 ②: 저장 응답 유실 + 실패 확정(job_fail)도 첫 확인 묶음(3번)은 서버에 닿지 못함 = '확인 불가'."""
+
+    def __init__(self, mcp):
+        super().__init__(mcp)
+        self.fail_blocked = 3
+
+    async def tool(self, name, **args):
+        if name == "job_fail" and self.fail_blocked > 0:
+            self.fail_blocked -= 1
+            raise ConnectionResetError("job_fail 전달 실패 (시험)")
+        return await super().tool(name, **args)
+
+
+def test_unconfirmed_outcome_is_not_settled_as_failure_and_llm_is_not_called_again(tmp_path, monkeypatch):
+    """확인 불가에서는 실패를 확정하지 않고 ACK도 안 함 → 재배송(시도 > 한도)은 핸들러 없이 확정만 다시 → 서버가 저장을 보고 완료."""
+    monkeypatch.setitem(S.KIND_MAX_ATTEMPTS, "qa", 1)
+    async def t():
+        async with Env(tmp_path) as e:
+            await e.api.tool("qa_seed", user_id=USER, course_id="c1", course_name="자료구조", docs=docs())
+            llm, mcp = FakeQALLM(), SaveLostThenFailUnconfirmed(e.m_w)
+            e.start_worker(QA, name="q", mcp=mcp, extras={"qa_llm": llm})
+            q = await ask(e, "스택 오버플로는 왜 생겨?")
+            await asyncio.sleep(1.5)                                    # 첫 시도의 확인 묶음이 끝날 때까지
+            assert (await e.row(q["job_id"]))["state"] == "running"      # 실패로 확정하지 않음
+            assert await e.wait_state(q["job_id"], timeout=20)
+            row = await e.row(q["job_id"])
+            assert row["state"] == "done" and row["attempts"] == 2, row  # 두 번째 배송은 확정만
+            assert llm.calls.count("understand") == 1 and mcp.lost == 1  # LLM·저장 다시 안 함
+            counts = (await e.api.tool("tool_stats", thread_id=q["job_id"]))["counts"]
+            assert counts["qa_context"] == 1 and counts["qa_search"] == 2
+    run(t())

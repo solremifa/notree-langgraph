@@ -11,7 +11,18 @@
 
 ## 2026-10-19
 
-### ⑤ heartbeat 무응답에도 lease 만료 판단 · (이번 커밋)
+### 리뷰 7차: 복구 도중 재시작, 확인 불가와 미저장 구분, touch 시간 제한, 요약 결과 확인 · (이번 커밋)
+자세히: [docs/changes/2026-10-19-review-7.md](docs/changes/2026-10-19-review-7.md)
+- 🐛 복구 스캔 도중 Redis가 재시작하면 새 Redis를 '확인함'으로 표시 → 표시 키에 스캔 시작 때의 run_id를 씀
+- 🐛 저장 확인이 실패하면 '미저장'으로 보고 실패 확정, 요약은 저장 응답을 모두 잃으면 failed → `job_fail`이 같은 트랜잭션에서 결과를 보고 완료로
+- ⚠️ 계약: `JobFailOut.done_instead`, `JobRecoverOut.done_instead` 추가. worker는 `failed` 또는 `done_instead`를 확인한 뒤 XACK
+- 🗑 worker 쪽 `done_check`(③) 삭제 → 서버 확인으로 대체
+- 🔧 시도 한도를 넘긴 재배송은 핸들러(LLM)를 다시 돌리지 않고 확정만 다시 보냄
+- 🐛 DB 모드 `touch()`가 멈추면 heartbeat 루프도 멈춤 → heartbeat 주기만큼만 기다림
+- 🆕 INFO를 못 쓰는 Redis면 scheduler 시작 때 경고
+- 테스트 → 173개
+
+### ⑤ heartbeat 무응답에도 lease 만료 판단 · `de2d59c`
 - 🐛 heartbeat가 오류 대신 응답을 멈추면 TTL이 지나도 작업이 계속됨 → 한 번의 heartbeat는 남은 TTL까지만 기다리고, 넘기면 잃은 것으로 취소
 - 🔧 DB lease(기본 모드)도 같은 규칙: lease 동안 한 번도 갱신 못 하면 스스로 멈춤 (전에는 일시 오류면 기한 없이 계속)
 - 테스트 → 167개

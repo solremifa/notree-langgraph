@@ -83,3 +83,31 @@ def test_one_slow_heartbeat_inside_the_lease_is_not_a_loss():
             await asyncio.sleep(0.5)
         assert not lease.lost
     asyncio.run(t())
+
+
+def _counting(value):
+    calls = []
+
+    async def f(*a, **k):
+        calls.append(time.monotonic())
+        return value
+    return f, calls
+
+
+def test_db_touch_that_never_answers_does_not_stall_the_heartbeat_loop():
+    """리뷰 7차 ③: DB heartbeat 뒤의 Redis touch()가 멈추면 다음 DB heartbeat도 멈춰 DB lease가 서버에서 만료됐다.
+    touch는 heartbeat 주기만큼만 기다리고 루프는 계속 → DB lease는 계속 갱신된다."""
+    beat, calls = _counting({"renewed": True})
+
+    async def t():
+        async with Lease(_ctx(_Mcp(beat)), touch=Hang()) as lease:
+            await asyncio.sleep(0.4)
+        assert not lease.lost
+    asyncio.run(t())
+    assert len(calls) >= 4, calls                       # 0.4초 동안 (박동 0.03 + touch 상한 0.03)마다 갱신
+
+
+def test_db_touch_hang_then_heartbeat_hang_still_loses_the_lease():
+    """touch가 멈춘 상태에서 heartbeat까지 응답을 멈춰도 lease 시간 안에 손을 뗀다."""
+    took = asyncio.run(_run_until_lost(Lease(_ctx(_Mcp(Hang(2, {"renewed": True}))), touch=Hang())))
+    assert took < 0.4, took

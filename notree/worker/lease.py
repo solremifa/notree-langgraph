@@ -7,7 +7,7 @@
 또는 lease 시간 동안 한 번도 갱신하지 못하면(오류·무응답 — 한 번의 호출은 lease의 남은 시간까지만 기다린다)
 핸들러를 취소하고 LeaseLost를 던진다 → 루프는 ACK도 완료 표시도 하지 않고 손을 뗀다.
 
-heartbeat가 성공할 때마다 touch()도 부른다. 루프는 여기서 Redis 메시지의 '방치 시간'을 0으로 되돌린다
+heartbeat가 성공할 때마다 touch()도 부른다 (heartbeat 주기만큼만 기다림 — 멈춰도 heartbeat 루프는 계속). 루프는 여기서 Redis 메시지의 '방치 시간'을 0으로 되돌린다
 (XCLAIM … JUSTID). 그래야 살아서 실행 중인 메시지가 XAUTOCLAIM 재배송 대상에 오르지 않는다.
 """
 import asyncio
@@ -61,9 +61,9 @@ class Lease:
                 log("lease", f"lease를 잃음({why}) → 작업 취소")
                 self._owner.cancel()
                 return
-            if self.touch:
+            if self.touch:                                      # Redis가 멈춰도 다음 박동·만료 판단을 막지 않게 (리뷰 7차 ③)
                 try:
-                    await self.touch()
+                    await asyncio.wait_for(self.touch(), timeout=c.cfg.heartbeat_sec)
                 except Exception as e:                          # 다음 박동에 다시
                     log("lease", f"Redis 방치 시간 초기화 실패({type(e).__name__})")
 
