@@ -47,6 +47,13 @@
 | `note_publish` | 쓰기 | worker | T3·T4 |  |  | 구현 |
 | `note_get` | 개발용 | dev | T3·T4 |  |  | 구현 |
 | `tool_stats` | 개발용 | dev | worker 담당 |  |  | 구현 |
+| `transcript_range` | 읽기 | worker | T3·T4 | T1·T2 | ○ | 구현 |
+| `summary_publish` | 쓰기 | worker | T3·T4 |  |  | 구현 |
+| `lecture_start` | 쓰기 | api | T3·T4 |  |  | 구현 |
+| `transcript_commit` | 쓰기 | api | T3·T4 |  |  | 구현 |
+| `lecture_end` | 쓰기 | api | T3·T4 |  |  | 구현 |
+| `lecture_get` | 개발용 | dev | T3·T4 |  |  | 구현 |
+| `summary_recover` | 작업 제어 | scheduler | T3·T4 |  |  | 구현 |
 | `qa_ask` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
 | `qa_context` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
 | `qa_search` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
@@ -55,9 +62,7 @@
 | `qa_get` | 읽기 | api | T5 | T3·T4 |  | 구현 |
 | `qa_delete` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
 | `qa_seed` | 개발용 | dev | T5 |  |  | 구현 |
-| `transcript_range` | 읽기 | worker | T3·T4 | T1·T2 | ○ | 계획 |
 | `summary_segments` | 읽기 | worker | T3·T4 |  |  | 계획 |
-| `summary_publish` | 쓰기 | worker | T3·T4 |  |  | 계획 |
 | `notes_read` | 읽기 | worker | T3·T4 | T5 | ○ | 계획 |
 | `notes_search` | 읽기 | worker | T3·T4 | T5 | ○ | 계획 |
 | `lecture_note_publish` | 쓰기 | worker | T3·T4 |  |  | 계획 |
@@ -488,6 +493,173 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 |---|---|---|
 | `counts` | `dict[str, int]` |  |
 
+### `transcript_range`
+
+읽기 · 호출: worker · 정의: T3·T4 · 리뷰: T1·T2 · **모델에 노출** · permit 필요
+
+[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. 읽은 끝 번호를 attempted_until로 남긴다 (누락 복구 판단용)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `after_seq` | `int | null` = None | 이 번호 이후의 확정 전사만. 없으면 요약이 끝난 위치(processed_until) 이후 |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `state` | `"recording" | "ended" | "cancelled"` |  |
+| `rolling_summary` | `str` |  |
+| `new_text` | `str` |  |
+| `from_seq` | `int` | 이번 범위의 첫 번호 (= processed_until + 1) |
+| `last_seq` | `int` | 이번 범위의 끝 번호 (= 읽은 시점의 saved_until). from_seq보다 작으면 새 전사 없음 |
+| `generation` | `int` | 발행할 때 expected_generation으로 다시 넘긴다 |
+
+### `summary_publish`
+
+쓰기 · 호출: worker · 정의: T3·T4 · permit 필요
+
+[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq) 확인
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `idem_key` | `str` |  |
+| `lecture_id` | `str` |  |
+| `expected_generation` | `int` |  |
+| `from_seq` | `int` | transcript_range가 준 from_seq. 요약 위치가 그 사이 움직였으면 stale |
+| `upto_seq` | `int` |  |
+| `text` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `status` | `"published" | "duplicate" | "stale"` |  |
+| `summary_version` | `int` |  |
+| `processed_until` | `int` |  |
+
+### `lecture_start`
+
+쓰기 · 호출: api · 정의: T3·T4
+
+[PoC] 녹음 시작 (강의 행)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `state` | `str` |  |
+| `generation` | `int` |  |
+| `saved_until` | `int` |  |
+| `processed_until` | `int` |  |
+| `attempted_until` | `int` |  |
+| `rolling_summary` | `str` |  |
+| `summary_version` | `int` |  |
+
+### `transcript_commit`
+
+쓰기 · 호출: api · 정의: T3·T4
+
+[PoC] 확정 전사 묶음 저장 + 대기 중 요약이 없으면 요약 작업 1건 등록 (강의당 대기 1개, DB 유일 인덱스)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `user_id` | `str` |  |
+| `segments` | `list[dict[str, any]]` | [{seq, text}] 확정 전사. seq는 saved_until+1부터 빈틈 없이 (이미 저장된 번호는 무시) |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `saved_until` | `int` |  |
+| `enqueued_job_id` | `str | null` = None | 이번 커밋이 새로 등록한 요약 작업. 대기 중 요약이 이미 있으면 None (합쳐짐) |
+| `coalesced` | `bool` |  |
+
+### `lecture_end`
+
+쓰기 · 호출: api · 정의: T3·T4
+
+[PoC] 녹음 종료: 상태 ended, 세대 +1 (늦은 실시간 요약이 덮지 못하게)
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `state` | `str` |  |
+| `generation` | `int` |  |
+| `saved_until` | `int` |  |
+| `processed_until` | `int` |  |
+| `attempted_until` | `int` |  |
+| `rolling_summary` | `str` |  |
+| `summary_version` | `int` |  |
+
+### `lecture_get`
+
+개발용 · 호출: dev · 정의: T3·T4
+
+[PoC] 강의 상태·요약 위치 조회
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `lecture_id` | `str` |  |
+| `state` | `str` |  |
+| `generation` | `int` |  |
+| `saved_until` | `int` |  |
+| `processed_until` | `int` |  |
+| `attempted_until` | `int` |  |
+| `rolling_summary` | `str` |  |
+| `summary_version` | `int` |  |
+
+### `summary_recover`
+
+작업 제어 · 호출: scheduler · 정의: T3·T4
+
+[PoC] 누락 복구: 녹음 중이고 아직 아무도 시도 안 한 전사가 있는데 요약 작업이 없는 강의에 1건 등록
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `limit` | `int` = 50 |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `registered` | `list[str]` | 새로 등록한 요약 작업 job_id |
+
 ### `qa_ask`
 
 쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
@@ -669,28 +841,6 @@ PoC 검색용 노트·전사·웹 문서 넣기
 
 담당자가 PR로 필드를 확정하고 `notree/mcp_server/server.py`에 구현합니다.
 
-### `transcript_range` (계획)
-
-읽기 · 호출: worker · 정의: T3·T4 · 리뷰: T1·T2 · **모델에 노출** · permit 필요
-
-강의의 롤링 요약과 지정 번호 이후 확정 전사를 읽는다
-
-입력
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `lecture_id` | `str` |  |
-| `after_seq` | `int` | 이 번호 이후의 확정 전사만 |
-
-출력 (`data`)
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `rolling_summary` | `str` |  |
-| `new_text` | `str` |  |
-| `last_seq` | `int` |  |
-| `generation` | `int` | 발행할 때 expected_generation으로 다시 넘긴다 |
-
 ### `summary_segments` (계획)
 
 읽기 · 호출: worker · 정의: T3·T4 · permit 필요
@@ -710,28 +860,6 @@ PoC 검색용 노트·전사·웹 문서 넣기
 | `segments` | `list[SummarySegment]` |  |
 | `missing_ranges` | `list[list[int]]` |  |
 | `generation` | `int` |  |
-
-### `summary_publish` (계획)
-
-쓰기 · 호출: worker · 정의: T3·T4 · permit 필요
-
-실시간 요약 저장 + outbox
-
-입력
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `idem_key` | `str` |  |
-| `lecture_id` | `str` |  |
-| `expected_generation` | `int` |  |
-| `upto_seq` | `int` |  |
-| `text` | `str` |  |
-
-출력 (`data`)
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `summary_version` | `int` |  |
 
 ### `notes_read` (계획)
 

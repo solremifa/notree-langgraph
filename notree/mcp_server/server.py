@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -77,11 +77,29 @@ CREATE TABLE IF NOT EXISTS qa_docs(
 CREATE TABLE IF NOT EXISTS qa_questions(
   question_id TEXT PRIMARY KEY, user_id TEXT, course_id TEXT, question TEXT, job_id TEXT,
   generation INTEGER DEFAULT 1, state TEXT, answer TEXT, answer_id TEXT, idem_key TEXT, created REAL, updated_at REAL);
+CREATE TABLE IF NOT EXISTS lectures(
+  lecture_id TEXT PRIMARY KEY, user_id TEXT, state TEXT, generation INTEGER DEFAULT 1,
+  saved_until INTEGER DEFAULT 0, processed_until INTEGER DEFAULT 0, attempted_until INTEGER DEFAULT 0,
+  rolling_summary TEXT DEFAULT '', summary_version INTEGER DEFAULT 0, updated_at REAL);
+CREATE TABLE IF NOT EXISTS transcripts(lecture_id TEXT, seq INTEGER, text TEXT, PRIMARY KEY(lecture_id, seq));
+CREATE TABLE IF NOT EXISTS summaries(
+  idem_key TEXT PRIMARY KEY, lecture_id TEXT, version INTEGER, from_seq INTEGER, upto_seq INTEGER,
+  generation INTEGER, text TEXT, created REAL);
 """
 # 나중에 추가된 컬럼 (이전 버전 DB 호환)
+# 실시간 요약: 강의당 '대기 중(pending)' 요약은 하나뿐 (DB 제약). 동시 커밋이 각각 "없다"고 보고 둘을 넣는 경쟁을 막는다.
+# 실행 중(reserved·sent·running) 요약과 대기 1개는 함께 있을 수 있다 → 대기 1개가 그사이 들어온 전사를 모두 합친다.
+AFTER_COLUMNS = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_pending_summary ON jobs(lecture_id)
+  WHERE kind='live_summary' AND state='pending';
+CREATE INDEX IF NOT EXISTS jobs_lecture ON jobs(lecture_id, kind, state);
+"""
+SUMMARY_IN_FLIGHT = ("reserved", "sent", "running")
+
 ADDED_COLUMNS = [
     ("jobs", "user_id TEXT"), ("jobs", "updated_at REAL"), ("jobs", "user_retryable INTEGER"),
     ("jobs", "exec_epoch INTEGER DEFAULT 0"),   # 실행 세대: job_start마다 +1, 절대 되돌리지 않음 (job_retry도)
+    ("jobs", "lecture_id TEXT"),                 # 실시간 요약 합치기용 (강의당 대기 1개)
     ("notes", "user_id TEXT"),
 ]
 
@@ -99,6 +117,7 @@ def _init_db() -> None:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
                 except sqlite3.OperationalError:
                     pass
+            con.executescript(AFTER_COLUMNS)
             con.commit()
             con.close()
             return
@@ -185,8 +204,9 @@ def _issue_permit(job_id: str, worker: str, attempt: int, epoch: int, user_id: s
     return f"{body}.{_sign(body)}"
 
 
-def _claims(permit: str | None, job_id: str) -> dict | None:
-    """permit을 확인하고 claims를 돌려준다. permit이 없으면 None (REQUIRE_PERMIT=1이면 거절)."""
+def _claims(permit: str | None, job_id: str | None) -> dict | None:
+    """permit을 확인하고 claims를 돌려준다. permit이 없으면 None (REQUIRE_PERMIT=1이면 거절).
+    job_id=None이면 어느 작업의 permit인지는 보지 않는다 (서명·만료만. 읽기 도구가 사용자 범위를 확인할 때)."""
     if permit is None:
         if REQUIRE_PERMIT:
             raise Reject(ErrorCode.PERMIT_INVALID, "permit 필요")
@@ -198,7 +218,7 @@ def _claims(permit: str | None, job_id: str) -> dict | None:
         raise Reject(ErrorCode.PERMIT_INVALID, "permit 형식 오류") from None
     if not hmac.compare_digest(sig, _sign(body)):
         raise Reject(ErrorCode.PERMIT_INVALID, "permit 서명 불일치")
-    if claims.get("j") != job_id:
+    if job_id is not None and claims.get("j") != job_id:
         raise Reject(ErrorCode.PERMIT_INVALID, "다른 작업의 permit")
     if claims.get("e", 0) < time.time():
         raise Reject(ErrorCode.PERMIT_INVALID, "permit 만료")
@@ -343,16 +363,18 @@ def job_create(kind: str, payload: dict, user_id: str, stream: str | None = None
     return ok(C.JobCreateOut(job_id=job_id))
 
 
-def _insert_job(con, kind: str, payload: dict, user_id: str, stream: str | None = None) -> str:
-    """작업 의도 한 행. 업무 데이터를 쓰는 트랜잭션 안에서 부른다 (qa_ask처럼)."""
+def _insert_job(con, kind: str, payload: dict, user_id: str, stream: str | None = None,
+                lecture_id: str | None = None) -> str:
+    """작업 의도 한 행. 업무 데이터를 쓰는 트랜잭션 안에서 부른다 (qa_ask처럼).
+    실시간 요약은 lecture_id를 준다 → 대기 중 요약이 이미 있으면 sqlite3.IntegrityError (jobs_one_pending_summary)."""
     job_id = f"op-{uuid.uuid4().hex[:8]}"
     now = time.time()
     if kind in KIND_DEADLINE_SEC and payload.get("deadline_at") is None:   # Q&A·채점: 요청부터 전체 90초
         payload = {**payload, "deadline_at": now + KIND_DEADLINE_SEC[kind]}
-    con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, created, updated_at, user_id, lecture_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (job_id, kind, json.dumps(payload, ensure_ascii=False),
-                 stream or STREAM_OF.get(kind, "notree:batch"), "pending", now, now, user_id))
+                 stream or STREAM_OF.get(kind, "notree:batch"), "pending", now, now, user_id, lecture_id))
     _log(con, "job_create", job_id)
     return job_id
 
@@ -361,13 +383,17 @@ def _insert_job(con, kind: str, payload: dict, user_id: str, stream: str | None 
 def job_reserve_pending(limit: int = 10, stream: str | None = None) -> dict:
     """[scheduler 배정기] 대기 중인 의도 → 실행 허가(reserved). 동시 상한·예산 검사가 들어갈 자리.
     stream을 주면 그 레인만 고른다. 어떤 레인을 얼마나 먼저 고를지는 배정기(애플리케이션)가 정한다."""
+    # 실시간 요약은 같은 강의의 요약이 실행 중(reserved·sent·running)이면 허가하지 않는다 → 강의당 동시 실행 1개.
+    # 대기 1개는 앞 요약이 끝난 뒤 허가되고, 시작할 때 그때까지 쌓인 전사를 한꺼번에 읽는다 (업무 규칙은 서비스에서)
+    gate = (" AND NOT (kind='live_summary' AND EXISTS (SELECT 1 FROM jobs j2 WHERE j2.kind='live_summary' "
+            "AND j2.lecture_id=jobs.lecture_id AND j2.state IN ('reserved','sent','running')))")
     with db() as con:
         if stream is None:
-            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' ORDER BY created LIMIT ?",
-                               (limit,)).fetchall()
+            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending'" + gate +
+                               " ORDER BY created LIMIT ?", (limit,)).fetchall()
         else:
-            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' AND stream=? "
-                               "ORDER BY created LIMIT ?", (stream, limit)).fetchall()
+            rows = con.execute("SELECT job_id, kind, stream FROM jobs WHERE state='pending' AND stream=?" + gate +
+                               " ORDER BY created LIMIT ?", (stream, limit)).fetchall()
         for r in rows:
             _set(con, r["job_id"], state="reserved")
             _log(con, "job_reserve_pending", r["job_id"])
@@ -513,6 +539,139 @@ def job_get(job_id: str) -> dict:
         d["payload"] = json.loads(d["payload"])
         d["user_retryable"] = None if d["user_retryable"] is None else bool(d["user_retryable"])
         return ok(C.JobRow(found=True, **d))
+
+
+# ── 실시간 요약 (PoC: SQLite, 실제는 PG) ─────────────────────────────
+# 위치 세 개 (강의 행): saved_until(저장된 확정 전사 끝) ≥ attempted_until(요약이 읽어 간 끝) ≥ processed_until(요약 끝)
+# 합치기: 강의당 대기 요약 1개(유일 인덱스) + 실행 중 1개(배정 조건). 대기 요약은 시작할 때 그때까지의 전사를 모두 읽는다.
+def _lecture(con, lecture_id: str, user_id: str | None = None) -> sqlite3.Row:
+    r = con.execute("SELECT * FROM lectures WHERE lecture_id=?", (lecture_id,)).fetchone()
+    if not r or (user_id is not None and r["user_id"] != user_id):
+        raise Reject(ErrorCode.NOT_FOUND, f"강의 없음: {lecture_id}")
+    return r
+
+
+def _lecture_out(r) -> dict:
+    return ok(C.LectureOut(**{k: r[k] for k in C.LectureOut.model_fields}))
+
+
+def _enqueue_summary(con, lec: sqlite3.Row) -> str | None:
+    """대기 요약이 없으면 1건 등록하고 job_id, 이미 있으면 None (합쳐짐)."""
+    try:
+        return _insert_job(con, "live_summary", {"lecture_id": lec["lecture_id"]}, lec["user_id"],
+                           lecture_id=lec["lecture_id"])
+    except sqlite3.IntegrityError:
+        return None
+
+
+@tool
+def lecture_start(lecture_id: str, user_id: str) -> dict:
+    """[api] 녹음 시작."""
+    with tx() as con:
+        con.execute("INSERT OR IGNORE INTO lectures(lecture_id, user_id, state, updated_at) VALUES(?,?,'recording',?)",
+                    (lecture_id, user_id, time.time()))
+        return _lecture_out(_lecture(con, lecture_id, user_id))
+
+
+@tool
+def transcript_commit(lecture_id: str, user_id: str, segments: list[dict]) -> dict:
+    """[api·gateway] 확정 전사 묶음 + (대기 요약이 없으면) 요약 작업 의도를 한 트랜잭션에."""
+    with tx() as con:
+        lec = _lecture(con, lecture_id, user_id)
+        if lec["state"] != "recording":
+            raise Reject(ErrorCode.GENERATION_MISMATCH, f"녹음 중이 아님 ({lec['state']})")
+        saved = lec["saved_until"]
+        for seg in sorted(segments, key=lambda x: int(x["seq"])):
+            seq = int(seg["seq"])
+            if seq <= saved:
+                continue                                     # 다시 보낸 묶음 (멱등)
+            if seq != saved + 1:
+                raise ValueError(f"전사 번호에 빈틈: {saved} 다음이 {seq}")
+            con.execute("INSERT INTO transcripts VALUES(?,?,?)", (lecture_id, seq, seg["text"]))
+            saved = seq
+        con.execute("UPDATE lectures SET saved_until=?, updated_at=? WHERE lecture_id=?", (saved, time.time(), lecture_id))
+        _log(con, "transcript_commit", lecture_id)
+        job_id = _enqueue_summary(con, lec) if saved > lec["processed_until"] else None
+        return ok(C.TranscriptCommitOut(saved_until=saved, enqueued_job_id=job_id, coalesced=job_id is None))
+
+
+@tool
+def transcript_range(lecture_id: str, after_seq: int | None = None, permit: str | None = None) -> dict:
+    """[worker] 롤링 요약 + 요약 위치 이후 확정 전사. 읽은 끝 번호를 attempted_until로 남긴다."""
+    claims = _claims(permit, None)
+    with tx() as con:
+        lec = _lecture(con, lecture_id, claims["u"] if claims else None)   # permit의 사용자 = 강의 주인
+        start = (lec["processed_until"] if after_seq is None else after_seq) + 1
+        rows = con.execute("SELECT seq, text FROM transcripts WHERE lecture_id=? AND seq BETWEEN ? AND ? ORDER BY seq",
+                           (lecture_id, start, lec["saved_until"])).fetchall()
+        con.execute("UPDATE lectures SET attempted_until=MAX(attempted_until, ?) WHERE lecture_id=?",
+                    (lec["saved_until"], lecture_id))
+        _log(con, "transcript_range", lecture_id)
+        return ok(C.TranscriptRangeOut(state=lec["state"], rolling_summary=lec["rolling_summary"],
+                                       new_text="\n".join(r["text"] for r in rows), from_seq=start,
+                                       last_seq=lec["saved_until"], generation=lec["generation"]))
+
+
+@tool
+def summary_publish(idem_key: str, lecture_id: str, expected_generation: int, from_seq: int, upto_seq: int, text: str,
+                    permit: str | None = None) -> dict:
+    """[worker] 요약 저장 + 요약 위치 이동 (한 트랜잭션). 멱등, 세대·실행권·위치 확인. 위치는 앞으로만 움직인다."""
+    claims = _claims(permit, idem_key)
+    with tx() as con:
+        lec = _lecture(con, lecture_id)
+        done = con.execute("SELECT version FROM summaries WHERE idem_key=?", (idem_key,)).fetchone()
+        if done:
+            return ok(C.SummaryPublishOut(status="duplicate", summary_version=done["version"],
+                                          processed_until=lec["processed_until"]), duplicate=True)
+        _require_live(con, claims, idem_key)
+        if lec["generation"] != expected_generation or lec["state"] != "recording":
+            raise Reject(ErrorCode.GENERATION_MISMATCH, f"강의 세대·상태가 바뀜 ({lec['state']}, 세대 {lec['generation']})")
+        if lec["processed_until"] != from_seq - 1 or upto_seq > lec["saved_until"] or upto_seq < from_seq:
+            return ok(C.SummaryPublishOut(status="stale", summary_version=lec["summary_version"],
+                                          processed_until=lec["processed_until"]))
+        version = lec["summary_version"] + 1
+        con.execute("INSERT INTO summaries VALUES(?,?,?,?,?,?,?,?)",
+                    (idem_key, lecture_id, version, from_seq, upto_seq, lec["generation"], text, time.time()))
+        con.execute("UPDATE lectures SET rolling_summary=?, processed_until=?, summary_version=?, updated_at=? "
+                    "WHERE lecture_id=?", (text, upto_seq, version, time.time(), lecture_id))
+        _log(con, "summary_publish", idem_key)
+        return ok(C.SummaryPublishOut(status="published", summary_version=version, processed_until=upto_seq))
+
+
+@tool
+def lecture_end(lecture_id: str, user_id: str) -> dict:
+    """[api] 녹음 종료: ended, 세대 +1. 진행 중이던 실시간 요약의 발행은 generation_mismatch로 막힌다.
+    (최종 노트 등록은 이 PoC에서 아직 안 함)"""
+    with tx() as con:
+        lec = _lecture(con, lecture_id, user_id)
+        if lec["state"] == "recording":
+            con.execute("UPDATE lectures SET state='ended', generation=generation+1, updated_at=? WHERE lecture_id=?",
+                        (time.time(), lecture_id))
+        return _lecture_out(_lecture(con, lecture_id))
+
+
+@tool
+def lecture_get(lecture_id: str, user_id: str) -> dict:
+    """[dev] 강의 상태·요약 위치."""
+    with closing(db()) as con:
+        return _lecture_out(_lecture(con, lecture_id, user_id))
+
+
+@tool
+def summary_recover(limit: int = 50) -> dict:
+    """[scheduler] 누락 복구. 다음을 모두 만족하는 강의에 요약 1건 등록:
+      녹음 중 · 요약 안 된 전사가 있음(saved > processed) · 아무 요약도 읽어 가지 않은 전사가 있음(saved > attempted)
+      · 대기·실행 중 요약 작업이 없음
+    'saved > attempted' 조건 때문에 실패한 요약의 범위를 혼자 계속 다시 등록하지 않는다 — 새 전사가 오면
+    커밋이 등록하고, 그 요약이 실패 구간까지 함께 읽는다. 비용 한도 검사는 비용 원장이 생기면 여기에 넣는다."""
+    with tx() as con:
+        rows = con.execute(
+            "SELECT * FROM lectures l WHERE state='recording' AND saved_until > processed_until "
+            "AND saved_until > attempted_until AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind='live_summary' "
+            "AND j.lecture_id=l.lecture_id AND j.state IN ('pending','reserved','sent','running')) LIMIT ?",
+            (limit,)).fetchall()
+        got = [j for lec in rows if (j := _enqueue_summary(con, lec))]
+        return ok(C.SummaryRecoverOut(registered=got))
 
 
 # ── 발행 ─────────────────────────────────────────────────────────

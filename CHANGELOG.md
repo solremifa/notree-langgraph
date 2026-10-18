@@ -9,6 +9,17 @@
 
 ---
 
+## 2026-10-18
+
+### 실시간 요약 범위 합치기 (PoC) · (이번 커밋)
+자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md) (브랜치 `feat/summary-coalesce`)
+
+- 🆕 실시간 요약 PoC 경로: `lecture_start`·`transcript_commit`·`lecture_end`·`lecture_get`·`summary_recover`, `transcript_range`·`summary_publish` 구현, `live_summary` 핸들러(가짜 LLM)
+- 🆕 강의당 대기 요약 1개(DB 유일 부분 인덱스) + 동시 실행 1개(배정 조건) → 그사이 커밋은 다음 요약 하나로 합쳐짐
+- 🆕 scheduler 주기 작업에 요약 누락 복구 (아무도 읽어 가지 않은 전사가 있을 때만)
+- 🔧 `jobs.lecture_id`, `job_reserve_pending`에 실시간 요약 배정 조건, `.gitignore`에 `data/`
+- 테스트 101 → 109개
+
 ## 2026-10-17
 
 ### Q&A 평가 기준 정정: 모델 원본 검사 분리, 사례별 기대 상태 하나로 · `5a98cdb`
