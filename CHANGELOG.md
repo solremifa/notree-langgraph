@@ -11,6 +11,8 @@
 
 ## 2026-10-18
 
+### Redis 소유권 문서 정정 · `37381a8`
+- 🔧 "Redis 소유자는 늘 DB 실행자와 같다" → "최종 쓰기는 DB의 현재 실행 세대만 허용" (세대 발급과 키 저장 사이 일시 불일치 명시), 동시 시작으로 시도가 소모되는 것은 시도 한도를 줄이는 비용으로 명시
 ### Redis 유실 복구 리뷰 4차: 전달 세대 · `9b31d5b`
 - 🐛 초기화 전 메시지의 늦은 `job_start`가 복구 시작 뒤 도착하면 `updated_at`이 기준 뒤로 바뀌어 복구에서 빠지고 영영 running → 전달 세대(`dispatch_gen`)를 메시지·작업에 기록, 이전 세대의 시작은 `stale_dispatch`로 거절, 복구 대상은 "마지막 전달이 이전 세대"
 - ⚠️ 계약: `ReservedJob.gen`, `job_start.dispatch_gen`, 상태 `stale_dispatch` (선택). XADD 메시지에 `gen` 필드
