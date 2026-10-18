@@ -254,14 +254,17 @@ class ToolStatsOut(BaseModel):
 
 class TranscriptRangeIn(BaseModel):
     lecture_id: str
-    after_seq: int = Field(description="이 번호 이후의 확정 전사만")
+    after_seq: int | None = Field(None, description="이 번호 이후의 확정 전사만. 없으면 요약이 끝난 위치(processed_until) 이후")
 
 
 class TranscriptRangeOut(BaseModel):
+    state: Literal["recording", "ended", "cancelled"]
     rolling_summary: str
     new_text: str
-    last_seq: int
+    from_seq: int = Field(description="이번 범위의 첫 번호 (= processed_until + 1)")
+    last_seq: int = Field(description="이번 범위의 끝 번호 (= 읽은 시점의 saved_until). from_seq보다 작으면 새 전사 없음")
     generation: int = Field(description="발행할 때 expected_generation으로 다시 넘긴다")
+    already_published: bool = Field(False, description="이 작업(permit)의 요약이 이미 저장됨 → 다시 요약하지 않고 완료")
 
 
 class SummarySegmentsIn(BaseModel):
@@ -284,12 +287,57 @@ class SummaryPublishIn(BaseModel):
     idem_key: str
     lecture_id: str
     expected_generation: int
+    from_seq: int = Field(description="transcript_range가 준 from_seq. 요약 위치가 그 사이 움직였으면 stale")
     upto_seq: int
     text: str
 
 
 class SummaryPublishOut(BaseModel):
+    status: Literal["published", "duplicate", "stale"]
     summary_version: int
+    processed_until: int
+
+
+class LectureStartIn(BaseModel):
+    lecture_id: str
+    user_id: str
+
+
+class LectureIn(BaseModel):
+    lecture_id: str
+    user_id: str
+
+
+class LectureOut(BaseModel):
+    lecture_id: str
+    state: str
+    generation: int
+    saved_until: int
+    processed_until: int
+    attempted_until: int
+    rolling_summary: str
+    summary_version: int
+
+
+class TranscriptCommitIn(BaseModel):
+    lecture_id: str
+    user_id: str
+    segments: list[dict[str, Any]] = Field(description="[{seq, text}] 확정 전사. seq는 saved_until+1부터 빈틈 없이 (이미 저장된 번호는 무시)")
+
+
+class TranscriptCommitOut(BaseModel):
+    saved_until: int
+    added: int = Field(description="이번 커밋으로 새로 저장된 전사 수. 0이면 재전송·빈 묶음 → 요약을 등록하지 않음")
+    enqueued_job_id: str | None = Field(None, description="이번 커밋이 새로 등록한 요약 작업")
+    coalesced: bool = Field(description="새 전사가 있었지만 대기 중 요약이 이미 있어 그 요약에 합쳐짐")
+
+
+class SummaryRecoverIn(BaseModel):
+    limit: int = 50
+
+
+class SummaryRecoverOut(BaseModel):
+    registered: list[str] = Field(description="새로 등록한 요약 작업 job_id")
 
 
 class NotesReadIn(BaseModel):
@@ -557,12 +605,23 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("note_get", NoteGetIn, NoteGetOut, DEV, "dev", "T3·T4", summary="발행된 노트 조회"),
     ToolSpec("tool_stats", ThreadIn, ToolStatsOut, DEV, "dev", LEAD, summary="도구 호출 횟수 (실행 흐름 확인용)"),
     # 계획된 도구
-    ToolSpec("transcript_range", TranscriptRangeIn, TranscriptRangeOut, W, "read", "T3·T4", "T1·T2", True, "planned",
-             "강의의 롤링 요약과 지정 번호 이후 확정 전사를 읽는다"),
+    ToolSpec("transcript_range", TranscriptRangeIn, TranscriptRangeOut, W, "write", "T3·T4", "T1·T2", True,
+             summary="[PoC] 롤링 요약 + 요약 위치 이후 확정 전사. **상태 변경**: 읽은 끝 번호를 attempted_until로 남김 "
+                     "(누락 복구 판단용) → 이 강의의 live_summary 작업의 현재 실행권이 있어야 함"),
     ToolSpec("summary_segments", SummarySegmentsIn, SummarySegmentsOut, W, "read", "T3·T4", "", False, "planned",
              "최종 노트용 구간 요약 목록"),
-    ToolSpec("summary_publish", SummaryPublishIn, SummaryPublishOut, W, "write", "T3·T4", "", False, "planned",
-             "실시간 요약 저장 + outbox"),
+    ToolSpec("summary_publish", SummaryPublishIn, SummaryPublishOut, W, "write", "T3·T4",
+             summary="[PoC] 실시간 요약 저장 + 요약 위치 이동을 한 트랜잭션에. 멱등(idem_key), 세대·실행권·위치(from_seq), "
+                     "작업↔강의 연결(종류 live_summary·같은 lecture_id·같은 사용자) 확인. duplicate도 연결 확인"),
+    ToolSpec("lecture_start", LectureStartIn, LectureOut, API, "write", "T3·T4", summary="[PoC] 녹음 시작 (강의 행)"),
+    ToolSpec("transcript_commit", TranscriptCommitIn, TranscriptCommitOut, API, "write", "T3·T4",
+             summary="[PoC] 확정 전사 묶음 저장 + **새 전사가 실제로 저장됐고** 대기 중 요약이 없으면 요약 작업 1건 등록 "
+                     "(강의당 대기 1개, DB 유일 인덱스). 재전송·빈 묶음은 상태만 돌려줌"),
+    ToolSpec("lecture_end", LectureIn, LectureOut, API, "write", "T3·T4",
+             summary="[PoC] 녹음 종료: 상태 ended, 세대 +1 (늦은 실시간 요약이 덮지 못하게)"),
+    ToolSpec("lecture_get", LectureIn, LectureOut, DEV, "dev", "T3·T4", summary="[PoC] 강의 상태·요약 위치 조회"),
+    ToolSpec("summary_recover", SummaryRecoverIn, SummaryRecoverOut, SCH, "control", "T3·T4",
+             summary="[PoC] 누락 복구: 녹음 중이고 아직 아무도 시도 안 한 전사가 있는데 요약 작업이 없는 강의에 1건 등록"),
     ToolSpec("notes_read", NotesReadIn, NotesReadOut, W, "read", "T3·T4", "T5", True, "planned",
              "노트 블록을 읽는다"),
     ToolSpec("notes_search", NotesSearchIn, NotesSearchOut, W, "read", "T3·T4", "T5", True, "planned",

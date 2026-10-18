@@ -3,6 +3,8 @@
   resend_stale     (팀 결정 6번)  허가 후 XADD 전에 죽었거나 메시지가 유실돼 멈춘 의도를 다시 XADD.
                                   중복 메시지는 worker의 job_start가 done/leased로 걸러 내므로 넉넉하게 보내도 안전하다.
   cleanup_checkpoints (결정 9번)  완료·실패 후 보관 기간(기본 7일)이 지난 작업의 체크포인트 삭제.
+  recover_summaries              실시간 요약 누락 복구 (summary_recover). 정상 경로는 transcript_commit이 등록하므로
+                                 보통은 0건. 등록된 작업은 배정기가 평소처럼 보낸다.
 
 재배송(죽은 worker의 메시지 회수)은 여기서 하지 않는다. worker가 XAUTOCLAIM으로 직접 한다 (결정 1번).
 """
@@ -21,6 +23,13 @@ async def resend_stale(r, mcp: McpClient, reserved_sec: float = S.RESEND_RESERVE
         msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
         log("resend", f"{j['job_id']} [{j['kind']}] 멈춰 있음 → 다시 XADD {j['stream']} {msg_id}")
     return len(jobs)
+
+
+async def recover_summaries(mcp: McpClient) -> int:
+    got = (await mcp.tool("summary_recover"))["registered"]
+    if got:
+        log("recover", f"실시간 요약 누락 복구: {got}")
+    return len(got)
 
 
 async def cleanup_checkpoints(mcp: McpClient, keep_sec: float = S.CHECKPOINT_KEEP_SEC) -> int:
@@ -43,6 +52,7 @@ async def run_periodic(r, mcp: McpClient, stop: asyncio.Event | None = None, *,
         try:
             if now >= next_resend:
                 await resend_stale(r, mcp, reserved_sec, sent_sec)
+                await recover_summaries(mcp)
                 next_resend = now + resend_every
             if now >= next_cleanup:
                 await cleanup_checkpoints(mcp, keep_sec)

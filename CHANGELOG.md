@@ -9,6 +9,35 @@
 
 ---
 
+## 2026-10-18
+
+### 실시간 요약 리뷰 3차: job_retry 원자성 · `1dc797d`
+- 🐛 사용자 재시도의 "후속 요약 없음" 확인과 상태 변경이 한 트랜잭션이 아니어서, 그사이 커밋이 후속 요약을 넣으면 `UNIQUE constraint failed` → 한 쓰기 트랜잭션 + `WHERE state='failed'`, 제약 충돌도 "되살리지 않음"으로 응답. MCP 서버 2개로 동시 30회 재현 뒤 고침
+- 테스트 115 → 116개
+
+### 실시간 요약 리뷰 2차: 사용자 재시도 충돌, 저장 응답 유실 · `501442d`
+- 🐛 `job_retry`가 실패한 요약을 되살릴 때 후속 요약이 대기 중이면 `UNIQUE constraint failed`로 깨짐 → 후속 요약이 있거나 녹음이 끝났으면 되살리지 않고 이유를 돌려줌
+- 🐛 `summary_publish` 응답만 유실되면 요약은 저장됐는데 작업은 failed(시도 한도 초과) → 같은 idem_key로 저장을 다시 보내 확인 (LLM은 다시 안 부름), 다시 실행돼도 `transcript_range.already_published`면 완료
+- 테스트 112 → 115개
+
+### 실시간 요약 리뷰 반영: 작업↔강의 연결 확인, 재전송 재등록 막기 · `a1face6`
+자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md#리뷰-반영-3b1c00e-이후)
+
+- 🐛 P1 `summary_publish`가 permit의 작업이 그 강의를 요약하는 작업인지 확인하지 않아, 다른 작업의 유효한 permit으로 남의 강의 요약을 바꿀 수 있었음 → 종류·lecture_id·사용자·현재 실행권 확인 (duplicate 경로 포함)
+- 🐛 P1 같은 전사 묶음 재전송이 실패한 요약을 다시 등록 → 새 전사가 저장됐을 때만 등록
+- 🐛 P2 실행권을 잃은 worker도 `transcript_range`로 attempted_until을 올릴 수 있었음 → 현재 실행권 확인, 계약에 상태 변경 도구로 표시
+- ⚠️ `transcript_commit` 응답에 `added`, `coalesced` 의미 좁힘
+- 테스트 109 → 112개
+
+### 실시간 요약 범위 합치기 (PoC) · `3b1c00e`
+자세히: [docs/changes/2026-10-18-summary-coalesce.md](docs/changes/2026-10-18-summary-coalesce.md) (브랜치 `feat/summary-coalesce`)
+
+- 🆕 실시간 요약 PoC 경로: `lecture_start`·`transcript_commit`·`lecture_end`·`lecture_get`·`summary_recover`, `transcript_range`·`summary_publish` 구현, `live_summary` 핸들러(가짜 LLM)
+- 🆕 강의당 대기 요약 1개(DB 유일 부분 인덱스) + 동시 실행 1개(배정 조건) → 그사이 커밋은 다음 요약 하나로 합쳐짐
+- 🆕 scheduler 주기 작업에 요약 누락 복구 (아무도 읽어 가지 않은 전사가 있을 때만)
+- 🔧 `jobs.lecture_id`, `job_reserve_pending`에 실시간 요약 배정 조건, `.gitignore`에 `data/`
+- 테스트 101 → 109개
+
 ## 2026-10-17
 
 ### Q&A 평가 기준 정정: 모델 원본 검사 분리, 사례별 기대 상태 하나로 · `5a98cdb`
