@@ -11,9 +11,37 @@
 
 ## 2026-10-18
 
+### 전달 세대 없는 메시지는 기본 거절 · `f7a957a`
+- 🔧 운영 worker는 `gen` 없는 메시지로 시작하지 않고 ACK (재전송이 세대를 붙여 다시 보냄). 예전 메시지 허용은 `NOTREE_ALLOW_LEGACY_MESSAGES=1` 또는 `Worker(allow_legacy=True)`로만
+- ⚠️ 세대 없이 XADD하는 도구는 허용 설정이 필요 (`lane_bench`는 `allow_legacy=True`로 바꿈)
+- 테스트 → 129개
+
+### 전달 세대를 Stream별로 기억 · `8a74f28`
+- 🐛 worker가 메시지의 전달 세대를 메시지 ID만으로 기억 → Stream마다 ID가 따로 매겨져, 빌려 쓰는 worker는 두 Stream의 같은 ID를 함께 들 수 있음 → 한쪽 세대가 덮어써 정상 메시지를 이전 세대로 잘못 거절·ACK할 수 있었음 → (Stream, ID)로 기억. 실제 Redis에서 두 Stream에 같은 ID `5-0`으로 확인
+- 테스트 → 127개
+
+### Redis 유실 복구 리뷰 4차: 전달 세대 · `9b31d5b`
+- 🐛 초기화 전 메시지의 늦은 `job_start`가 복구 시작 뒤 도착하면 `updated_at`이 기준 뒤로 바뀌어 복구에서 빠지고 영영 running → 전달 세대(`dispatch_gen`)를 메시지·작업에 기록, 이전 세대의 시작은 `stale_dispatch`로 거절, 복구 대상은 "마지막 전달이 이전 세대"
+- ⚠️ 계약: `ReservedJob.gen`, `job_start.dispatch_gen`, 상태 `stale_dispatch` (선택). XADD 메시지에 `gen` 필드
+- 테스트 → 126개
+
+### Redis 유실 복구 리뷰 3차: '발견'과 '완료' 분리 · `b712b2a`
+- 🐛 표시 키를 복구 완료로 써서, 첫 복구 때 lease가 살아 있던 고립 작업이 영영 running에 남음 → 표시 키는 발견, 완료는 DB(`meta.recovery_since`)가 판단해 열려 있는 동안 매 주기 재확인
+- 🐛 한 번에 500건만 처리 → job_id 순서로 쪽을 나눠 끝까지
+- ⚠️ `job_recover_orphans`에 `start`·`after` 인자, 응답에 `held`·`open`·`next_after`
+- 테스트 → 123개
+
 ### 실시간 요약 리뷰 3차: job_retry 원자성 · `1dc797d`
 - 🐛 사용자 재시도의 "후속 요약 없음" 확인과 상태 변경이 한 트랜잭션이 아니어서, 그사이 커밋이 후속 요약을 넣으면 `UNIQUE constraint failed` → 한 쓰기 트랜잭션 + `WHERE state='failed'`, 제약 충돌도 "되살리지 않음"으로 응답. MCP 서버 2개로 동시 30회 재현 뒤 고침
 - 테스트 115 → 116개
+### 배정·회수·Redis 유실 복구 · `6b98185`
+자세히: [docs/changes/2026-10-18-dispatch-recovery.md](docs/changes/2026-10-18-dispatch-recovery.md) (브랜치 `fix/dispatch-recovery`)
+
+- 🐛 배정기가 둘 이상이면 같은 작업을 두 번 허가하고 끝난 작업을 reserved로 되돌릴 수 있었음 → 한 트랜잭션 + `WHERE state='pending'`
+- 🐛 `XAUTOCLAIM` 다음 탐색 위치를 버려 앞쪽 PEL 10개가 살아 있으면 뒤의 죽은 메시지를 못 찾음 → Stream별로 위치 보관
+- 🐛 Redis 초기화 뒤 worker가 `NOGROUP`만 반복 → group 다시 만듦
+- 🆕 `job_recover_orphans` + scheduler의 Redis 유실 감지(표시 키): reserved·sent·lease 끝난 running을 다시 보냄, 마감·시도 한도는 실패 확정
+- 테스트 115 → 119개
 
 ### 실시간 요약 리뷰 2차: 사용자 재시도 충돌, 저장 응답 유실 · `501442d`
 - 🐛 `job_retry`가 실패한 요약을 되살릴 때 후속 요약이 대기 중이면 `UNIQUE constraint failed`로 깨짐 → 후속 요약이 있거나 녹음이 끝났으면 되살리지 않고 이유를 돌려줌

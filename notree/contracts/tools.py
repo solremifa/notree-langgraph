@@ -40,6 +40,7 @@ class ReservedJob(BaseModel):
     job_id: str
     kind: str
     stream: str
+    gen: int | None = Field(None, description="전달 세대. XADD 메시지에 함께 넣는다 (Redis 유실을 발견할 때마다 DB가 올림)")
 
 
 class JobListOut(BaseModel):
@@ -64,10 +65,11 @@ class JobStartIn(BaseModel):
     job_id: str
     worker: str
     lease_sec: float
+    dispatch_gen: int | None = Field(None, description="메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절")
 
 
 class JobStartOut(BaseModel):
-    status: Literal["started", "done", "failed", "leased", "unknown"]
+    status: Literal["started", "done", "failed", "leased", "unknown", "stale_dispatch"]
     kind: str | None = None
     payload: dict[str, Any] | None = None
     attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")
@@ -125,6 +127,20 @@ class JobRetryIn(BaseModel):
 class JobRetryOut(BaseModel):
     revived: bool
     reason: str | None = None
+
+
+class JobRecoverIn(BaseModel):
+    start: bool = Field(False, description="Redis 초기화를 방금 발견함 → 전달 세대를 올림")
+    after: str | None = Field(None, description="이전 쪽의 next_after (job_id 순서로 이어서)")
+    limit: int = 500
+
+
+class JobRecoverOut(BaseModel):
+    jobs: list[ReservedJob] = Field(description="다시 XADD할 작업 (sent로 표시됨)")
+    failed: list[str] = Field(description="마감이 지났거나 시도 한도를 다 써서 실패 확정한 작업")
+    held: int = Field(0, description="lease가 아직 살아 있어 보류한 running (다음 주기에 다시 확인)")
+    open: bool = Field(False, description="복구가 아직 안 끝남 (대상이 남아 있음)")
+    next_after: str | None = Field(None, description="이 쪽이 꽉 찼으면 다음 쪽 시작점")
 
 
 class JobRow(BaseModel):
@@ -583,6 +599,9 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("job_reserve_pending", JobReservePendingIn, JobListOut, SCH, "control", LEAD, summary="대기 의도 → 실행 허가. stream을 주면 그 레인만 (배정기가 레인별로 부름)"),
     ToolSpec("job_mark_sent", JobIdIn, JobMarkSentOut, SCH, "control", LEAD, summary="XADD 후 전송 완료 표시"),
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
+    ToolSpec("job_recover_orphans", JobRecoverIn, JobRecoverOut, SCH, "control", LEAD,
+             summary="Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 "
+                     "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정. 대상이 없으면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
              summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,

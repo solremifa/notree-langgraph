@@ -91,7 +91,7 @@ async def bench(a, design: str, alloc: str) -> dict:
     mcp = StubMcp(jobs)
     stop = asyncio.Event()
     sc = a.scale
-    ws = [Worker(f"{design}{i}", s.pop("cfg"), r, mcp, block_ms=50, shutdown_grace_sec=0.1, **s)
+    ws = [Worker(f"{design}{i}", s.pop("cfg"), r, mcp, block_ms=50, shutdown_grace_sec=0.1, allow_legacy=True, **s)   # 가짜 MCP: 전달 세대 없음
           for i, s in enumerate(specs)]
     tasks = [asyncio.create_task(w.run(stop)) for w in ws]
     if alloc != "none":

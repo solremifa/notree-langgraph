@@ -20,8 +20,13 @@ from notree.common.log import ACTOR, log
 from notree.worker.mcp_client import McpClient
 
 
+def _fields(j: dict) -> dict:
+    """XADD 필드: 작업 ID와 전달 세대 (세대가 있으면). worker는 세대를 job_start에 넘겨 Redis 유실 전 메시지를 거른다."""
+    return {"job_id": j["job_id"], **({"gen": str(j["gen"])} if j.get("gen") is not None else {})}
+
+
 async def _send(r, mcp: McpClient, j: dict) -> None:
-    msg_id = await r.xadd(j["stream"], {"job_id": j["job_id"]})
+    msg_id = await r.xadd(j["stream"], _fields(j))
     await mcp.tool("job_mark_sent", job_id=j["job_id"])
     log("allocator", f"{j['job_id']} [{j['kind']}] 허가 → XADD {j['stream']} {msg_id}")
 
