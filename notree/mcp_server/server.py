@@ -403,7 +403,9 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
 @tool
 def job_start(job_id: str, worker: str, lease_sec: float) -> dict:
     """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
-    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지)."""
+    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지).
+    lease_sec=0 (LIVENESS=redis): 실행 중 판단은 worker가 Redis 소유 키로 이미 했다. 여기서는 실행 세대만 올려
+    이전 실행자의 permit을 무효로 만든다 (lease_until=지금 → 다음 job_start가 leased로 막지 않음)."""
     now = time.time()
     with tx() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()

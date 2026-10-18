@@ -9,6 +9,17 @@
 
 ---
 
+## 2026-10-18
+
+### heartbeat를 Redis 소유 키로 (시험 구현, 기본값은 db) · (이번 커밋)
+자세히: [docs/changes/2026-10-18-redis-heartbeat.md](docs/changes/2026-10-18-redis-heartbeat.md) (브랜치 `feat/redis-heartbeat`)
+
+- 🆕 `NOTREE_LIVENESS=redis`: 소유 키 `SET NX` + Lua heartbeat 한 번(토큰 일치·PEL 소유자 나·원본 메시지 존재일 때만 갱신). DB heartbeat 없음, 늦은 쓰기는 `exec_epoch`
+- 🆕 `notree/worker/ownership.py`, 실제 Redis 시험 10개 (`tests/test_redis_ownership.py`: Lua 규칙, 인계, 갱신 지연, 프로세스 SIGKILL·SIGSTOP)
+- 🔧 계약: `job_start.lease_sec=0` = DB lease 없이 실행 세대만, `job_get`에 `exec_epoch`
+- 🔧 `.gitignore`에 `data/` (main에 빠져 있어 강의 자료가 커밋될 수 있었음)
+- 테스트 101 → 111개 (Redis 시험은 redis-server 없으면 건너뜀)
+
 ## 2026-10-17
 
 ### Q&A 평가 기준 정정: 모델 원본 검사 분리, 사례별 기대 상태 하나로 · `5a98cdb`

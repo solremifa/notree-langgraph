@@ -4,6 +4,9 @@
 
 한 메시지의 처리 (process)
   이미 이 worker가 실행 중인 job → 손대지 않음 (보조 방어)
+  [LIVENESS=redis] 소유 키 SET NX 실패 → 손대지 않음 (다른 실행이 살아 있음. ACK도 안 함 — 지금의 보수적 규칙)
+                   성공하면 job_start(lease_sec=0)로 실행 세대만 올리고, heartbeat는 Redis Lua 한 번 (ownership.py)
+                   끝나면(죽은 경우 제외) 소유 키를 토큰 비교로 해제
   job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
              ├─ leased                  → 손대지 않음 (살아 있는 lease. 같은 worker라도)
              └─ started → Lease 안에서 핸들러 실행 (job_timeout과 마감 시각 중 짧은 쪽으로 제한)
@@ -31,6 +34,7 @@ from notree.common.log import ACTOR, log
 from notree.common.settings import StreamConfig
 from notree.worker.lease import Lease, LeaseLost
 from notree.worker.mcp_client import McpClient
+from notree.worker.ownership import Ownership, RedisLease
 from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
 
 
@@ -199,7 +203,24 @@ class Worker:
     async def process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig | None = None) -> None:
         ACTOR.set(self.name)
         cfg = cfg or self.cfg                     # 이 메시지가 온 레인의 설정 (빌린 작업이면 빌려 온 레인)
-        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name, lease_sec=cfg.lease_sec)
+        if S.LIVENESS != "redis":
+            return await self._process(msg_id, job_id, how, cfg, None)
+        own = Ownership(self.r, job_id, self.name, cfg, msg_id)
+        if not await own.acquire():
+            log("skip", f"{job_id}: 소유 키를 {(own.holder or '?').split('|')[0]}가 가짐 → 손대지 않음")
+            return
+        try:
+            await self._process(msg_id, job_id, how, cfg, own)
+        finally:
+            if not self.dead:                     # 죽은 프로세스는 정리하지 않는다 (키는 TTL로 풀림)
+                try:
+                    await own.release()
+                except Exception as e:
+                    log("error", f"{job_id}: 소유 키 해제 실패({type(e).__name__}) → TTL로 풀림")
+
+    async def _process(self, msg_id: str, job_id: str, how: str, cfg: StreamConfig, own: Ownership | None) -> None:
+        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name,
+                                 lease_sec=0 if own else cfg.lease_sec)
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이미 {st['status']} → ACK만")
@@ -225,7 +246,8 @@ class Worker:
                 if left <= 0:
                     raise DeadlinePassed()
                 timeout = min(timeout, left)
-            async with Lease(ctx, touch=lambda: self._touch(msg_id, cfg)):
+            lease = RedisLease(ctx, own) if own else Lease(ctx, touch=lambda: self._touch(msg_id, cfg))
+            async with lease:
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
             log("job", f"{job_id}: lease를 잃어 손을 뗌 (ACK 안 함)")

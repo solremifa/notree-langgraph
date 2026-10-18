@@ -63,7 +63,8 @@ class JobResendStaleIn(BaseModel):
 class JobStartIn(BaseModel):
     job_id: str
     worker: str
-    lease_sec: float
+    lease_sec: float = Field(description="DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 "
+                                         "(NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch)")
 
 
 class JobStartOut(BaseModel):
@@ -138,6 +139,7 @@ class JobRow(BaseModel):
     lease_owner: str | None = None
     lease_until: float | None = None
     attempts: int | None = None
+    exec_epoch: int | None = Field(None, description="실행 세대. job_start마다 1씩 오르고 되돌아가지 않음 (늦은 쓰기 차단)")
     fail_reason: str | None = None
     user_retryable: bool | None = None
     created: float | None = None
@@ -536,9 +538,10 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
     ToolSpec("job_mark_sent", JobIdIn, JobMarkSentOut, SCH, "control", LEAD, summary="XADD 후 전송 완료 표시"),
     ToolSpec("job_resend_stale", JobResendStaleIn, JobListOut, SCH, "control", LEAD, summary="오래 멈춘 reserved/sent 의도를 다시 보낼 목록 (결정 6)"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
-             summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased"),
+             summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. "
+                     "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드)"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,
-             summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false"),
+             summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음"),
     ToolSpec("job_finish", JobWorkerIn, JobFinishOut, W, "control", LEAD,
              summary="완료 표시. finished=true를 확인한 뒤에만 XACK"),
     ToolSpec("job_fail", JobFailIn, JobFailOut, W, "control", LEAD, summary="실패 확정. failed=true를 확인한 뒤에만 XACK"),
