@@ -500,15 +500,21 @@ def job_finish(job_id: str, worker: str, permit: str | None = None) -> dict:
         return ok(C.JobFinishOut(finished=cur.rowcount == 1))
 
 
+# 작업 종류 → 그 작업(idem_key = job_id)이 저장한 업무 결과를 찾는 SQL. 실패 확정 트랜잭션 안에서 본다 (리뷰 7·8차).
+# 결과를 저장하는 작업 종류를 새로 만들면 여기에 더한다. 결과를 저장하지 않는 종류는 RESULTLESS_KINDS에 둔다
+# (tests/test_decisions.py가 등록된 모든 핸들러가 둘 중 하나에 있는지 확인한다).
+RESULT_SAVED_SQL = {
+    "qa": "SELECT 1 FROM qa_questions WHERE job_id=:j AND state='answered' AND idem_key=:j",
+    "live_summary": "SELECT 1 FROM summaries WHERE idem_key=:j",
+    "course_update": "SELECT 1 FROM notes WHERE idem_key=:j",          # 과목 노트 발행 (thread_id = job_id)
+}
+RESULTLESS_KINDS = {"echo", "final_note", "grading"}   # 시험용 / 아직 저장 도구 없음 (뼈대) → 저장 도구가 생기면 위로 옮긴다
+
+
 def _result_saved(con, job_id: str, kind: str) -> bool:
-    """이 작업(idem_key = job_id)이 업무 결과를 이미 저장했나. 실패를 확정하는 트랜잭션 안에서 부른다 (리뷰 7차 ②④).
-    결과를 저장하는 작업 종류를 새로 만들면 여기에 그 결과 테이블을 더한다."""
-    if kind == "qa":
-        return con.execute("SELECT 1 FROM qa_questions WHERE job_id=? AND state='answered' AND idem_key=?",
-                           (job_id, job_id)).fetchone() is not None
-    if kind == "live_summary":
-        return con.execute("SELECT 1 FROM summaries WHERE idem_key=?", (job_id,)).fetchone() is not None
-    return False
+    """이 작업이 업무 결과를 이미 저장했나. 실패를 확정하는 트랜잭션 안에서 부른다."""
+    sql = RESULT_SAVED_SQL.get(kind)
+    return sql is not None and con.execute(sql, {"j": job_id}).fetchone() is not None
 
 
 @tool

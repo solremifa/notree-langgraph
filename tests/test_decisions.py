@@ -208,3 +208,65 @@ def test_checkpoint_cleanup_removes_old_finished_jobs(tmp_path):
             assert con.execute("SELECT COUNT(*) FROM checkpoints WHERE thread_id=?", (j,)).fetchone()[0] == 0
             con.close()
     asyncio.run(t())
+
+
+# ── 리뷰 8차 (2026-10-19): 결과를 저장하는 모든 작업 종류가 실패 확정 때 결과 확인 대상 ──────────────
+def test_every_handler_kind_is_covered_by_the_saved_result_check():
+    """시도 한도를 넘긴 재배송은 핸들러를 건너뛰고 job_fail만 보낸다 → 결과를 저장하는 종류가 _result_saved에서 빠지면
+    저장된 결과가 있는데도 failed가 된다 (리뷰 8차: course_update). 새 종류는 둘 중 한 곳에 반드시 적는다."""
+    os.environ.setdefault("NOTREE_DB", "/tmp/notree-contract-test.db")
+    from notree.mcp_server import server as srv
+    from notree.worker.registry import load_handlers
+    kinds = set(load_handlers())
+    assert kinds == set(srv.RESULT_SAVED_SQL) | srv.RESULTLESS_KINDS, kinds ^ (set(srv.RESULT_SAVED_SQL) | srv.RESULTLESS_KINDS)
+    assert not set(srv.RESULT_SAVED_SQL) & srv.RESULTLESS_KINDS
+
+
+class _LoseFinish:
+    """job_finish 요청 n번이 서버에 닿지 못한다 (전달 실패). 나머지 도구는 그대로."""
+
+    def __init__(self, inner, n=3):
+        self.inner, self.n = inner, n
+
+    async def tool(self, name, **args):
+        if name == "job_finish" and self.n > 0:
+            self.n -= 1
+            raise ConnectionResetError("job_finish 전달 실패 (시험)")
+        return await self.inner.tool(name, **args)
+
+    def __getattr__(self, item):
+        return getattr(self.inner, item)
+
+
+def test_course_update_published_but_finish_lost_ends_as_done(tmp_path, monkeypatch):
+    """리뷰 8차 재현: 마지막 시도에서 노트 발행·그래프 완료 → job_finish 3번 전달 실패 → 재배송(시도 > 한도)은 핸들러를
+    건너뛰고 job_fail → 서버가 발행된 노트를 보고 done. LLM 다시 안 부름."""
+    monkeypatch.setattr(S, "KIND_MAX_ATTEMPTS", {"course_update": 1})
+    llm.CALLS.clear()
+
+    async def t():
+        async with Env(tmp_path) as e:
+            e.start_worker(cfg=BATCH, mcp=_LoseFinish(e.m_w))
+            j = await batch_job(e, {"sources": ["hello", "world"]})
+            assert await e.wait_state(j, timeout=20)
+            row = await e.row(j)
+            assert row["state"] == "done" and row["attempts"] == 2, row
+            assert sorted(llm.CALLS) == ["extract:hello", "extract:world", "merge#1"]    # 한 번씩만
+            assert (await e.api.tool("note_get", idem_key=j))["note"] == "HELLO WORLD!"
+            assert (await e.api.tool("tool_stats", thread_id=j))["counts"]["note_publish"] == 1
+    asyncio.run(t())
+
+
+def test_redis_loss_recovery_finishes_a_course_update_whose_note_is_published(tmp_path, monkeypatch):
+    """같은 상태(노트 발행됨, 완료 표시 전, 시도 한도 다 씀)에서 Redis 유실 복구 → 실패가 아니라 done_instead."""
+    from notree.mcp_server import server as srv
+    monkeypatch.setattr(srv, "DB", tmp_path / "cu.db")
+    srv._init_db()
+    with srv.tx() as con:
+        for jid in ("op-published", "op-not-published"):
+            con.execute("INSERT INTO jobs(job_id, kind, payload, stream, state, attempts, lease_until, created, updated_at) "
+                        "VALUES(?, 'course_update', '{}', 'notree:batch', 'running', 9, 0, 0, 0)", (jid,))
+        con.execute("INSERT INTO notes(idem_key, course, note, status) VALUES('op-published', 'c', 'HELLO WORLD!', '완료')")
+    res = srv.job_recover_orphans(start=True)
+    data = res.get("data", res)
+    assert data["done_instead"] == ["op-published"] and data["failed"] == ["op-not-published"], data
