@@ -1,6 +1,11 @@
 """벡터 비교 스크립트의 순수 함수 (DB·API 없이). 실제 강의 데이터는 쓰지 않는다."""
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 pytest.importorskip("asyncpg")
 from notree.dev.vec_compare import first_rank, is_gold, items_covered, rrf, tie_at  # noqa: E402
@@ -53,3 +58,17 @@ def test_fake_embedder_is_normalized_and_deterministic():
     m2, _ = e.embed(["선형 회귀", "객체"])
     v = normalize(m1)
     assert np.allclose(m1, m2) and np.allclose(np.linalg.norm(v, axis=1), 1)
+
+
+def test_trace_splits_items_into_search_and_delivery():
+    from notree.dev.vec_trace import section_trace
+    ids = lambda n, t: {"note": n, "transcript": t}  # noqa: E731
+    rows = [{"set": "fresh", "id": "fresh01", "ids": {"trgm": ids(["a:s1"], ["a:t5"]), "vec": ids(["a:s9"], [])}}]
+    key = {"fresh01": {"status": "completed", "items": [{"gold": ["a:t1"]}, {"gold": ["a:t5"]}, {"gold": ["a:t7"]}, {"gold": ["a:t9"]}]}}
+    run = [{"id": "fresh01", "llm": "openai", "limit": 3, "searches": ["note"], "attempts": [{"evidence": ["a:s1", "a:t7"]}]}]
+    text = "\n".join(section_trace(rows, run, key, "trgm", 3, 3, "vec"))
+    assert "| 검색 O · 전달 O | 1 (25%)" in text      # t1: 검색(s1=t1)·전달(s1)
+    assert "| 검색 O · 전달 X | 1 (25%)" in text      # t5: 검색에만
+    assert "| 검색 X · 전달 O | 1 (25%)" in text      # t7: 전달에만
+    assert "| 검색 X · 전달 X | 1 (25%)" in text and "vec 상위 3개에는 있음 1개" in text   # t9: vec에는 있음
+    assert "| fresh01 | 노트만 |" in text

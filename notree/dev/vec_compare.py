@@ -182,18 +182,20 @@ def report(rows: list[dict], methods: list[str], ks: list[int], vec_meta: dict |
         if st == "fresh":
             head += "".join(f"{f'항목@{k}':>12}" for k in ks)
         out.append(head)
+        out.append(f"  (칸 = 비율 개수 · R@k 분모 {len(pos)}개 질문"
+                   + (f" · 항목 분모 {sum(r['items'][methods[0]][str(ks[0])][1] for r in pos)}개 항목)" if st == "fresh" else ")"))
         for m in methods:
             line = f"{m:<8}"
             for k in ks:
                 n = sum(1 for r in pos if (r["rank"][m]["note"] or 99) <= k)
                 t = sum(1 for r in pos if (r["rank"][m]["transcript"] or 99) <= k)
                 e = sum(1 for r in pos if min(r["rank"][m]["note"] or 99, r["rank"][m]["transcript"] or 99) <= k)
-                line += f"{n / len(pos):>12.0%}{t / len(pos):>12.0%}{e / len(pos):>12.0%}"
+                line += "".join(f"{f'{x / len(pos):.0%} {x}':>12}" for x in (n, t, e))
             if st == "fresh":
                 for k in ks:
                     c = sum(r["items"][m][str(k)][0] for r in pos)
                     a = sum(r["items"][m][str(k)][1] for r in pos)
-                    line += f"{c / a:>12.0%}" if a else f"{'-':>12}"
+                    line += f"{f'{c / a:.0%} {c}':>12}" if a else f"{'-':>12}"
             out.append(line)
         for m in methods:
             ties = {k: sum(1 for r in pos if r["tie"][m][str(k)]) for k in ks}

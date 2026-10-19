@@ -11,6 +11,10 @@
 
 ## 2026-10-19
 
+### 질문·항목별 비교 표 도구 · (이번 커밋)
+- 🆕 `notree.dev.vec_trace`: `vec_compare` 결과(+실제 LLM 실행 결과)로 질문별 첫 정답 순위, 방식 간 이기고 진 질문(진 쪽 순위 포함), 새 30 항목별 "검색 O/X × 그래프 전달 O/X" 표를 만든다. DB·API 없이 결과 파일만 읽고, 질문 ID·순위·개수만 출력
+- 🔧 `vec_compare` 표의 각 칸에 비율과 개수를 함께, 분모(질문 수·항목 수)를 표 머리에 출력
+
 ### 검색 방식 오프라인 비교 도구 (pg_trgm · 벡터 · 결합) · `2ccba8d`
 자세히: [docs/changes/2026-10-19-vector-compare.md](docs/changes/2026-10-19-vector-compare.md) (브랜치 `exp/vector-compare`, worker·그래프 변경 없음)
 
