@@ -411,20 +411,86 @@ class LectureNotePublishOut(BaseModel):
 # **잠정 계약**: 계약 담당(T5) 확인 전이다. 화면·API가 확정 계약으로 의존하기 전에 확인받고, 바뀌면 이 표시를 지운다.
 # 흐름: api qa_ask(질문 + 작업 의도를 한 트랜잭션) → worker qa_context → qa_search·web_search(그래프가 여러 번)
 #       → qa_complete(멱등, 세대 확인) → api qa_get(화면 조회). 노트 반영 제안·사용자 승인은 첫 통합에서 뺌.
-QaStatus = Literal["completed", "부분 답변", "근거 부족", "시간 초과"]
-QaLabel = Literal["강의", "웹", "일반 지식", "근거 부족"]
+# 대화 세션 단기 메모리 (2026-10-20, docs/changes/2026-10-20-qa-conversation-memory.md): conversation_id가 있으면
+#   qa_conversation_start → qa_ask(conversation_id) → qa_context(recent_turns) → qa_complete(서버가 이력 반영) → qa_conversation_close
+#   conversation_id 없이 부르면 이전과 같은 단일 질문 (문맥 없음, Redis를 건드리지 않음)
+QaStatus = Literal["completed", "부분 답변", "근거 부족", "시간 초과", "확인 필요"]
+QaLabel = Literal["강의", "웹", "일반 지식", "근거 부족", "확인 질문"]
 QaNotice = Literal["not_found", "insufficient", "timeout"]
+QaMemoryState = Literal["none", "ok", "incomplete", "lost", "ended", "unavailable"]
 
 
 class QaAskIn(BaseModel):
-    user_id: str = Field(description="질문한 사용자 (실제로는 api가 세션에서 꺼냄)")
+    user_id: str = Field(description="질문한 사용자 (실제로는 api가 세션에서 꺼냄. 이 PoC 서버는 api 인증을 하지 않음)")
     course_id: str
     question: str
+    conversation_id: str | None = Field(None, description="qa_conversation_start로 만든 대화. 없으면 문맥 없는 단일 질문 (이전과 같음)")
 
 
 class QaAskOut(BaseModel):
+    status: Literal["accepted", "busy", "closed", "expired"] = Field(
+        "accepted", description="accepted: 질문·작업 등록 / busy: 이 대화에 진행 중 질문이 있음 (작업 안 만듦) / "
+                                "closed·expired: 끝난 대화 → 새 대화를 시작해야 함 (작업 안 만듦)")
+    question_id: str | None = Field(None, description="accepted일 때만")
+    job_id: str | None = Field(None, description="accepted일 때만. qa 작업, 마감(deadline_at)은 요청 시각 + 90초")
+    conversation_id: str | None = None
+    turn_seq: int | None = Field(None, description="대화 안 차례 번호 (1부터). accepted일 때만")
+    active_question_id: str | None = Field(None, description="busy일 때 진행 중인 질문")
+    expire_reason: Literal["ttl", "context_lost", "closed"] | None = Field(
+        None, description="closed·expired일 때: ttl(미사용 만료) / context_lost(Redis 유실) / closed(명시적 종료)")
+
+
+class QaTurnMessage(BaseModel):
+    message_id: str
     question_id: str
-    job_id: str = Field(description="qa 작업. 마감(deadline_at)은 요청 시각 + 90초")
+    role: Literal["user", "assistant"]
+    content: str = Field(description="질문 원문 / 답 문장(인용 표시 없음)·안내문·확인 질문")
+    sequence: int = Field(description="대화 안 메시지 순서 (질문 2t-1, 답 2t, t = turn_seq)")
+    status: str | None = Field(None, description="답 메시지의 결과 상태 (completed, 확인 필요 …)")
+
+
+class QaClarification(BaseModel):
+    question: str = Field(description="사용자에게 되묻는 문장")
+    options: list[str] = Field([], description="선택지 후보 (화면의 빠른 답 버튼용, 비어 있을 수 있음)")
+
+
+class QaConversationStartIn(BaseModel):
+    user_id: str = Field(description="api가 세션에서 꺼낸 사용자 (PoC: 인증 안 함)")
+    course_id: str
+
+
+class QaConversationStartOut(BaseModel):
+    conversation_id: str
+    expires_at: float = Field(description="이 시각까지 질문이 없으면 만료 (epoch 초). 질문 등록마다 늘어남")
+
+
+class QaConversationIn(BaseModel):
+    conversation_id: str
+    user_id: str
+
+
+class QaConversationCloseOut(BaseModel):
+    closed: bool = Field(description="이번 호출로 닫음. 이미 끝난 대화면 false")
+    state: Literal["open", "closed", "expired"]
+    memory_cleared: bool = Field(description="Redis 단기 문맥 삭제 성공. false면 이전 세대 키가 TTL로 사라짐 (아무도 읽지 않음)")
+    active_question_id: str | None = Field(None, description="닫을 때 진행 중이던 질문. 답은 DB에 저장되지만 이력에는 들어가지 않음")
+
+
+class QaConversationGetIn(BaseModel):
+    conversation_id: str
+    user_id: str
+    include_messages: bool = Field(False, description="Redis 최근 문답을 함께 (개발 CLI·시험용)")
+
+
+class QaConversationGetOut(BaseModel):
+    found: bool
+    state: Literal["open", "closed", "expired"] | None = Field(None, description="open이어도 시간이 지났으면 expired로 계산해 돌려줌")
+    course_id: str | None = None
+    turns: int = Field(0, description="이 대화에 등록된 질문 수")
+    active_question_id: str | None = None
+    expires_at: float | None = Field(None, description="Redis 키의 만료 시각 (epoch 초). 키가 없으면 null")
+    memory_state: QaMemoryState = "none"
+    messages: list[QaTurnMessage] = []
 
 
 class QaContextIn(BaseModel):
@@ -437,7 +503,11 @@ class QaContextOut(BaseModel):
     course_name: str = Field(description="LLM에 주는 과목 이름")
     lecture_ids: list[str] = Field(description="과목의 강의 목록 (전사 검색 범위를 좁힐 때)")
     generation: int = Field(description="질문 세대. 삭제·수정되면 바뀐다 → qa_complete의 expected_generation")
-    recent_turns: list[str] = Field([], description="같은 과목의 최근 대화 (첫 통합에서는 비어 있음)")
+    conversation_id: str | None = Field(None, description="질문이 속한 대화 (단일 질문이면 null)")
+    recent_turns: list[QaTurnMessage] = Field([], description="이 대화의 이전 문답 (완료된 쌍만, 오래된 순, 현재 질문 제외, "
+                                                              "추정 토큰 상한 안). 강의 근거가 아니라 맥락이다. 단일 질문은 빈 목록")
+    memory_state: QaMemoryState = Field("none", description="none: 대화 없음 / ok / incomplete: 저장된 이전 답이 이력에 빠짐 / "
+                                                            "lost: Redis에 문맥 없음 / ended: 대화가 끝남 / unavailable: Redis 장애")
     answered: bool = Field(False, description="이 작업의 답이 이미 저장됨 (저장 응답을 못 받고 재시도된 경우) → 그래프를 건너뛰고 완료")
 
 
@@ -484,11 +554,15 @@ class QaCompleteIn(BaseModel):
     sentences: list[QaSentence]
     sources: list[QaSource] = Field(description="인용된 근거만. 문장의 인용은 모두 여기에 있어야 함 (없으면 invalid_args)")
     notice_code: QaNotice | None = None
+    clarification: QaClarification | None = Field(None, description="status=확인 필요일 때만 (그때는 label=확인 질문, sources=[])")
 
 
 class QaCompleteOut(BaseModel):
     answer_id: str
     reflect_suggested: bool = Field(False, description="노트 반영 제안 여부 (첫 통합에서는 항상 false)")
+    memory: Literal["none", "applied", "noop", "skipped", "failed"] = Field(
+        "none", description="대화 이력 반영 (DB 저장 뒤): none 대화 없음 / applied / noop 이미 반영 / skipped 대화가 끝남·문맥 없음 / "
+                            "failed Redis 장애 (저장은 성공, 다음 질문에서 다시 반영)")
 
 
 class QaGetIn(BaseModel):
@@ -501,7 +575,8 @@ class QaGetOut(BaseModel):
     question: str | None = None
     state: Literal["pending", "answered", "deleted"] | None = None
     job_id: str | None = None
-    answer: dict[str, Any] | None = Field(None, description="저장된 결과 (status, label, answer, sentences, citations, sources, notice_code). "
+    answer: dict[str, Any] | None = Field(None, description="저장된 결과 (status, label, answer, sentences, citations, sources, notice_code, "
+                                                             "clarification). "
                                                              "citations는 서버가 문장별 인용을 순서대로 중복 없이 모은 것. 삭제된 질문은 question·answer 모두 null")
 
 
@@ -651,19 +726,28 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
              "과목 노트에서 질문과 관련된 블록을 찾는다 (pg_trgm)"),
     ToolSpec("lecture_note_publish", LectureNotePublishIn, LectureNotePublishOut, W, "write", "T3·T4", "", False,
              "planned", "강의 최종 노트 발행 (완료/부분 완료)"),
+    ToolSpec("qa_conversation_start", QaConversationStartIn, QaConversationStartOut, API, "write", "T5", "T3·T4",
+             summary="[잠정 · T5 확인 전] 새 대화 시작 (DB 행 + Redis 단기 메모리 키). 키를 만드는 유일한 도구"),
+    ToolSpec("qa_conversation_close", QaConversationIn, QaConversationCloseOut, API, "write", "T5", "T3·T4",
+             summary="[잠정 · T5 확인 전] 대화 종료: 새 질문 거절, 세션 세대 +1, Redis 단기 문맥 삭제. DB 질문·답변은 그대로"),
+    ToolSpec("qa_conversation_get", QaConversationGetIn, QaConversationGetOut, API, "read", "T5", "T3·T4",
+             summary="[잠정 · T5 확인 전] 대화 상태 (계산한 만료 포함). include_messages면 Redis 최근 문답"),
     ToolSpec("qa_ask", QaAskIn, QaAskOut, API, "write", "T5", "T3·T4",
-             summary="[잠정 · T5 확인 전] 질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)"),
+             summary="[잠정 · T5 확인 전] 질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite). conversation_id가 있으면 "
+                     "대화당 진행 중 질문 1개(조건부 갱신), 차례 번호·메시지 ID 부여, 만료 시각 연장. 결과는 status로"),
     ToolSpec("qa_context", QaContextIn, QaContextOut, W, "read", "T5", "T3·T4",
-             summary="[잠정 · T5 확인 전] 질문·과목·강의 목록·세대. 사용자는 permit에서"),
+             summary="[잠정 · T5 확인 전] 질문·과목·강의 목록·세대 + 대화 이전 문답(recent_turns, memory_state). 사용자는 permit에서. "
+                     "**상태 변경**: 저장됐는데 이력에 빠진 이전 답이 있으면 Redis에 반영 (멱등)"),
     ToolSpec("qa_search", QaSearchIn, QaSearchOut, W, "read", "T5", "T3·T4",
              summary="[잠정 · T5 확인 전] 노트·전사 근거 검색. PoC는 키워드 일치 점수, 실제는 pg_trgm(Read)"),
     ToolSpec("web_search", WebSearchIn, WebSearchOut, W, "external", "T5", "",
              summary="[잠정 · T5 확인 전] 웹 검색 1회. PoC는 시드한 web 문서에서 찾는 가짜 (실제 공급자 미정)"),
     ToolSpec("qa_complete", QaCompleteIn, QaCompleteOut, W, "write", "T5", "T3·T4",
-             summary="[잠정 · T5 확인 전] 답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만"),
+             summary="[잠정 · T5 확인 전] 답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만. DB 커밋 뒤 대화 이력 반영 "
+                     "(실패해도 저장은 성공, memory로 알림)"),
     ToolSpec("qa_get", QaGetIn, QaGetOut, API, "read", "T5", "T3·T4", summary="[잠정 · T5 확인 전] 화면 조회: 질문 상태와 저장된 답변"),
     ToolSpec("qa_delete", QaDeleteIn, QaDeleteOut, API, "write", "T5", "T3·T4",
-             summary="[잠정 · T5 확인 전] 질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)"),
+             summary="[잠정 · T5 확인 전] 질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch). 대화 단기 문맥에서도 뺌"),
     ToolSpec("qa_seed", QaSeedIn, QaSeedOut, DEV, "dev", "T5", summary="PoC 검색용 노트·전사·웹 문서 넣기"),
     ToolSpec("grade_context", GradeContextIn, GradeContextOut, W, "read", "T5", "", False, "planned",
              "채점용 문제·루브릭·답안·근거"),

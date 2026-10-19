@@ -15,8 +15,13 @@ class HitDict(TypedDict):
 
 
 class QAState(TypedDict, total=False):
-    question: str
+    question: str                                      # 사용자가 쓴 원래 질문 (그대로 보존)
     course: str
+    history: list[dict]                                # 대화의 이전 문답 (qa_context.recent_turns). 맥락이지 근거가 아니다
+    memory_state: str                                  # none(단일 질문) / ok / incomplete / lost / ended / unavailable
+    search_query: str                                  # understand가 문맥을 반영해 만든 독립적인 질문 (검색·답변용)
+    clarify: dict | None                               # 지시 대상이 모호함 → {question, options}. 있으면 검색·답변 없이 저장
+    clarification: dict | None                         # 저장용 (status=확인 필요일 때만 = clarify)
     related: bool                                      # 질문이 이 과목 노트와 관련 있는가
     keywords: list[str]                                # understand가 만든 검색어
     hits: Annotated[list[HitDict], operator.add]       # 지금까지 찾은 근거 (단계마다 덧붙임)

@@ -25,6 +25,7 @@ uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초
 uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
 uv run python -m notree.dev.qa_run       # Q&A 근거 탐색 그래프 (feat/qa-graph 실험)
+uv run python -m notree.dev.qa_chat --local "외래키가 뭐야?" "그럼 그걸 쓰는 이유는?"   # 대화 세션 (이전 문답으로 후속 질문 해석)
 uv run pytest -q                         # 146개
 ```
 
@@ -34,6 +35,10 @@ uv run pytest -q                         # 146개
 ```powershell
 uv run pytest -q -rs      # 맨 아래 "SKIPPED ... redis-server 없음"이 있으면 그 시험은 안 돈 것
 ```
+
+대화 메모리 시험(`test_qa_conversation*`)은 가짜 Redis와 실제 Redis로 **따로** 돕니다 (`[fake]` / `[real]`).
+실제 쪽은 `redis-server`가 없으면 docker의 `redis:7-alpine`을 시험 전용으로 띄우고(RDB/AOF 끔, 끝나면 삭제), 둘 다 없으면 건너뜁니다.
+Windows에서 저장소 경로가 길면 가상환경 경로가 260자를 넘어 import가 실패할 수 있습니다 → `UV_PROJECT_ENVIRONMENT`로 짧은 경로에 두세요.
 
 프록시 환경에서 시험이 HTTP 클라이언트 생성 단계에서 실패하면 (2026-10-18 리뷰 환경):
 - SOCKS 프록시를 쓰는 환경: `uv pip install socksio==1.0.0` (모든 개발자에게 필수는 아님)

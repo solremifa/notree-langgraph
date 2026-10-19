@@ -105,6 +105,14 @@ def job_timeout_for(kind: str, cfg: StreamConfig) -> float:
     return min(cfg.job_timeout_sec, KIND_JOB_TIMEOUT_SEC.get(kind, cfg.job_timeout_sec))
 
 
+# Q&A 대화 세션 단기 메모리 (2026-10-20, docs/changes/2026-10-20-qa-conversation-memory.md).
+# 모두 잠정 초기값이다 (요구사항 확정값 아님). 읽고 쓰는 곳은 MCP 서버의 notree/mcp_server/conversation.py 하나.
+CONV_REDIS_URL = os.getenv("NOTREE_CONV_REDIS_URL", REDIS_URL)          # 대화 메모리 Redis (MCP 서버가 붙음)
+QA_CONV_MAX_TURNS = int(_f("NOTREE_QA_CONV_MAX_TURNS", 5))              # Redis에 남기는 최근 문답 쌍 수
+QA_CONV_TTL_SEC = _f("NOTREE_QA_CONV_TTL_SEC", 1800)                    # 마지막 사용자 활동(질문 등록) 뒤 만료. Q&A 마감(90초)보다 길게
+QA_HISTORY_MAX_TOKENS = int(_f("NOTREE_QA_HISTORY_MAX_TOKENS", 1200))   # 모델 입력 이력 상한 (추정: UTF-8 바이트 / 3)
+QA_CONV_MSG_MAX_CHARS = int(_f("NOTREE_QA_CONV_MSG_MAX_CHARS", 2000))   # 메시지 하나를 Redis에 넣을 때 자르는 길이
+
 # scheduler 주기 작업 (팀 결정 6·9번)
 RESEND_INTERVAL_SEC = _f("NOTREE_RESEND_INTERVAL_SEC", 10)        # 누락 복구 주기
 RESEND_RESERVED_SEC = _f("NOTREE_RESEND_RESERVED_SEC", 30)        # 허가 후 이만큼 전송 완료가 안 되면 다시 보냄

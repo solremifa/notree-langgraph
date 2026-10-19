@@ -6,6 +6,13 @@
                        │              ├(부족)→ search_web ───────────────→   │         ├(인용 문제·재시도 남음)→ answer
                        │              └(시간 없음)→ skip_web ──────────────→   │         └(답할 수 없음·남은 출처·시간)→ 다음 search_*
                        └(시간 없음)→ skip_transcript ──────────────────────→   ┘
+    understand ─(대화 속 질문인데 지시 대상이 모호함)→ save (상태 '확인 필요', 검색·답변 없음)
+
+대화 (2026-10-20): 입력에 history(이전 문답)·memory_state가 있으면 understand부터 쓴다.
+- understand가 이전 문답으로 지시 대상을 풀어 search_query(독립적인 질문)를 만들고, 검색어도 그 기준으로. 원래 질문은 question 그대로
+- 대상이 둘 이상으로 읽히면 임의로 정하지 않고 확인 질문 (clarify) — 결과 상태 '확인 필요', 라벨 '확인 질문'
+- answer에는 이전 문답을 근거와 따로 넘긴다. 인용 확인은 이번 근거 ID만 보므로 이전 답은 인용될 수 없다
+- memory_state가 none(단일 질문)이면 LLM을 이전과 같은 인자로 부른다
 
 규칙
 - 검색을 멈추는 기준: 최고 점수 ≥ ENOUGH_SCORE
@@ -142,21 +149,33 @@ def next_source(state: QAState, config: RunnableConfig) -> str | None:
 
 # ── 노드 ─────────────────────────────────────────────────────────
 
+def in_conversation(state: QAState) -> bool:
+    """대화 속 질문인가 (qa_context의 memory_state가 none이 아님). 단일 질문이면 LLM을 이전과 같은 인자로 부른다."""
+    return state.get("memory_state", "none") != "none"
+
+
 async def understand(state: QAState, config: RunnableConfig) -> dict:
+    """질문 이해. 대화 속 질문이면 검색 전에 이전 문답으로 지시 대상을 풀어 search_query를 만든다 (원래 질문은 그대로 둠).
+    지시 대상이 모호하면 확인 질문(clarify)으로 끝낸다 — 검색·답변을 하지 않는다."""
     q = state["question"]
     calls = state.get("llm_calls", 0)
     fallback = Understanding(related=True, keywords=keywords_of(q))   # 판단을 못 하면 '관련 있음'으로 보고 찾는다
     if time_left(config) < MIN_ANSWER_SEC + ANSWER_RESERVE_SEC:
         return {"related": fallback.related, "keywords": fallback.keywords, "answer_attempts": 0, "llm_calls": calls,
-                "skipped": ["understand: 시간 부족 → 단어 추출로 대신"]}
+                "search_query": q, "clarify": None, "skipped": ["understand: 시간 부족 → 단어 추출로 대신"]}
+    conv = in_conversation(state)
+    extra = {"history": state.get("history") or [], "memory_state": state["memory_state"]} if conv else {}
     try:
-        u = await asyncio.wait_for(_cfg(config)["llm"].understand(q, state.get("course", "")),
+        u = await asyncio.wait_for(_cfg(config)["llm"].understand(q, state.get("course", ""), **extra),
                                    timeout=_llm_timeout(config))
         note = []
     except TimeoutError:
         u, note = fallback, ["understand: LLM 시간 초과 → 단어 추출로 대신"]
+    clarify = None
+    if conv and u.needs_clarification and u.clarification_question.strip():
+        clarify = {"question": u.clarification_question.strip(), "options": [o for o in u.clarification_options if o]}
     return {"related": u.related, "keywords": split_keywords(u.keywords), "answer_attempts": 0, "llm_calls": calls + 1,
-            "skipped": note}
+            "search_query": (u.search_query or "").strip() or q, "clarify": clarify, "skipped": note}
 
 
 def split_keywords(keywords: list[str]) -> list[str]:
@@ -202,10 +221,13 @@ async def answer(state: QAState, config: RunnableConfig) -> dict:
                  "answer_attempts": attempt, "needs_more": False, "timed_out": True}
     if not _can_call_llm(state, config):
         return {**timed_out, "llm_calls": calls}
+    # 대화 속 질문: 이전 문답과 해석한 질문을 따로 넘긴다 (근거는 ev만. 인용 확인도 ev 기준이라 이전 답은 인용될 수 없다)
+    extra = ({"history": state.get("history") or [], "search_query": state.get("search_query") or state["question"]}
+             if in_conversation(state) else {})
     try:
         a = await asyncio.wait_for(
             _cfg(config)["llm"].answer(state["question"], ev, attempt, state.get("verify_problem", ""),
-                                       related=related),
+                                       related=related, **extra),
             timeout=_llm_timeout(config))
     except TimeoutError:
         return {**timed_out, "llm_calls": calls + 1}
@@ -241,6 +263,14 @@ async def save(state: QAState, config: RunnableConfig) -> dict:
     시간 초과·근거 부족도 그래프는 정상 종료하므로 작업은 done이 된다."""
     notice = None
     out: dict = {"status": "completed"}
+    if state.get("clarify"):                   # 지시 대상이 모호함 → 답이 아니라 되묻기 (기존 상태에 끼우지 않는다)
+        c = state["clarify"]
+        out.update(status="확인 필요", label="확인 질문", answer=c["question"], citations=[], notice_code=None,
+                   sentences=[{"text": c["question"], "citations": []}], sources=[], clarification=c)
+        sink = _cfg(config).get("sink")
+        if sink is not None:
+            await sink({**state, **out})
+        return out
     if state.get("timed_out"):
         notice, out["status"] = "timeout", "시간 초과"
     elif state.get("verify_problem"):          # 재시도까지 실패 → 틀린 본문은 버리고 정해진 안내문으로
@@ -266,6 +296,8 @@ async def save(state: QAState, config: RunnableConfig) -> dict:
 # ── 분기 ─────────────────────────────────────────────────────────
 
 def after_understand(state: QAState) -> str:
+    if state.get("clarify"):
+        return "save"
     return "search_note" if state.get("related") else "answer"
 
 
@@ -314,7 +346,7 @@ def build_qa_graph():
     g.add_node("save", save)
 
     g.add_edge(START, "understand")
-    g.add_conditional_edges("understand", after_understand, ["search_note", "answer"])
+    g.add_conditional_edges("understand", after_understand, ["search_note", "answer", "save"])
     g.add_conditional_edges("search_note", after_notes, ["answer", "search_transcript", "skip_transcript"])
     g.add_conditional_edges("search_transcript", after_transcript, ["answer", "search_web", "skip_web"])
     g.add_edge("skip_transcript", "answer")

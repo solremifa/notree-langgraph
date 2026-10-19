@@ -55,6 +55,9 @@
 | `lecture_end` | 쓰기 | api | T3·T4 |  |  | 구현 |
 | `lecture_get` | 개발용 | dev | T3·T4 |  |  | 구현 |
 | `summary_recover` | 작업 제어 | scheduler | T3·T4 |  |  | 구현 |
+| `qa_conversation_start` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
+| `qa_conversation_close` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
+| `qa_conversation_get` | 읽기 | api | T5 | T3·T4 |  | 구현 |
 | `qa_ask` | 쓰기 | api | T5 | T3·T4 |  | 구현 |
 | `qa_context` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
 | `qa_search` | 읽기 | worker | T5 | T3·T4 |  | 구현 |
@@ -690,32 +693,107 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 |---|---|---|
 | `registered` | `list[str]` | 새로 등록한 요약 작업 job_id |
 
-### `qa_ask`
+### `qa_conversation_start`
 
 쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
 
-[잠정 · T5 확인 전] 질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite)
+[잠정 · T5 확인 전] 새 대화 시작 (DB 행 + Redis 단기 메모리 키). 키를 만드는 유일한 도구
 
 입력
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `user_id` | `str` | 질문한 사용자 (실제로는 api가 세션에서 꺼냄) |
+| `user_id` | `str` | api가 세션에서 꺼낸 사용자 (PoC: 인증 안 함) |
 | `course_id` | `str` |  |
-| `question` | `str` |  |
 
 출력 (`data`)
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `question_id` | `str` |  |
-| `job_id` | `str` | qa 작업. 마감(deadline_at)은 요청 시각 + 90초 |
+| `conversation_id` | `str` |  |
+| `expires_at` | `float` | 이 시각까지 질문이 없으면 만료 (epoch 초). 질문 등록마다 늘어남 |
+
+### `qa_conversation_close`
+
+쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+[잠정 · T5 확인 전] 대화 종료: 새 질문 거절, 세션 세대 +1, Redis 단기 문맥 삭제. DB 질문·답변은 그대로
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `conversation_id` | `str` |  |
+| `user_id` | `str` |  |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `closed` | `bool` | 이번 호출로 닫음. 이미 끝난 대화면 false |
+| `state` | `"open" | "closed" | "expired"` |  |
+| `memory_cleared` | `bool` | Redis 단기 문맥 삭제 성공. false면 이전 세대 키가 TTL로 사라짐 (아무도 읽지 않음) |
+| `active_question_id` | `str | null` = None | 닫을 때 진행 중이던 질문. 답은 DB에 저장되지만 이력에는 들어가지 않음 |
+
+### `qa_conversation_get`
+
+읽기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+[잠정 · T5 확인 전] 대화 상태 (계산한 만료 포함). include_messages면 Redis 최근 문답
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `conversation_id` | `str` |  |
+| `user_id` | `str` |  |
+| `include_messages` | `bool` = False | Redis 최근 문답을 함께 (개발 CLI·시험용) |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `found` | `bool` |  |
+| `state` | `"open" | "closed" | "expired" | null` = None | open이어도 시간이 지났으면 expired로 계산해 돌려줌 |
+| `course_id` | `str | null` = None |  |
+| `turns` | `int` = 0 | 이 대화에 등록된 질문 수 |
+| `active_question_id` | `str | null` = None |  |
+| `expires_at` | `float | null` = None | Redis 키의 만료 시각 (epoch 초). 키가 없으면 null |
+| `memory_state` | `"none" | "ok" | "incomplete" | "lost" | "ended" | "unavailable"` = 'none' |  |
+| `messages` | `list[QaTurnMessage]` = [] |  |
+
+### `qa_ask`
+
+쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
+
+[잠정 · T5 확인 전] 질문 저장 + qa 작업 의도를 한 트랜잭션에 (PoC: SQLite). conversation_id가 있으면 대화당 진행 중 질문 1개(조건부 갱신), 차례 번호·메시지 ID 부여, 만료 시각 연장. 결과는 status로
+
+입력
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `user_id` | `str` | 질문한 사용자 (실제로는 api가 세션에서 꺼냄. 이 PoC 서버는 api 인증을 하지 않음) |
+| `course_id` | `str` |  |
+| `question` | `str` |  |
+| `conversation_id` | `str | null` = None | qa_conversation_start로 만든 대화. 없으면 문맥 없는 단일 질문 (이전과 같음) |
+
+출력 (`data`)
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `status` | `"accepted" | "busy" | "closed" | "expired"` = 'accepted' | accepted: 질문·작업 등록 / busy: 이 대화에 진행 중 질문이 있음 (작업 안 만듦) / closed·expired: 끝난 대화 → 새 대화를 시작해야 함 (작업 안 만듦) |
+| `question_id` | `str | null` = None | accepted일 때만 |
+| `job_id` | `str | null` = None | accepted일 때만. qa 작업, 마감(deadline_at)은 요청 시각 + 90초 |
+| `conversation_id` | `str | null` = None |  |
+| `turn_seq` | `int | null` = None | 대화 안 차례 번호 (1부터). accepted일 때만 |
+| `active_question_id` | `str | null` = None | busy일 때 진행 중인 질문 |
+| `expire_reason` | `"ttl" | "context_lost" | "closed" | null` = None | closed·expired일 때: ttl(미사용 만료) / context_lost(Redis 유실) / closed(명시적 종료) |
 
 ### `qa_context`
 
 읽기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
 
-[잠정 · T5 확인 전] 질문·과목·강의 목록·세대. 사용자는 permit에서
+[잠정 · T5 확인 전] 질문·과목·강의 목록·세대 + 대화 이전 문답(recent_turns, memory_state). 사용자는 permit에서. **상태 변경**: 저장됐는데 이력에 빠진 이전 답이 있으면 Redis에 반영 (멱등)
 
 입력
 
@@ -732,7 +810,9 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `course_name` | `str` | LLM에 주는 과목 이름 |
 | `lecture_ids` | `list[str]` | 과목의 강의 목록 (전사 검색 범위를 좁힐 때) |
 | `generation` | `int` | 질문 세대. 삭제·수정되면 바뀐다 → qa_complete의 expected_generation |
-| `recent_turns` | `list[str]` = [] | 같은 과목의 최근 대화 (첫 통합에서는 비어 있음) |
+| `conversation_id` | `str | null` = None | 질문이 속한 대화 (단일 질문이면 null) |
+| `recent_turns` | `list[QaTurnMessage]` = [] | 이 대화의 이전 문답 (완료된 쌍만, 오래된 순, 현재 질문 제외, 추정 토큰 상한 안). 강의 근거가 아니라 맥락이다. 단일 질문은 빈 목록 |
+| `memory_state` | `"none" | "ok" | "incomplete" | "lost" | "ended" | "unavailable"` = 'none' | none: 대화 없음 / ok / incomplete: 저장된 이전 답이 이력에 빠짐 / lost: Redis에 문맥 없음 / ended: 대화가 끝남 / unavailable: Redis 장애 |
 | `answered` | `bool` = False | 이 작업의 답이 이미 저장됨 (저장 응답을 못 받고 재시도된 경우) → 그래프를 건너뛰고 완료 |
 
 ### `qa_search`
@@ -781,7 +861,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 
 쓰기 · 호출: worker · 정의: T5 · 리뷰: T3·T4 · permit 필요
 
-[잠정 · T5 확인 전] 답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만
+[잠정 · T5 확인 전] 답변 저장. 멱등(idem_key), 질문 세대가 그대로일 때만. DB 커밋 뒤 대화 이력 반영 (실패해도 저장은 성공, memory로 알림)
 
 입력
 
@@ -790,12 +870,13 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `idem_key` | `str` | = job_id. 같은 키로 두 번 오면 처음 결과를 돌려주고 duplicate=true |
 | `question_id` | `str` |  |
 | `expected_generation` | `int` | qa_context에서 받은 세대. 다르면 generation_mismatch (질문이 삭제·수정됨) |
-| `status` | `"completed" | "부분 답변" | "근거 부족" | "시간 초과"` |  |
-| `label` | `"강의" | "웹" | "일반 지식" | "근거 부족"` |  |
+| `status` | `"completed" | "부분 답변" | "근거 부족" | "시간 초과" | "확인 필요"` |  |
+| `label` | `"강의" | "웹" | "일반 지식" | "근거 부족" | "확인 질문"` |  |
 | `answer` | `str` | 화면용 본문. 인용 표시 [^ID] 포함 (코드가 만든 것) |
 | `sentences` | `list[QaSentence]` |  |
 | `sources` | `list[QaSource]` | 인용된 근거만. 문장의 인용은 모두 여기에 있어야 함 (없으면 invalid_args) |
 | `notice_code` | `"not_found" | "insufficient" | "timeout" | null` = None |  |
+| `clarification` | `QaClarification | null` = None | status=확인 필요일 때만 (그때는 label=확인 질문, sources=[]) |
 
 출력 (`data`)
 
@@ -803,6 +884,7 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 |---|---|---|
 | `answer_id` | `str` |  |
 | `reflect_suggested` | `bool` = False | 노트 반영 제안 여부 (첫 통합에서는 항상 false) |
+| `memory` | `"none" | "applied" | "noop" | "skipped" | "failed"` = 'none' | 대화 이력 반영 (DB 저장 뒤): none 대화 없음 / applied / noop 이미 반영 / skipped 대화가 끝남·문맥 없음 / failed Redis 장애 (저장은 성공, 다음 질문에서 다시 반영) |
 
 ### `qa_get`
 
@@ -825,13 +907,13 @@ PoC 과목 노트 발행. 사용자 ID는 permit에서
 | `question` | `str | null` = None |  |
 | `state` | `"pending" | "answered" | "deleted" | null` = None |  |
 | `job_id` | `str | null` = None |  |
-| `answer` | `dict[str, any] | null` = None | 저장된 결과 (status, label, answer, sentences, citations, sources, notice_code). citations는 서버가 문장별 인용을 순서대로 중복 없이 모은 것. 삭제된 질문은 question·answer 모두 null |
+| `answer` | `dict[str, any] | null` = None | 저장된 결과 (status, label, answer, sentences, citations, sources, notice_code, clarification). citations는 서버가 문장별 인용을 순서대로 중복 없이 모은 것. 삭제된 질문은 question·answer 모두 null |
 
 ### `qa_delete`
 
 쓰기 · 호출: api · 정의: T5 · 리뷰: T3·T4
 
-[잠정 · T5 확인 전] 질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch)
+[잠정 · T5 확인 전] 질문 삭제 (세대 증가 → 진행 중 답변 저장은 generation_mismatch). 대화 단기 문맥에서도 뺌
 
 입력
 

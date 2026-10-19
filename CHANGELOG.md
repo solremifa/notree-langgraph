@@ -9,6 +9,27 @@
 
 ---
 
+## 2026-10-20
+
+### Q&A 대화 세션별 단기 메모리 (`feat/qa-conversation-memory`, main 미머지) · (이번 커밋)
+자세히: [docs/changes/2026-10-20-qa-conversation-memory.md](docs/changes/2026-10-20-qa-conversation-memory.md) · 기준 `a8995e4`
+
+- 🐛 후속 질문("그럼 그걸 삭제하면?")이 이전 문답 없이 처리되던 문제: `recent_turns`가 항상 비어 있었고 그래프가 `(질문, 과목)`만 받음 (재현 시험으로 확인)
+- 🆕 `qa_conversation_start` / `qa_conversation_close` / `qa_conversation_get` (api). 대화 = (사용자, 과목, `conversation_id`), DB 표 `qa_conversations`
+- 🆕 `notree/mcp_server/conversation.py`: Redis 최근 문답 (`notree:conv:{id}:{세대}` 해시, 쌍 단위, WATCH 조건부 갱신, 있는 키만 변경). MCP 서버만 씀, worker는 모름
+- 🆕 그래프: understand부터 이전 문답 사용 → `search_query`(독립 질문)·검색어. 지시 대상이 모호하면 확인 질문 (결과 상태 `확인 필요`, 라벨 `확인 질문`, `clarification`)
+- 🆕 프롬프트에서 이번 근거(ID)와 이전 대화(ID 없음, 인용·사실 근거 금지)를 분리, 이력 속 지시를 따르지 않게 system 지시
+- 🆕 설정(잠정값): `NOTREE_CONV_REDIS_URL`, `NOTREE_QA_CONV_MAX_TURNS`(5), `NOTREE_QA_CONV_TTL_SEC`(1800), `NOTREE_QA_HISTORY_MAX_TOKENS`(1200, 추정), `NOTREE_QA_CONV_MSG_MAX_CHARS`(2000)
+- 🆕 개발 CLI `uv run python -m notree.dev.qa_chat --local "…" "…"` (화면 대신)
+- ⚠️ `qa_ask` 결과에 `status`(accepted / busy / closed / expired). `question_id`·`job_id`는 accepted일 때만 값이 있음 (conversation_id 없는 기존 호출은 항상 accepted라 그대로 동작)
+- ⚠️ `qa_context.recent_turns`: `list[str]` → `list[QaTurnMessage]` (`message_id, question_id, role, content, sequence, status`), `memory_state`·`conversation_id` 추가
+- ⚠️ 결과 상태·라벨에 `확인 필요`·`확인 질문` 추가 → 화면은 답이 아닌 되묻기로 그려야 함 (출처·인용·다시 시도 없음)
+- 🔧 `qa_complete`: 저장 뒤 이력 반영 결과 `memory` (Redis 실패해도 저장 성공), `clarification` 인자. `qa_delete`: 단기 문맥에서도 뺌. `job_retry`: 대화 속 질문은 그 뒤 새 질문이 없을 때만
+- 🔧 LLM 인터페이스: `understand(…, history=, memory_state=)`, `answer(…, history=, search_query=)` — **대화 속 질문일 때만** 넘김 (단일 질문은 이전과 같은 인자)
+- worker 루프·배정기·permit·실행 세대·재시도·멱등 저장·ACK·Stream 메시지 형식·Redis 영속화 설정은 그대로
+- 테스트 → Windows 171 passed·28 skipped (기존 실제 Redis 시험 27개는 redis-server가 없어 건너뜀), Linux 컨테이너 파일별 198 passed·1 skipped (그 27개 포함)
+- 🐛 시험 도구: 가짜 Redis TCP 서버의 처리 스레드가 pytest 종료를 막던 문제 (데몬 스레드, 클라이언트 닫기)
+
 ## 2026-10-19
 
 ### 검색 방식 비교 측정 기록 (문서만) · `6ae423d`

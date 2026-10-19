@@ -35,9 +35,11 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # 저장소 루트 (파일 경로로 직접 띄워질 때 notree import)
+from notree.common import settings as S  # noqa: E402
 from notree.common.settings import KIND_DEADLINE_SEC, STREAMS, max_attempts_for  # noqa: E402
 from notree.contracts import tools as C  # noqa: E402
 from notree.contracts.envelope import ErrorCode, err, ok  # noqa: E402
+from notree.mcp_server import conversation as CONV  # noqa: E402
 
 DB = Path(os.getenv("NOTREE_DB", "out/notree.db"))
 DB.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,9 @@ CREATE TABLE IF NOT EXISTS qa_docs(
 CREATE TABLE IF NOT EXISTS qa_questions(
   question_id TEXT PRIMARY KEY, user_id TEXT, course_id TEXT, question TEXT, job_id TEXT,
   generation INTEGER DEFAULT 1, state TEXT, answer TEXT, answer_id TEXT, idem_key TEXT, created REAL, updated_at REAL);
+CREATE TABLE IF NOT EXISTS qa_conversations(
+  conversation_id TEXT PRIMARY KEY, user_id TEXT, course_id TEXT, state TEXT, epoch INTEGER DEFAULT 1,
+  next_seq INTEGER DEFAULT 1, active_question_id TEXT, last_user_at REAL, created REAL, ended_at REAL, end_reason TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS lectures(
   lecture_id TEXT PRIMARY KEY, user_id TEXT, state TEXT, generation INTEGER DEFAULT 1,
@@ -103,6 +108,9 @@ ADDED_COLUMNS = [
     ("jobs", "lecture_id TEXT"),                 # 실시간 요약 합치기용 (강의당 대기 1개)
     ("jobs", "dispatch_gen INTEGER"),            # 마지막으로 Redis에 보낸 전달 세대 (Redis 유실 복구 판정)
     ("notes", "user_id TEXT"),
+    # Q&A 대화 (2026-10-20): 질문이 속한 대화, 대화 안 차례, 메시지 ID (등록 때 정해 재시도에도 같음)
+    ("qa_questions", "conversation_id TEXT"), ("qa_questions", "turn_seq INTEGER"),
+    ("qa_questions", "user_message_id TEXT"), ("qa_questions", "assistant_message_id TEXT"),
 ]
 
 
@@ -593,6 +601,10 @@ def job_retry(job_id: str, deadline_at: float | None = None) -> dict:
                 return ok(C.JobRetryOut(revived=False,
                                         reason="후속 요약이 이미 있음 → 그 요약이 실패 구간부터 함께 처리함"))
         payload = json.loads(r["payload"])
+        if r["kind"] == "qa":                                # 대화 속 질문: 대화당 진행 중 1개·차례 순서를 지킨다
+            why = _qa_retry_blocked(con, payload.get("question_id"))
+            if why:
+                return ok(C.JobRetryOut(revived=False, reason=why))
         if deadline_at is None and r["kind"] in KIND_DEADLINE_SEC:
             deadline_at = time.time() + KIND_DEADLINE_SEC[r["kind"]]
         if deadline_at is not None:
@@ -832,9 +844,250 @@ def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) ->
     return ok(C.QaSeedOut(inserted=len(docs)))
 
 
+# ── Q&A 대화 세션 (2026-10-20, docs/changes/2026-10-20-qa-conversation-memory.md) ─────────
+# DB가 세션의 정체(주인·상태·세대·차례·진행 중 질문)를, Redis(conversation.py)가 최근 문답을 가진다.
+# 둘은 한 번에 원자적으로 쓸 수 없으므로 경계마다 순서를 정했다 (문서 3절):
+#   시작: Redis 키 → DB 행 / 질문: DB 확인 → Redis 연장(있을 때만) → DB 슬롯·질문 / 답: DB 저장 → Redis 반영(실패해도 저장 성공)
+#   종료·만료: DB 세대 +1 → Redis 삭제. 종료·만료된 대화를 DB 이력으로 다시 만들지 않는다.
+def _conv_row(con, conversation_id: str, user_id: str, course_id: str | None = None) -> sqlite3.Row:
+    r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+    if not r or r["user_id"] != user_id or (course_id is not None and r["course_id"] != course_id):
+        raise Reject(ErrorCode.NOT_FOUND, f"대화 없음: {conversation_id}")      # 남의 대화는 '없음'과 구별하지 않는다
+    return r
+
+
+def _timed_out(r) -> bool:
+    """DB 기준 미사용 만료 (마지막 사용자 활동 + TTL). Redis TTL과 따로 본다: 둘 중 하나라도 지나면 만료."""
+    return time.time() - (r["last_user_at"] or r["created"]) > S.QA_CONV_TTL_SEC
+
+
+def _end_conversation(conversation_id: str, epoch: int, state: str, reason: str) -> bool:
+    """열린 대화를 끝낸다 (closed·expired). 세대를 올려 이전 세대 키로 가는 늦은 쓰기를 무력화하고 단기 문맥을 지운다.
+    DB는 조건부(state='open' AND epoch=?)라 여러 번 불려도 한 번만 바뀐다. → Redis 삭제 성공 여부."""
+    with tx() as con:
+        con.execute("UPDATE qa_conversations SET state=?, epoch=epoch+1, ended_at=?, end_reason=? "
+                    "WHERE conversation_id=? AND state='open' AND epoch=?",
+                    (state, time.time(), reason, conversation_id, epoch))
+    try:
+        CONV.drop(conversation_id, epoch)
+        return True
+    except CONV.MemoryUnavailable:
+        return False                                  # 이전 세대 키는 아무도 읽지 않고 TTL로 사라진다
+
+
+def _release_if_finished(con, r) -> None:
+    """진행 중 슬롯의 질문이 이미 끝났으면 비운다. 작업 실패(failed)는 qa_complete 없이 끝나므로 다음 질문 등록 때 여기서 비운다."""
+    q = con.execute("SELECT q.state qs, j.state js FROM qa_questions q LEFT JOIN jobs j ON j.job_id=q.job_id "
+                    "WHERE q.question_id=?", (r["active_question_id"],)).fetchone()
+    if not q or q["qs"] != "pending" or q["js"] in ("done", "failed"):
+        con.execute("UPDATE qa_conversations SET active_question_id=NULL WHERE conversation_id=? AND active_question_id=?",
+                    (r["conversation_id"], r["active_question_id"]))
+
+
+def _assistant_text(a: dict) -> str:
+    """이력에 넣는 답: 인용 표시 없는 문장만 (이전 답의 근거 ID가 다음 답의 인용으로 새지 않게). 확인 질문은 그 문장."""
+    if a.get("clarification"):
+        return a["clarification"]["question"]
+    return " ".join(s["text"] for s in a.get("sentences") or []) or a.get("answer") or ""
+
+
+def _memory_turns(con, conversation_id: str) -> list[dict]:
+    """DB에 저장된 최근 답 (이력의 원본). 남기는 쌍 수만큼만 본다."""
+    rows = con.execute("SELECT question_id, turn_seq, user_message_id, assistant_message_id, question, answer "
+                       "FROM qa_questions WHERE conversation_id=? AND state='answered' AND answer IS NOT NULL "
+                       "ORDER BY turn_seq DESC LIMIT ?", (conversation_id, S.QA_CONV_MAX_TURNS)).fetchall()
+    out = []
+    for r in rows:
+        a = json.loads(r["answer"])
+        out.append({"turn_seq": r["turn_seq"], "question_id": r["question_id"], "question": r["question"],
+                    "user_message_id": r["user_message_id"], "assistant_message_id": r["assistant_message_id"],
+                    "answer": _assistant_text(a), "status": a.get("status")})
+    return out
+
+
+def _sync_memory(conversation_id: str) -> tuple[str, int]:
+    """DB에 저장됐는데 Redis 이력에 아직 없는 답을 반영한다 (mark 비교라 몇 번 불려도 중복 없음).
+    열린 대화의 현재 세대 키가 있을 때만 — 재시도 중인 현재 대화의 결과 확인이지, 끝난 대화의 복원이 아니다.
+    → (applied | noop | skipped | failed, 반영 뒤 mark)"""
+    with db() as con:
+        r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if not r or r["state"] != "open":
+            return "skipped", -1
+        turns = _memory_turns(con, conversation_id)
+    try:
+        res, mark = CONV.apply_turns(conversation_id, r["epoch"], r["user_id"], r["course_id"], turns)
+    except CONV.MemoryUnavailable:
+        return "failed", -1
+    return ("skipped" if res == "missing" else res), mark
+
+
+def _context_turns(q) -> tuple[list[dict], str]:
+    """qa_context용 이전 문답과 memory_state. 현재 질문은 빼고(차례·ID 둘 다), DB에서 지운 질문도 뺀다."""
+    cid = q["conversation_id"]
+    sync, _ = _sync_memory(cid)
+    with db() as con:
+        r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (cid,)).fetchone()
+        if r["state"] != "open":
+            return [], "ended"
+        answered = {x["question_id"]: x["turn_seq"] for x in con.execute(
+            "SELECT question_id, turn_seq FROM qa_questions WHERE conversation_id=? AND state='answered' AND turn_seq<?",
+            (cid, q["turn_seq"]))}
+    try:
+        m = CONV.read(cid, r["epoch"], r["user_id"], r["course_id"])
+    except CONV.MemoryUnavailable:
+        return [], "unavailable"
+    if m is None:
+        return [], "lost"
+    msgs = [x for x in m["messages"] if x["question_id"] in answered]
+    turns = CONV.window(msgs, q["turn_seq"], q["question_id"])
+    missing = max(answered.values(), default=0) > m["mark"]      # 저장된 최근 답이 아직 이력에 없음
+    return turns, ("incomplete" if sync == "failed" or missing else "ok")
+
+
 @tool
-def qa_ask(user_id: str, course_id: str, question: str) -> dict:
-    """[api] 질문 행과 qa 작업 의도를 한 트랜잭션에. 마감은 job_create와 같은 규칙(요청 + 90초)."""
+def qa_conversation_start(user_id: str, course_id: str) -> dict:
+    """[api] 새 대화. Redis 키를 먼저 만들고 DB 행을 넣는다 (DB가 실패하면 고아 키는 아무도 읽지 않고 TTL로 사라짐)."""
+    with db() as con:
+        c = con.execute("SELECT user_id FROM qa_courses WHERE course_id=?", (course_id,)).fetchone()
+    if not c or c["user_id"] != user_id:
+        raise Reject(ErrorCode.NOT_FOUND, f"과목 없음: {course_id}")
+    cid = f"cv-{uuid.uuid4().hex[:12]}"
+    try:
+        exp = CONV.create(cid, 1, user_id, course_id)
+    except CONV.MemoryUnavailable as e:
+        raise Reject(ErrorCode.UNAVAILABLE, f"대화 메모리: {e}") from None
+    now = time.time()
+    with tx() as con:
+        con.execute("INSERT INTO qa_conversations(conversation_id, user_id, course_id, state, epoch, next_seq, "
+                    "last_user_at, created) VALUES(?,?,?,'open',1,1,?,?)", (cid, user_id, course_id, now, now))
+    return ok(C.QaConversationStartOut(conversation_id=cid, expires_at=exp / 1000))
+
+
+@tool
+def qa_conversation_close(conversation_id: str, user_id: str) -> dict:
+    """[api] 대화 종료. 새 질문을 거절하고 단기 문맥을 지운다. 진행 중 질문은 계속 돌아 DB에 답을 저장하지만,
+    세대가 바뀌어 이력에는 들어가지 않는다. DB의 질문·답변은 지우지 않는다 (보관 정책 그대로)."""
+    with db() as con:
+        r = _conv_row(con, conversation_id, user_id)
+        active = None
+        if r["active_question_id"]:
+            q = con.execute("SELECT state FROM qa_questions WHERE question_id=?", (r["active_question_id"],)).fetchone()
+            active = r["active_question_id"] if q and q["state"] == "pending" else None
+    if r["state"] != "open":
+        return ok(C.QaConversationCloseOut(closed=False, state=r["state"], memory_cleared=False))
+    with tx() as con:
+        n = con.execute("UPDATE qa_conversations SET state='closed', epoch=epoch+1, ended_at=?, end_reason='closed' "
+                        "WHERE conversation_id=? AND state='open' AND epoch=?",
+                        (time.time(), conversation_id, r["epoch"])).rowcount
+        now_state = con.execute("SELECT state FROM qa_conversations WHERE conversation_id=?",
+                                (conversation_id,)).fetchone()["state"]
+    if n != 1:                                          # 그사이 만료·종료됨
+        return ok(C.QaConversationCloseOut(closed=False, state=now_state, memory_cleared=False))
+    try:
+        CONV.drop(conversation_id, r["epoch"])
+        cleared = True
+    except CONV.MemoryUnavailable:
+        cleared = False
+    return ok(C.QaConversationCloseOut(closed=True, state="closed", memory_cleared=cleared, active_question_id=active))
+
+
+@tool
+def qa_conversation_get(conversation_id: str, user_id: str, include_messages: bool = False) -> dict:
+    """[api·dev] 대화 상태. 만료는 다음 질문 때 DB에 확정되지만, 여기서는 시간·Redis 키를 보고 계산해 돌려준다."""
+    with db() as con:
+        r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if not r or r["user_id"] != user_id:
+            return ok(C.QaConversationGetOut(found=False))
+        answered = {x[0] for x in con.execute(
+            "SELECT question_id FROM qa_questions WHERE conversation_id=? AND state='answered'", (conversation_id,))}
+    state, exp, mstate, msgs = r["state"], None, "ended", []
+    if r["state"] == "open":
+        try:
+            m = CONV.read(conversation_id, r["epoch"], r["user_id"], r["course_id"])
+            mstate = "lost" if m is None else "ok"
+            if m is not None:
+                exp = m["expires_at"] / 1000
+                msgs = [x for x in m["messages"] if x["question_id"] in answered] if include_messages else []
+        except CONV.MemoryUnavailable:
+            mstate = "unavailable"
+        if _timed_out(r) or mstate == "lost":
+            state = "expired"
+    return ok(C.QaConversationGetOut(found=True, state=state, course_id=r["course_id"], turns=r["next_seq"] - 1,
+                                     active_question_id=r["active_question_id"], expires_at=exp, memory_state=mstate,
+                                     messages=msgs))
+
+
+def _ended(r) -> dict:
+    return ok(C.QaAskOut(status="closed" if r["state"] == "closed" else "expired",
+                         conversation_id=r["conversation_id"], expire_reason=r["end_reason"]))
+
+
+def _qa_ask_in_conversation(user_id: str, course_id: str, question: str, conversation_id: str) -> dict:
+    with db() as con:
+        r = _conv_row(con, conversation_id, user_id, course_id)
+    if r["state"] != "open":
+        return _ended(r)
+    epoch = r["epoch"]
+    if _timed_out(r):
+        _end_conversation(conversation_id, epoch, "expired", "ttl")
+        return ok(C.QaAskOut(status="expired", conversation_id=conversation_id, expire_reason="ttl"))
+    try:
+        alive = CONV.touch(conversation_id, epoch, user_id, course_id)     # 사용자 활동: 있는 키만 연장 (없으면 만들지 않음)
+    except CONV.MemoryUnavailable as e:
+        raise Reject(ErrorCode.UNAVAILABLE, f"대화 메모리: {e}") from None
+    if alive is None:                         # DB는 열려 있는데 키가 없음 → Redis 유실(또는 막 만료). 같은 세션을 되살리지 않는다
+        _end_conversation(conversation_id, epoch, "expired", "context_lost")
+        return ok(C.QaAskOut(status="expired", conversation_id=conversation_id, expire_reason="context_lost"))
+    question_id, now = f"q-{uuid.uuid4().hex[:8]}", time.time()
+    with tx() as con:
+        r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if r["state"] != "open" or r["epoch"] != epoch:                  # 그사이 종료·만료
+            return _ended(r)
+        if r["active_question_id"]:
+            _release_if_finished(con, r)
+        # 대화당 진행 중 질문 1개: 조건부 갱신 한 문장 (PG에서도 같은 문장 + RETURNING next_seq로 경쟁 없이)
+        n = con.execute("UPDATE qa_conversations SET active_question_id=?, next_seq=next_seq+1, last_user_at=? "
+                        "WHERE conversation_id=? AND state='open' AND epoch=? AND active_question_id IS NULL",
+                        (question_id, now, conversation_id, epoch)).rowcount
+        if n != 1:
+            con.execute("UPDATE qa_conversations SET last_user_at=? WHERE conversation_id=?", (now, conversation_id))
+            active = con.execute("SELECT active_question_id FROM qa_conversations WHERE conversation_id=?",
+                                 (conversation_id,)).fetchone()[0]
+            return ok(C.QaAskOut(status="busy", conversation_id=conversation_id, active_question_id=active))
+        turn = r["next_seq"]                          # 같은 트랜잭션(BEGIN IMMEDIATE) 안이라 위 갱신 전 값 = 이 질문의 차례
+        job_id = _insert_job(con, "qa", {"question_id": question_id}, user_id)
+        con.execute("INSERT INTO qa_questions(question_id, user_id, course_id, question, job_id, state, created, updated_at, "
+                    "conversation_id, turn_seq, user_message_id, assistant_message_id) "
+                    "VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?)",
+                    (question_id, user_id, course_id, question, job_id, now, now, conversation_id, turn,
+                     f"m-{uuid.uuid4().hex[:12]}", f"m-{uuid.uuid4().hex[:12]}"))
+    return ok(C.QaAskOut(question_id=question_id, job_id=job_id, conversation_id=conversation_id, turn_seq=turn))
+
+
+def _qa_retry_blocked(con, question_id: str | None) -> str | None:
+    """대화 속 질문의 '다시 시도': 대화가 열려 있고, 그 뒤 새 질문이 없고, 진행 중 슬롯을 다시 잡을 수 있을 때만."""
+    q = con.execute("SELECT * FROM qa_questions WHERE question_id=?", (question_id,)).fetchone() if question_id else None
+    if not q or not q["conversation_id"]:
+        return None
+    r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (q["conversation_id"],)).fetchone()
+    if r["state"] != "open" or _timed_out(r):
+        return "대화가 끝나 다시 시도할 수 없음 → 새 대화에서 다시 질문"
+    if q["turn_seq"] != r["next_seq"] - 1:
+        return "그 뒤에 새 질문이 있어 다시 시도할 수 없음 → 다시 질문"
+    if r["active_question_id"] and r["active_question_id"] != question_id:
+        _release_if_finished(con, r)
+    n = con.execute("UPDATE qa_conversations SET active_question_id=? WHERE conversation_id=? AND state='open' "
+                    "AND epoch=? AND (active_question_id IS NULL OR active_question_id=?)",
+                    (question_id, r["conversation_id"], r["epoch"], question_id)).rowcount
+    return None if n == 1 else "이 대화에 진행 중인 질문이 있음"
+
+
+@tool
+def qa_ask(user_id: str, course_id: str, question: str, conversation_id: str | None = None) -> dict:
+    """[api] 질문 행과 qa 작업 의도를 한 트랜잭션에. 마감은 job_create와 같은 규칙(요청 + 90초).
+    conversation_id가 없으면 이전과 같은 단일 질문 (문맥 없음, Redis를 건드리지 않음)."""
+    if conversation_id is not None:
+        return _qa_ask_in_conversation(user_id, course_id, question, conversation_id)
     question_id = f"q-{uuid.uuid4().hex[:8]}"
     now = time.time()
     with tx() as con:
@@ -849,7 +1102,7 @@ def qa_ask(user_id: str, course_id: str, question: str) -> dict:
 
 @tool
 def qa_context(question_id: str, permit: str | None = None) -> dict:
-    """[worker] 질문·과목·강의 목록·세대."""
+    """[worker] 질문·과목·강의 목록·세대 + 대화의 이전 문답. 이 작업의 답이 이미 저장됐으면 answered (이때도 이력 반영을 재확인)."""
     with db() as con:
         q, _ = _qa_question(con, question_id, permit)
         _log(con, "qa_context", q["job_id"])
@@ -857,9 +1110,11 @@ def qa_context(question_id: str, permit: str | None = None) -> dict:
         lectures = [r["lecture_id"] for r in con.execute(
             "SELECT DISTINCT lecture_id FROM qa_docs WHERE course_id=? AND lecture_id IS NOT NULL ORDER BY lecture_id",
             (q["course_id"],))]
-        return ok(C.QaContextOut(question=q["question"], course_id=q["course_id"], course_name=c["name"] if c else "",
-                                 lecture_ids=lectures, generation=q["generation"],
-                                 answered=q["state"] == "answered" and q["idem_key"] == q["job_id"]))
+        answered = q["state"] == "answered" and q["idem_key"] == q["job_id"]
+    turns, memory_state = _context_turns(q) if q["conversation_id"] else ([], "none")
+    return ok(C.QaContextOut(question=q["question"], course_id=q["course_id"], course_name=c["name"] if c else "",
+                             lecture_ids=lectures, generation=q["generation"], conversation_id=q["conversation_id"],
+                             recent_turns=turns, memory_state=memory_state, answered=answered))
 
 
 @tool
@@ -898,10 +1153,16 @@ def web_search(question_id: str, query: str, limit: int = 3, permit: str | None 
 @tool
 def qa_complete(idem_key: str, question_id: str, expected_generation: int, status: str, label: str, answer: str,
                 sentences: list[dict], sources: list[dict], notice_code: str | None = None,
-                permit: str | None = None) -> dict:
-    """[worker] 답변 저장. 같은 idem_key는 처음 결과 그대로 duplicate=true. 실행권과 질문 세대를 확인한다."""
+                clarification: dict | None = None, permit: str | None = None) -> dict:
+    """[worker] 답변 저장. 같은 idem_key는 처음 결과 그대로 duplicate=true. 실행권과 질문 세대를 확인한다.
+    대화 속 질문이면 같은 트랜잭션에서 진행 중 슬롯을 비우고, 커밋 뒤 이력에 반영한다 (실패해도 저장은 성공 → memory=failed)."""
     C.QaCompleteIn(idem_key=idem_key, question_id=question_id, expected_generation=expected_generation, status=status,
-                   label=label, answer=answer, sentences=sentences, sources=sources, notice_code=notice_code)  # 값 검사
+                   label=label, answer=answer, sentences=sentences, sources=sources, notice_code=notice_code,
+                   clarification=clarification)  # 값 검사
+    if (status == "확인 필요") != (clarification is not None) or (status == "확인 필요") != (label == "확인 질문"):
+        raise ValueError("확인 필요 ↔ label 확인 질문 ↔ clarification은 함께")
+    if clarification is not None and sources:
+        raise ValueError("확인 질문에는 출처가 없다")
     citations = list(dict.fromkeys(c for s in sentences for c in s["citations"]))   # 화면용 전체 인용 (순서, 중복 없음)
     missing = [c for c in citations if c not in {s["id"] for s in sources}]
     if missing:
@@ -913,20 +1174,30 @@ def qa_complete(idem_key: str, question_id: str, expected_generation: int, statu
         claims = _claims(permit, q["job_id"])
         if claims is not None and claims.get("u") != q["user_id"]:
             raise Reject(ErrorCode.NOT_FOUND, f"질문 없음: {question_id}")
-        if q["idem_key"] == idem_key:                              # 이미 저장됨 (응답을 못 받은 재시도 등)
-            return ok(C.QaCompleteOut(answer_id=q["answer_id"]), duplicate=True)
-        if q["state"] == "answered":                               # 다른 키로 이미 답함 → 덮어쓰지 않는다
-            raise Reject(ErrorCode.GENERATION_MISMATCH, "이미 다른 실행이 답을 저장함")
-        _require_live(con, claims, q["job_id"])
-        if q["generation"] != expected_generation:                 # 삭제(state=deleted)도 세대가 올라가 여기서 걸린다
-            raise Reject(ErrorCode.GENERATION_MISMATCH, f"질문이 바뀜 (세대 {q['generation']} ≠ {expected_generation})")
-        answer_id = f"a-{uuid.uuid4().hex[:8]}"
-        body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "citations": citations,
-                "sources": sources, "notice_code": notice_code}
-        con.execute("UPDATE qa_questions SET state='answered', answer=?, answer_id=?, idem_key=?, updated_at=? "
-                    "WHERE question_id=?", (json.dumps(body, ensure_ascii=False), answer_id, idem_key, time.time(), question_id))
-        _log(con, "qa_complete", q["job_id"])
-        return ok(C.QaCompleteOut(answer_id=answer_id))
+        duplicate = q["idem_key"] == idem_key                      # 이미 저장됨 (응답을 못 받은 재시도 등)
+        if duplicate:
+            answer_id = q["answer_id"]
+        else:
+            if q["state"] == "answered":                           # 다른 키로 이미 답함 → 덮어쓰지 않는다
+                raise Reject(ErrorCode.GENERATION_MISMATCH, "이미 다른 실행이 답을 저장함")
+            _require_live(con, claims, q["job_id"])
+            if q["generation"] != expected_generation:             # 삭제(state=deleted)도 세대가 올라가 여기서 걸린다
+                raise Reject(ErrorCode.GENERATION_MISMATCH, f"질문이 바뀜 (세대 {q['generation']} ≠ {expected_generation})")
+            answer_id = f"a-{uuid.uuid4().hex[:8]}"
+            body = {"status": status, "label": label, "answer": answer, "sentences": sentences, "citations": citations,
+                    "sources": sources, "notice_code": notice_code}
+            if clarification is not None:
+                body["clarification"] = clarification
+            con.execute("UPDATE qa_questions SET state='answered', answer=?, answer_id=?, idem_key=?, updated_at=? "
+                        "WHERE question_id=?",
+                        (json.dumps(body, ensure_ascii=False), answer_id, idem_key, time.time(), question_id))
+            if q["conversation_id"]:
+                con.execute("UPDATE qa_conversations SET active_question_id=NULL "
+                            "WHERE conversation_id=? AND active_question_id=?", (q["conversation_id"], question_id))
+            _log(con, "qa_complete", q["job_id"])
+    # DB 커밋 뒤: 이력 반영. 같은 차례는 mark로 한 번만 들어가므로 duplicate(재시도)에서도 그대로 다시 확인한다
+    memory = _sync_memory(q["conversation_id"])[0] if q["conversation_id"] else "none"
+    return ok(C.QaCompleteOut(answer_id=answer_id, memory=memory), duplicate=duplicate)
 
 
 @tool
@@ -945,12 +1216,21 @@ def qa_get(question_id: str, user_id: str) -> dict:
 @tool
 def qa_delete(question_id: str, user_id: str) -> dict:
     """[api] 질문 삭제. 질문 원문·답변·출처 복사본을 지우고(보관 안 함), 세대를 올려 진행 중인 답변 저장을 막는다.
-    행은 남긴다: 진행 중 작업의 저장이 generation_mismatch로 거절되고, 조회는 'deleted'로 답하게."""
+    행은 남긴다: 진행 중 작업의 저장이 generation_mismatch로 거절되고, 조회는 'deleted'로 답하게.
+    대화 속 질문이면 단기 문맥에서도 뺀다. Redis 장애로 못 빼도 qa_context가 지운 질문의 메시지는 걸러 낸다."""
     with tx() as con:
         cur = con.execute("UPDATE qa_questions SET state='deleted', generation=generation+1, question=NULL, answer=NULL, "
                           "updated_at=? WHERE question_id=? AND user_id=? AND state!='deleted'",
                           (time.time(), question_id, user_id))
-        return ok(C.QaDeleteOut(deleted=cur.rowcount == 1))
+        deleted = cur.rowcount == 1
+        conv = con.execute("SELECT c.* FROM qa_questions q JOIN qa_conversations c ON c.conversation_id=q.conversation_id "
+                           "WHERE q.question_id=?", (question_id,)).fetchone() if deleted else None
+    if conv is not None and conv["state"] == "open":
+        try:
+            CONV.remove_question(conv["conversation_id"], conv["epoch"], conv["user_id"], conv["course_id"], question_id)
+        except CONV.MemoryUnavailable:
+            pass
+    return ok(C.QaDeleteOut(deleted=deleted))
 
 
 @tool

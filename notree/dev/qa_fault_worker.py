@@ -33,13 +33,13 @@ class LoseResponse:
 
 
 class LoggingLLM(FakeQALLM):
-    async def understand(self, question, course):
-        log("llm", f"LLM 호출: understand ({question})")
-        return await super().understand(question, course)
+    async def understand(self, question, course, **kw):          # kw: 대화 속 질문이면 history·memory_state
+        log("llm", f"LLM 호출: understand (질문 {len(question)}자, 이력 {len(kw.get('history') or [])}개)")
+        return await super().understand(question, course, **kw)
 
-    async def answer(self, question, evidence, attempt, problem="", related=True):
+    async def answer(self, question, evidence, attempt, problem="", related=True, **kw):
         log("llm", f"LLM 호출: answer#{attempt}")
-        return await super().answer(question, evidence, attempt, problem, related)
+        return await super().answer(question, evidence, attempt, problem, related, **kw)
 
 
 async def main() -> None:

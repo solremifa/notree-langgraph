@@ -12,7 +12,8 @@ notree/
 │   ├─ envelope.py        공통 응답 형식 {ok, data} / {ok:false, code, message, retryable}, 오류 코드
 │   └─ tools.py           도구별 입력·출력 Pydantic 모델, 담당, 모델 노출 여부 (→ docs/tool-contracts.md 자동 생성)
 ├─ mcp_server/            내부 MCP 서버 (DB를 소유하는 유일한 프로세스). python -m notree.mcp_server --http
-│   └─ server.py
+│   ├─ server.py
+│   └─ conversation.py    Q&A 대화 단기 메모리 (Redis). 대화 이력 읽기·쓰기 규칙은 여기만. worker는 이 키를 모름
 ├─ graphs/
 │   └─ course_update/     과목 노트 그래프 (graph.py 노드·분기, state.py 상태, llm.py 가짜/OpenAI LLM)
 ├─ scheduler/
@@ -132,5 +133,6 @@ worker 창에서 Ctrl+C 한 번이면 진행 중인 작업을 끝내고 종료, 
 | `allocator`가 MCP 도구로 의도를 읽음 | scheduler가 PG에 직접 (SKIP LOCKED, 동시 상한·예산) |
 | `note_publish`가 permit의 사용자 ID로 저장 (RLS 흉내) | MCP 서버가 permit의 사용자 ID로 `SET LOCAL app.user_id` → 진짜 RLS |
 | `contracts/tools.py`의 계획된 도구 12개 = 초안 | 담당자 PR로 필드 확정 후 서버 구현 |
+| `mcp_server/conversation.py`가 Redis에 대화 단기 메모리 (WATCH 조건부 갱신) | 같은 규칙을 업무 서비스의 Redis 모듈로. 대화 행·진행 중 슬롯은 PG 조건부 UPDATE (`… WHERE active_question_id IS NULL RETURNING next_seq`) |
 
 `worker/` 아래(`loop.py`, `lease.py`, `registry.py`, `mcp_client.py`, `checkpointer.py`)는 거의 그대로 옮길 수 있게 만들었습니다.

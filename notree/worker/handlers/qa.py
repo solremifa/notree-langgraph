@@ -3,9 +3,10 @@
     payload = {"question_id": ..., "deadline_at": 요청 + 90초}     (api의 qa_ask가 만든다)
 
 한 번의 실행
-  1. qa_context   → 질문·과목 이름·세대. 이 작업의 답이 이미 저장돼 있으면(answered) 여기서 완료
-  2. 그래프 실행   → 검색은 McpRetriever가 qa_search(노트·전사)·web_search(웹)로. 시간 예산은 deadline_at 기준
-  3. qa_complete  → 결과 저장 (idem_key = job_id, expected_generation = 1의 세대)
+  1. qa_context   → 질문·과목 이름·세대 + 대화의 이전 문답(recent_turns, memory_state). 이 작업의 답이 이미 저장돼 있으면(answered) 여기서 완료
+  2. 그래프 실행   → understand부터 이전 문답 사용. 검색은 McpRetriever가 qa_search(노트·전사)·web_search(웹)로. 시간 예산은 deadline_at 기준
+  3. qa_complete  → 결과 저장 (idem_key = job_id, expected_generation = 1의 세대). 대화 이력 반영은 서버가 저장 뒤에 한다
+                    (worker는 대화 Redis 키를 모른다. 반영 실패(memory=failed)도 저장은 성공이라 작업은 done)
 
 오류 변환
   검색 도구 retryable 거절·연결 문제 → SearchUnavailable (그래프가 1번 다시 / 다음 출처로)
@@ -74,18 +75,23 @@ async def qa(ctx: JobContext) -> None:
     llm = ctx.extras.get("qa_llm") or get_qa_llm(os.getenv("NOTREE_QA_LLM", "fake"))
     retriever = McpRetriever(ctx, qid)
     cfg = {"configurable": {"llm": llm, "retriever": retriever, "deadline_at": ctx.deadline_at}}
+    # 대화 속 질문이면 이전 문답(맥락)을 함께. 현재 질문은 question으로만 (서버가 이력에서 이미 뺐다)
+    inp = {"question": c["question"], "course": c["course_name"],
+           "history": c.get("recent_turns") or [], "memory_state": c.get("memory_state", "none")}
     try:
-        final = await _get_graph().ainvoke({"question": c["question"], "course": c["course_name"]}, cfg)
+        final = await _get_graph().ainvoke(inp, cfg)
     except QAFatal as e:
         raise FatalError(str(e)) from e
+    extra = {"clarification": final["clarification"]} if final.get("clarification") else {}
     try:
         res = await ctx.tool("qa_complete", idem_key=ctx.job_id, question_id=qid, expected_generation=c["generation"],
                              status=final["status"], label=final["label"], answer=final["answer"],
                              sentences=final.get("sentences") or [], sources=final.get("sources") or [],
-                             notice_code=final.get("notice_code"))
+                             notice_code=final.get("notice_code"), **extra)
     except ToolUnavailable as e:
         raise RetryableError(f"답변 저장 실패: {e}") from e
     except ToolRejected as e:
         raise FatalError(f"답변 저장 거절({e.code}): {e}") from e
+    # 원문(질문·답·이력)은 찍지 않는다. 이력은 개수와 상태만
     log("qa", f"{qid}: {final['status']} [{final['label']}] 검색={retriever.calls} 인용={final.get('citations', [])} "
-              f"→ {res['answer_id']}")
+              f"이력={len(inp['history'])}개({inp['memory_state']}) 반영={res.get('memory', 'none')} → {res['answer_id']}")
