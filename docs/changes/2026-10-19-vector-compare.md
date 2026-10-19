@@ -65,3 +65,8 @@ uv run python -m notree.dev.vec_compare --emb data/vec/oai-3-small --fresh-keywo
 
 강의 문장을 임베딩 API로 보내는 것은 외부 처리다. LLM 호출과 같은 동의 범위인지 팀에서 확인한 뒤 실행한다.
 임베딩은 강의 원문에서 나온 데이터라 `data/` 밖에 두지 않는다 (스크립트가 막음).
+
+## 측정 결과 (2026-10-19, 사용자 PC)
+
+실제 임베딩·LLM 실행 결과와 해석은 [docs/measurements/2026-10-19-vector-compare](../measurements/2026-10-19-vector-compare/README.md)에 있다.
+위 "이 환경에서 확인한 것"의 새 30 수치는 단어 추출 검색어 · 가짜 벡터로 경로만 점검한 값이라 결과로 쓰지 않는다.
