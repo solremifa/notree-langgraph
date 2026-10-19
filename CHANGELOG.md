@@ -11,7 +11,7 @@
 
 ## 2026-10-20
 
-### Q&A 대화 세션별 단기 메모리 (`feat/qa-conversation-memory`, main 미머지) · (이번 커밋)
+### Q&A 대화 세션별 단기 메모리 (`feat/qa-conversation-memory`, main 미머지) · `1a1d717`
 자세히: [docs/changes/2026-10-20-qa-conversation-memory.md](docs/changes/2026-10-20-qa-conversation-memory.md) · 기준 `a8995e4`
 
 - 🐛 후속 질문("그럼 그걸 삭제하면?")이 이전 문답 없이 처리되던 문제: `recent_turns`가 항상 비어 있었고 그래프가 `(질문, 과목)`만 받음 (재현 시험으로 확인)
