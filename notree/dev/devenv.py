@@ -37,9 +37,13 @@ def mcp_server(db: Path, require_permit: bool = True):
 
 
 def redis_client(url: str | None):
-    """(redis 클라이언트, worker block_ms). url이 없으면 fakeredis (BLOCK이 이벤트 루프를 멈추므로 폴링)."""
+    """(redis 클라이언트, worker block_ms). url이 없으면 fakeredis (BLOCK이 이벤트 루프를 멈추므로 폴링).
+    fakeredis는 Lua를 못 돌려 Redis 소유 키 모드(기본)로는 쓸 수 없다 → 실제 Redis를 주거나 NOTREE_LIVENESS=db를 명시."""
     if url:
         import redis.asyncio as aioredis
         return aioredis.from_url(url, decode_responses=True), 1000
+    from notree.common import settings as S
+    if S.LIVENESS == "redis":
+        raise SystemExit("Redis 없이(fakeredis) 돌리려면 NOTREE_LIVENESS=db를 명시하세요 (기본 redis 모드는 실제 Redis 필요: --redis URL)")
     import fakeredis
     return fakeredis.FakeAsyncRedis(decode_responses=True), 0

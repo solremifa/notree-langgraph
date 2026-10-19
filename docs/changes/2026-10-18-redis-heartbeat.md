@@ -1,5 +1,8 @@
 # 2026-10-18 변경 정리: heartbeat를 Redis 소유 키로 (`feat/redis-heartbeat`, 시험 구현)
 
+> **2026-10-19 갱신**: 아래 "DB 시작 → 세대를 담아 키 쓰기" 절차는 중복 시작이 둘 다 시도를 쓰는 문제가 있어
+> "Redis 선점 → DB 조건부 승인"으로 바뀌었고, 기본값이 `redis`가 됐다 → [2026-10-19-start-protocol.md](2026-10-19-start-protocol.md)
+
 설계 v0.2 검토의 ①(생존 신호 하나·소유권 검사가 들어간 원자적 heartbeat)을 구현하고 실제 Redis로 시험했습니다.
 **기본값은 그대로 `db`**입니다. `NOTREE_LIVENESS=redis`일 때만 새 경로를 씁니다 (팀 결정 전).
 시험 기록: [measurements/2026-10-18-redis-heartbeat](../measurements/2026-10-18-redis-heartbeat/README.md)

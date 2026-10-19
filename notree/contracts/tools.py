@@ -67,14 +67,20 @@ class JobStartIn(BaseModel):
     lease_sec: float = Field(description="DB lease 길이. 0이면 DB lease로 실행 중을 판단하지 않음 "
                                          "(NOTREE_LIVENESS=redis: 실행 중 판단은 Redis 소유 키, 실행권은 exec_epoch)")
     dispatch_gen: int | None = Field(None, description="메시지의 전달 세대. 지금 세대보다 작으면(Redis 유실 전 메시지) stale_dispatch로 거절")
+    start_id: str | None = Field(None, description="이 시작 요청의 식별자. 같은 값으로 승인된 실행이 지금도 현재면 그 승인을 그대로 "
+                                                   "돌려줌(replay) — 응답을 잃고 다시 보내도 세대·시도를 다시 올리지 않음")
+    expect_epoch: int | None = Field(None, description="현재 exec_epoch가 이 값일 때만 승인. 다르면 superseded + 현재 exec_epoch "
+                                                       "(Redis 소유 키 모드: 처음 0, 그다음은 소유 키를 가진 채로 들은 값)")
 
 
 class JobStartOut(BaseModel):
-    status: Literal["started", "done", "failed", "leased", "unknown", "stale_dispatch"]
-    exec_epoch: int | None = Field(None, description="started일 때 이번 실행 세대 (영속·단조). Redis 소유 키 모드는 이 값을 키에 담는다")
+    status: Literal["started", "done", "failed", "leased", "unknown", "stale_dispatch", "superseded"]
+    exec_epoch: int | None = Field(None, description="started: 이번 실행 세대 (영속·단조, 승인할 때만 오름). "
+                                                     "superseded: 지금 DB의 실행 세대 (expect_epoch와 달랐음)")
     kind: str | None = None
     payload: dict[str, Any] | None = None
-    attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 시도인지")
+    attempt: int | None = Field(None, description="1부터. 이번이 몇 번째 업무 시도인지 (승인할 때만 셈)")
+    replay: bool = Field(False, description="같은 start_id로 이미 승인된 것을 다시 돌려줌 (세대·시도 그대로)")
     previous_owner: str | None = None
     permit: str | None = Field(None, description="이후 모든 도구 호출에 첨부")
     owner: str | None = Field(None, description="status=leased일 때 현재 소유자")
@@ -160,7 +166,7 @@ class JobRow(BaseModel):
     lease_owner: str | None = None
     lease_until: float | None = None
     attempts: int | None = None
-    exec_epoch: int | None = Field(None, description="실행 세대. job_start마다 1씩 오르고 되돌아가지 않음 (늦은 쓰기 차단)")
+    exec_epoch: int | None = Field(None, description="실행 세대. job_start가 승인할 때만 1씩 오르고 되돌아가지 않음 (늦은 쓰기 차단)")
     fail_reason: str | None = None
     user_retryable: bool | None = None
     created: float | None = None
@@ -611,8 +617,9 @@ TOOLS: dict[str, ToolSpec] = {s.name: s for s in [
              summary="Redis 통째 유실 뒤: 마지막 전달이 이전 세대인 reserved·sent·lease 끝난 running을 새 세대로 다시 보낼 목록 "
                      "(살아 있는 lease는 보류, 쪽 나누기). 마감·시도 한도는 실패 확정(결과가 저장돼 있으면 완료). 대상이 없으면 복구 종료"),
     ToolSpec("job_start", JobStartIn, JobStartOut, W, "control", LEAD,
-             summary="실행 시작 + lease + permit(실행 세대 포함) 발급. 살아 있는 lease면 같은 worker라도 leased. "
-                     "lease_sec=0이면 DB lease 없이 실행 세대만 올림 (Redis 소유 키 모드: 받은 세대를 소유 키에 담음)"),
+             summary="실행 승인 + permit(실행 세대 포함) 발급. 세대·시도는 승인할 때만 오름. start_id가 같으면 같은 승인(replay), "
+                     "expect_epoch가 현재 세대와 다르면 superseded(아무것도 안 바꿈). lease_sec>0이면 DB lease(살아 있으면 같은 "
+                     "worker라도 leased), 0이면 DB lease 없음 (Redis 소유 키 모드: 소유 키를 먼저 선점한 worker만 부름)"),
     ToolSpec("job_heartbeat", JobHeartbeatIn, JobHeartbeatOut, W, "control", LEAD,
              summary="lease 연장. 실행권(소유자·실행 세대)이 없으면 renewed=false. Redis 소유 키 모드에서는 부르지 않음"),
     ToolSpec("job_finish", JobWorkerIn, JobFinishOut, W, "control", LEAD,

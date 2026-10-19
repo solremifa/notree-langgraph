@@ -4,12 +4,16 @@
 
 한 메시지의 처리 (process)
   이미 이 worker가 실행 중인 job → 손대지 않음 (보조 방어)
-  [LIVENESS=redis] 소유 키가 살아 있음 → 손대지 않음 (다른 실행이 살아 있음. ACK도 안 함 — 지금의 보수적 규칙)
-                   없으면 job_start(lease_sec=0)로 DB가 실행 세대를 발급 → 그 세대를 담아 소유 키를 씀 (더 큰 세대만 덮어씀)
-                   → 못 쓰면 낡은 실행이라 시작 안 함. heartbeat는 Redis Lua 한 번 (ownership.py)
-                   끝나면(죽은 경우 제외) 소유 키를 토큰 비교로 해제
+  [LIVENESS=redis, 기본] 소유 키 선점(SET NX) 실패 → 다른 실행이 있거나 시작 중 → DB도 부르지 않고 손대지 않음 (ACK 안 함)
+                   성공 → job_start(start_id=토큰, expect_epoch=E, lease_sec=0): DB가 exec_epoch == E일 때만 승인
+                   (세대·업무 시도는 승인할 때만 오름). superseded면 키가 아직 내 것인지 확인한 뒤 들은 세대로 한 번 더.
+                   시작을 기다리는 동안에도 heartbeat가 키를 연장한다. 실행 중 heartbeat는 Redis Lua 한 번 (ownership.py)
+                   끝나면(죽은 경우 제외) 소유 키를 값 비교로 해제. 절차: docs/changes/2026-10-19-start-protocol.md
+  [LIVENESS=db]    job_start(lease_sec)의 DB lease로 중복 실행을 막고 job_heartbeat로 연장 (비교·호환 모드)
+  job_start는 응답을 못 받으면 같은 start_id로 다시 보낸다 → 이미 승인됐으면 같은 승인 (replay, 시도를 다시 세지 않음)
   job_start ─┬─ done / failed / unknown → XACK (이미 끝난 작업)   ※ 결과는 data.status
-             ├─ leased                  → 손대지 않음 (살아 있는 lease. 같은 worker라도)
+             ├─ stale_dispatch          → XACK (Redis 유실 전 메시지. 복구가 새 세대로 보냄)
+             ├─ leased                  → 손대지 않음 (DB 모드: 살아 있는 lease. 같은 worker라도)
              └─ started → Lease 안에서 핸들러 실행 (job_timeout과 마감 시각 중 짧은 쪽으로 제한)
                       │   heartbeat마다 Redis 방치 시간도 초기화 → 실행 중인 메시지는 재배송되지 않음
                       ├─ 성공            → job_finish가 finished=true로 **확정되면** XACK
@@ -31,6 +35,7 @@
   빌린 작업의 lease·재배송·시도 한도·ACK는 원래 레인(borrow)의 설정을 따른다.
 """
 import asyncio
+import uuid
 
 from redis.exceptions import ResponseError
 
@@ -43,7 +48,8 @@ from notree.worker.ownership import Ownership, RedisLease
 from notree.worker.registry import FatalError, JobContext, SimulatedDeath, load_handlers
 
 
-CONFIRM_BACKOFF = (0.2, 0.5, 1.0)   # 완료·실패 표시 재시도 간격 (마지막 값은 쓰이지 않음)
+CONFIRM_BACKOFF = (0.2, 0.5, 1.0)   # 시작·완료·실패 표시 재시도 간격 (마지막 값은 쓰이지 않음)
+START_ROUNDS = 3                   # superseded를 듣고 다시 승인을 청하는 최대 횟수 (그때마다 키 확인)
 BORROW_POLL_MS = 200               # 빌려 쓸 수 있을 때 자기 Stream을 기다리는 최대 시간 (그 뒤 빌릴 것을 다시 본다)
 
 
@@ -238,9 +244,9 @@ class Worker:
         if S.LIVENESS != "redis":
             return await self._process(msg_id, job_id, how, cfg, None)
         own = Ownership(self.r, job_id, self.name, cfg, msg_id)
-        if await own.held():                      # 살아 있는 실행이 있음 → DB 시작도 하지 않는다 (세대를 올리지 않게)
+        if not await own.claim():                 # 다른 실행이 있거나 시작 중 → DB도 부르지 않는다 (세대·시도를 쓰지 않게)
             self._pop_gen(cfg, msg_id)
-            log("skip", f"{job_id}: 소유 키를 {(own.holder or '?').split('|')[0]}가 가짐 → 손대지 않음")
+            log("skip", f"{job_id}: 소유 키를 {(own.holder or '?').split(':')[0]}가 가짐 → 손대지 않음")
             return
         try:
             await self._process(msg_id, job_id, how, cfg, own)
@@ -258,17 +264,12 @@ class Worker:
             log("skip", f"{job_id}: 전달 세대가 없는 메시지 → 시작 안 함, ACK (재전송이 세대를 붙여 다시 보냄. "
                         f"전환 기간이면 NOTREE_ALLOW_LEGACY_MESSAGES=1)")
             return
-        st = await self.mcp.tool("job_start", job_id=job_id, worker=self.name,
-                                 lease_sec=0 if own else cfg.lease_sec,
-                                 **({"dispatch_gen": gen} if gen is not None else {}))
+        st = await self._start(job_id, gen, cfg, own)
+        if st is None:                           # 승인을 못 받음 (응답 없음·소유 키 잃음) → ACK 안 함, 재배송으로 다시
+            return
         if st["status"] == "stale_dispatch":     # Redis 유실 전에 보낸 메시지 → 복구가 새 세대로 다시 보냈거나 보낼 것
             await self._ack(msg_id, cfg)
             log("skip", f"{job_id}: 이전 전달 세대({gen})의 메시지 → 시작 안 함, ACK (복구가 새로 보냄)")
-            return
-        if own and st["status"] == "started" and not await own.acquire(st["exec_epoch"]):
-            # 더 큰(또는 같은) 세대가 이미 키를 가짐 → 나는 낡은 실행. 아무것도 하지 않는다 (내 쓰기는 DB가 어차피 거절)
-            log("skip", f"{job_id}: 세대 {st['exec_epoch']}로 소유 키를 못 얻음 "
-                        f"({(own.holder or '?').split('|')[0]}가 더 큰 세대) → 시작 안 함")
             return
         if st["status"] in ("done", "failed", "unknown"):
             await self._ack(msg_id, cfg)
@@ -285,7 +286,8 @@ class Worker:
                          deadline_at=st["payload"].get("deadline_at"), extras=self.extras)
         fn = self.handlers.get(kind)
         left = ctx.time_left()
-        log("job", f"{how} {job_id} [{kind}] 시도 {ctx.attempt}/{ctx.max_attempts}"
+        log("job", f"{how} {job_id} [{kind}] 시도 {ctx.attempt}/{ctx.max_attempts} · 세대 {st.get('exec_epoch')}"
+                   + (" · 같은 승인 다시 받음" if st.get("replay") else "")
                    + (f" · 마감까지 {left:.0f}초" if left is not None else ""))
         if ctx.attempt > ctx.max_attempts:
             # 한도를 이미 다 쓴 작업의 재배송: 이전 시도가 실패·완료 확정의 응답을 못 받았거나 마지막 시도 중 죽었다.
@@ -300,7 +302,7 @@ class Worker:
                 if left <= 0:
                     raise DeadlinePassed()
                 timeout = min(timeout, left)
-            lease = RedisLease(ctx, own) if own else Lease(ctx, touch=lambda: self._touch(msg_id, cfg))
+            lease = RedisLease(cfg, own) if own else Lease(ctx, touch=lambda: self._touch(msg_id, cfg))
             async with lease:
                 await asyncio.wait_for(fn(ctx), timeout=timeout)
         except LeaseLost:
@@ -329,6 +331,45 @@ class Worker:
                 log("retry", f"{job_id}: {reason} → lease 반납, {cfg.claim_idle_ms / 1000:g}초 뒤 재배송")
         else:
             await self._finish(ctx, msg_id)
+
+    async def _start(self, job_id: str, gen: int | None, cfg: StreamConfig, own: Ownership | None) -> dict | None:
+        """실행 승인을 받는다. 응답(data) 또는 None (끝내 응답을 못 받음·소유 키를 잃음 → ACK 안 함).
+        Redis 모드: 소유 키를 가진 동안만 청하고, 기다리는 동안 키를 연장한다. superseded를 들으면 키가 아직 내 것인지
+        확인한 뒤 그 세대를 조건으로 다시 청한다 — 키를 가진(살아 있는) 실행은 이 조건으로 지목될 수 없다."""
+        args = dict(job_id=job_id, worker=self.name, lease_sec=0 if own else cfg.lease_sec,
+                    start_id=own.token if own else f"{self.name}:{uuid.uuid4().hex}",
+                    **({"dispatch_gen": gen} if gen is not None else {}))
+        if own is None:
+            return await self._start_call(args)
+        try:
+            async with RedisLease(cfg, own):
+                expect = 0
+                for _ in range(START_ROUNDS):
+                    st = await self._start_call({**args, "expect_epoch": expect})
+                    if st is None or st["status"] != "superseded":
+                        return st
+                    if await own.heartbeat() != 1:          # 들은 뒤 키 확인: 선점 때부터 끊김 없이 내 것이어야 한다
+                        log("skip", f"{job_id}: 세대 {st['exec_epoch']}를 들었지만 소유 키를 잃음 → 시작 안 함")
+                        return None
+                    expect = st["exec_epoch"]
+                log("skip", f"{job_id}: 세대가 계속 바뀜({expect}) → 시작 안 함, 재배송 대기")
+                return None
+        except LeaseLost:
+            log("skip", f"{job_id}: 시작을 기다리는 동안 소유 키를 잃음 → 시작 안 함 (승인이 확정됐다면 그 시도는 소모됨)")
+            return None
+
+    async def _start_call(self, args: dict) -> dict | None:
+        """job_start 한 번을 응답까지 몇 번 시도한다 (같은 start_id → 이미 승인됐으면 같은 승인)."""
+        for i, wait in enumerate(CONFIRM_BACKOFF):
+            try:
+                return await self.mcp.tool("job_start", **args)
+            except Exception as e:
+                last = i == len(CONFIRM_BACKOFF) - 1
+                log("error", f"{args['job_id']}: job_start 실패({type(e).__name__}: {e})"
+                             + (" → 시작 안 함, ACK 안 함" if last else f" → {wait:g}초 뒤 같은 start_id로 다시"))
+                if not last:
+                    await asyncio.sleep(wait)
+        return None
 
     async def _finish(self, ctx: JobContext, msg_id: str) -> None:
         res = await self._confirm(ctx, "job_finish")

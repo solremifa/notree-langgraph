@@ -11,7 +11,23 @@
 
 ## 2026-10-19
 
-### 리뷰 8차: 과목 노트도 실패 확정 때 결과 확인 · (이번 커밋)
+### 실행 시작 절차 수정 + `NOTREE_LIVENESS` 기본값 `redis` · (이번 커밋)
+자세히: [docs/changes/2026-10-19-start-protocol.md](docs/changes/2026-10-19-start-protocol.md) · 측정: [docs/measurements/2026-10-19-start-protocol](docs/measurements/2026-10-19-start-protocol/README.md)
+- 🐛 Redis 모드에서 같은 작업의 중복 메시지가 둘 다 DB 시작을 해 시도 한도를 씀 → 총 1회인 실시간 요약이 요약 함수를 한 번도 부르지 않고 실패
+  (강제 순서 재현: failed·시도 2·요약 0 → 수정 후 done·시도 1·요약 1. 자연 발생: 수정 전 200회 중 67회 실패 → 0회)
+- 🔧 시작 절차: **Redis 소유 키 선점(SET NX) → DB 조건부 승인**. 선점에 진 요청은 DB를 부르지 않는다. 세대·업무 시도는 승인할 때만 오름
+- ⚠️ 계약: `job_start`에 선택 인자 `start_id`(같은 값이면 같은 승인 = replay)·`expect_epoch`(현재 세대와 다르면 `superseded`, 아무것도 안 바꿈),
+  응답 `status`에 `superseded`, `replay` 필드 추가. `jobs.start_id` 컬럼 추가. 기존 호출(인자 없이)은 그대로 동작
+- ⚠️ 기본값: `NOTREE_LIVENESS` 기본 `db` → **`redis`**. DB 모드는 `NOTREE_LIVENESS=db`로 명시할 때만 (비교·호환). 자동 전환 없음.
+  잘못된 값이면 시작 때 오류. 기본 모드는 실제 Redis가 필요 — fakeredis 데모는 `NOTREE_LIVENESS=db`를 명시해야 함
+- ⚠️ worker 내부: `Ownership.held()`·`acquire(epoch)` → `claim()` (세대 비교 Lua 삭제), `RedisLease(cfg, own)` (전에는 ctx)
+- 🔧 시작 응답을 못 받으면 같은 `start_id`로 다시 보냄 (DB 모드 포함), 시작을 기다리는 동안에도 Redis heartbeat가 키를 연장
+- 📏 정책: 승인 확정 뒤 죽거나 키를 잃은 실행은 시도 1회로 센다 (외부 호출이 정확히 한 번이라고 보장하지 않음)
+- 🆕 시험: `tests/test_start_protocol.py`(17개), 실제 Redis 시험을 `NOTREE_TEST_REDIS_URL`(시험 전용)로도 돌림, 프로세스 강제 종료·정지 시험이 Windows에서도 돔
+- 🆕 측정 도구: `notree/dev/start_race.py`(자연 발생 빈도), `notree/dev/liveness_bench.py`(정상·인계·Redis 재시작 비교)
+- 테스트 → 189개 (Redis 기본값·DB 모드 각각 전체 실행)
+
+### 리뷰 8차: 과목 노트도 실패 확정 때 결과 확인 · `969ba03`
 - 🐛 과목 노트 발행 후 완료 요청을 잃고 시도 한도를 넘기면 노트는 있는데 작업 failed (7차의 회귀) → `notes.idem_key = job_id` 확인 추가
 - 🆕 `RESULT_SAVED_SQL`·`RESULTLESS_KINDS`: 모든 작업 종류가 둘 중 한 곳에 있는지 시험으로 확인
 - 테스트 → 176개

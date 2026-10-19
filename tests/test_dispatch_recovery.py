@@ -6,7 +6,6 @@
 """
 import asyncio
 import dataclasses
-import shutil
 import socket
 import sqlite3
 import subprocess
@@ -22,11 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notree.common import settings as S  # noqa: E402
 from notree.worker.loop import Worker  # noqa: E402
 from notree.worker.mcp_client import McpClient  # noqa: E402
+from redis_support import needs_redis, needs_server, redis_url_fixture  # noqa: E402
 from test_skeleton import Env  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 RT = dataclasses.replace(S.RT, lease_sec=1.0, heartbeat_sec=0.3, claim_idle_ms=1000, job_timeout_sec=20)
-real_redis = pytest.mark.skipif(shutil.which("redis-server") is None, reason="redis-server 없음")
+real_redis = needs_redis
 
 
 def _free_port() -> int:
@@ -37,34 +37,14 @@ def _free_port() -> int:
 
 @pytest.fixture(scope="module")
 def redis_url():
-    if shutil.which("redis-server") is None:
-        pytest.skip("redis-server 없음")
-    port = _free_port()
-    p = subprocess.Popen(["redis-server", "--port", str(port), "--save", "", "--appendonly", "no"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(50):
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
-            break
-        except OSError:
-            time.sleep(0.1)
-    yield f"redis://127.0.0.1:{port}/0"
-    p.terminate()
-    p.wait(5)
+    yield from redis_url_fixture()
 
 
 class RealEnv(Env):
+    """실제 Redis (시험마다 FLUSHALL). 모드와 상관없이."""
+
     def __init__(self, tmp_path, url, **kw):
-        super().__init__(tmp_path, **kw)
-        self.r = aioredis.from_url(url, decode_responses=True)
-
-    async def __aenter__(self):
-        await self.r.flushall()
-        return await super().__aenter__()
-
-    async def __aexit__(self, *exc):
-        await super().__aexit__(*exc)
-        await self.r.aclose()
+        super().__init__(tmp_path, url=url, **kw)
 
 
 # ── 1. 배정기 여러 개 ────────────────────────────────────────────
@@ -357,7 +337,7 @@ def _redis_proc(port, d):
     return p
 
 
-@real_redis
+@needs_server
 def test_restore_from_an_old_snapshot_is_detected_as_loss(tmp_path):
     """표시 키가 든 스냅숏이 저장된 뒤 새 작업이 전달됨 → Redis가 그 스냅숏으로 복원 → 표시 키는 있지만 메시지는 없음.
     표시 키만 보면 유실을 못 알아챈다 → 재시작(run_id 변경)도 유실로 보고 다시 보내야 한다."""
@@ -390,7 +370,7 @@ def test_restore_from_an_old_snapshot_is_detected_as_loss(tmp_path):
         proc.terminate(); proc.wait(5)
 
 
-@real_redis
+@needs_server
 def test_restart_during_the_recovery_scan_is_not_marked_as_checked(tmp_path):
     """리뷰 7차 ①: 스캔 시작 때는 기존 Redis(유실 아님) → 스캔 도중 재시작(비어 있음) → 끝에서 새 run_id로 표시하면
     복구하지 않은 새 Redis를 '확인함'으로 표시해 다음 스캔도 0건. 표시 키에는 스캔 **시작 때** 본 run_id를 남겨야 한다."""
@@ -434,7 +414,7 @@ def test_restart_during_the_recovery_scan_is_not_marked_as_checked(tmp_path):
         proc.terminate(); proc.wait(5)
 
 
-@real_redis
+@needs_server
 def test_compose_redis_settings_come_back_empty_after_restart(tmp_path):
     """docker-compose.yml의 redis command 인자 그대로 띄우고, 데이터를 쓴 뒤 정상 종료(SHUTDOWN) → 재시작하면 비어 있어야 한다
     (스냅숏·AOF를 남기지 않음). 설정 파일을 읽어 쓰므로 설정이 바뀌면 이 시험도 따라간다."""

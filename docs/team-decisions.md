@@ -201,7 +201,7 @@
 
 | 항목 | 선택지 | 메모 |
 |---|---|---|
-| heartbeat·lease·진행 상태를 Redis로 | 옮김 / 유지 | 옮겨도 실행권 확인은 DB의 `exec_epoch`로 (`attempts`는 사용자 재시도 때 0으로 돌아가 쓸 수 없음). Redis 쪽 생존 신호는 하나로 (지금 쓰는 Stream 방치 시간 또는 TTL 키) |
+| heartbeat·lease를 Redis로 | **옮김 (2026-10-19 기본값 `redis`)** | 생존은 Redis 소유 키 TTL + Lua heartbeat, 실행권은 DB `exec_epoch`. 시작은 Redis 선점 → DB 조건부 승인 ([changes/2026-10-19-start-protocol.md](changes/2026-10-19-start-protocol.md)). `db`는 명시적 비교·호환 모드, 자동 전환 없음. 화면용 진행률·단계 상태는 옮기지 않음 |
 | DB에 기록한 작업의 전달 누락 복구 | outbox(영속 작업 의도) + 주기 복구 **유지** | heartbeat 위치와 별개. "DB 저장 성공 → API 종료·Redis 장애 → Redis 등록 실패" 구간은 커밋 직후 XADD로도 남는다 |
 | 정상 경로 전달을 즉시 깨우기 | 커밋 직후 XADD 또는 배정기 깨우기(NOTIFY 등) | 복구 장치는 그대로 두고 0.5초 주기 대기만 줄인다. 사용자·비용 한도를 배정기가 판단해 왔다면 그 판단을 어디로 옮길지 함께 정함 |
 | Q&A 검색 (`pg_trgm`) | DB 조회(Read)로 봄 | "DB는 CRUD만" = 업무 판단은 애플리케이션. 유사 문자열 후보 조회는 Read. 검색 모듈 분리와 검색 엔진 교체는 별개 결정 |

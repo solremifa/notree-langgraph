@@ -37,9 +37,10 @@ sequenceDiagram
     end
     W->>R: XREADGROUP (BLOCK)
     R-->>W: {job_id}  ※ 이 순간부터 '처리 중(PEL)'
-    W->>M: job_start → running + lease + permit 발급
+    W->>R: SET notree:own:{job_id} NX PX (소유 키 선점, 실패하면 손대지 않음)
+    W->>M: job_start(start_id, expect_epoch) → 조건부 승인: running + permit(실행 세대) 발급
     par 실행 중 내내
-        W->>M: job_heartbeat (lease 연장)
+        W->>R: heartbeat Lua (키 값·PEL 소유 확인 → 키 TTL·방치 시간 갱신)
     and
         W->>W: LangGraph ainvoke (thread_id = job_id)
         W->>M: checkpoint_put / checkpoint_put_writes (단계마다)
@@ -55,8 +56,8 @@ sequenceDiagram
 |---|---|---|
 | api 요청 | `pending` (의도) | 없음 |
 | 배정기 | `reserved` (실행 허가) → `sent` | `XADD`로 생성 |
-| worker가 받음 | `running` + `lease_owner`, `lease_until` | 그 worker의 처리 중 목록(PEL)에 들어감 |
-| 실행 중 | `lease_until`이 heartbeat마다 늘어남 | 그대로 |
+| worker가 받음 | 승인되면 `running` + `lease_owner`, `exec_epoch`+1, `attempts`+1 | 그 worker의 PEL + 소유 키 `notree:own:{job_id}` |
+| 실행 중 | 바뀌지 않음 (Redis 모드는 DB heartbeat 없음. DB 모드만 `lease_until`이 늘어남) | heartbeat마다 소유 키 TTL·방치 시간 갱신 |
 | 끝 | `done` 또는 `failed` | `XACK`로 PEL에서 빠짐 |
 | 일시적 실패 | `sent`로 되돌림 (lease 반납) | ACK 안 함 → 재배송 기준 뒤 다시 꺼내짐 |
 
@@ -71,14 +72,18 @@ while 종료 신호가 없으면:
   1) XAUTOCLAIM   : ACK 없이 재배송 기준 넘게 방치된 메시지가 있으면 내 것으로 가져옴 (= 죽은 worker의 작업)
   2) XREADGROUP   : 없으면 새 메시지 대기
   3) 이미 이 worker가 실행 중인 job이면 손대지 않음
-  4) job_start    : ├ done / failed  → 이미 끝난 작업. XACK만 하고 넘어감
-                    ├ leased         → lease가 살아 있음(같은 worker라도). 손대지 않음
-                    └ started        → lease + permit(실행 세대 포함) 획득
+  4) 소유 키 선점  : (기본 redis 모드) SET NX 실패 → 다른 실행이 있거나 시작 중. DB를 부르지 않고 손대지 않음
+     job_start    : start_id(=선점 토큰)·expect_epoch(처음 0)를 붙여 보냄. 응답을 못 받으면 같은 start_id로 다시 (같은 승인)
+                    ├ done / failed / stale_dispatch → XACK만 하고 넘어감
+                    ├ superseded     → 키가 아직 내 것인지 확인한 뒤, 들은 세대를 expect_epoch로 한 번 더
+                    ├ leased         → (DB 모드) lease가 살아 있음(같은 worker라도). 손대지 않음
+                    └ started        → permit(실행 세대 포함) 획득. 세대·업무 시도는 이때만 오름
   5) 핸들러        : (과목 노트) LangGraph 상태를 먼저 조회
                     ├ 체크포인트 없음                → 처음부터 ainvoke(입력)
                     ├ 체크포인트 있고 남은 노드 있음   → ainvoke(None) = 이어하기
                     └ 그래프는 이미 끝남              → 마무리만
-                    실행 중에는 heartbeat마다 job_heartbeat + Redis 방치 시간 초기화(XCLAIM JUSTID)
+                    실행 중에는 heartbeat마다 Redis Lua 한 번 (소유 키 TTL + 방치 시간 초기화, XCLAIM JUSTID)
+                    (DB 모드: job_heartbeat + 방치 시간 초기화)
   6) 결과별        : 성공 job_finish / 영구 실패·한도 초과·마감 초과 job_fail → **확정 응답을 받은 뒤에만** XACK
                     일시적 실패 job_release (ACK 안 함)
                     확정을 못 받으면(장애·실행권 없음) ACK 안 함 → 재배송으로 다시 처리
@@ -90,17 +95,20 @@ while 종료 신호가 없으면:
 
 | 상황 | 무슨 일이 일어나나 | 결과 |
 |---|---|---|
-| **extract 도중 죽음** | ACK·heartbeat가 멈춤 → lease 만료 → 메시지가 재배송 기준 넘게 방치됨 → 다른 worker가 `XAUTOCLAIM` → `job_start` 성공 → 체크포인트에서 이어감 | 이미 끝난 extract는 다시 안 부름 |
+| **같은 작업의 중복 메시지** | 늦게 온 쪽은 소유 키 선점에서 짐 → DB를 부르지 않음 (시도·세대를 쓰지 않음) | 한 번만 실행 |
+| **extract 도중 죽음** | ACK·heartbeat가 멈춤 → 소유 키 만료 → 메시지가 재배송 기준 넘게 방치됨 → 다른 worker가 `XAUTOCLAIM` → `job_start` 성공 → 체크포인트에서 이어감 | 이미 끝난 extract는 다시 안 부름 |
 | **merge 도중 `kill -9`** | 위와 같음. 마지막 체크포인트가 "extract 끝, merge 남음"이라 merge부터 | 실제 SIGKILL로 확인 |
 | **발행 직후 죽음** (DB엔 저장됐는데 ACK 전) | 넘겨받은 worker가 publish를 다시 실행 → 같은 멱등키라 `note_publish`가 `duplicate: true` | 노트는 한 번만 저장 |
-| **느리지만 살아 있음** | heartbeat마다 Redis 방치 시간을 초기화하므로 재배송 대상이 되지 않음. 그래도 넘어가면 `job_start`가 `leased`로 거절 | 원래 worker가 끝까지 처리 (같은 worker가 자기 메시지를 다시 가져가는 것도 막음) |
+| **느리지만 살아 있음** | heartbeat마다 소유 키와 Redis 방치 시간을 갱신하므로 재배송 대상이 되지 않음. 그래도 넘어가면 소유 키 선점에서 짐 | 원래 worker가 끝까지 처리 (같은 worker가 자기 메시지를 다시 가져가는 것도 막음) |
+| **승인 직후 죽음** | DB는 승인을 확정했지만 실행했는지 모름 → 이어받은 실행의 시도로 1을 더 셈 (정책) | 실시간 요약(총 1회)은 확정만 (결과가 있으면 완료, 없으면 실패·다시 시도 가능) |
 | **완료 기록 실패** | `job_finish`를 몇 번 다시 시도, 확정 못 받으면 ACK 안 함 → lease 만료 뒤 재배송 → 다시 실행(멱등) → 완료 | DB `running`인데 메시지만 사라지는 일이 없음 |
 | **lease를 잃은 실행자가 늦게 저장** | 쓰기 도구가 같은 트랜잭션에서 permit의 소유자·실행 세대를 DB와 대조 → `permit_invalid` | 넘겨받은 실행만 저장 가능 |
 | **일시적 오류** | lease 반납 후 재배송 → 시도 한도까지 재시도 | 한도 넘으면 실패 확정 (다시 시도 가능) |
 | **배정기가 허가 직후 죽음** | DB는 `reserved`인데 Redis 메시지 없음 → scheduler 주기 작업이 30초 뒤 다시 XADD | 실행됨 |
 
-"느리지만 살아 있음"이 lease와 heartbeat를 두는 이유입니다. Redis만으로는 "죽었다"와 "느리다"를 구분하지 못합니다.
-Redis가 아는 건 "ACK가 오래 안 왔다"뿐이라서, 살아 있는지는 DB의 lease로 판단합니다.
+"느리지만 살아 있음"이 heartbeat를 두는 이유입니다. Stream만으로는 "죽었다"와 "느리다"를 구분하지 못합니다 ("ACK가 오래 안 왔다"뿐).
+기본(redis) 모드는 살아 있는지를 소유 키 TTL로, 쓰기 권한을 DB의 실행 세대로 판단합니다. DB 모드는 둘 다 DB lease로.
+시작 절차와 정책: [changes/2026-10-19-start-protocol.md](changes/2026-10-19-start-protocol.md)
 
 ## 5. 역할 분담: LangGraph가 하는 것 / 우리가 짜는 것
 

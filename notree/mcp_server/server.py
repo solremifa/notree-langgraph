@@ -102,6 +102,7 @@ ADDED_COLUMNS = [
     ("jobs", "exec_epoch INTEGER DEFAULT 0"),   # 실행 세대: job_start마다 +1, 절대 되돌리지 않음 (job_retry도)
     ("jobs", "lecture_id TEXT"),                 # 실시간 요약 합치기용 (강의당 대기 1개)
     ("jobs", "dispatch_gen INTEGER"),            # 마지막으로 Redis에 보낸 전달 세대 (Redis 유실 복구 판정)
+    ("jobs", "start_id TEXT"),                   # 지금 실행 세대를 승인받은 시작 요청 (응답 유실 뒤 재요청을 같은 승인으로)
     ("notes", "user_id TEXT"),
 ]
 
@@ -446,12 +447,25 @@ def job_resend_stale(reserved_older_than_sec: float = 30, sent_older_than_sec: f
         return ok(C.JobListOut(jobs=[C.ReservedJob(**dict(r), gen=gen) for r in rows]))
 
 
+def _started(r, worker: str, attempt: int, epoch: int, previous_owner: str | None, replay: bool = False) -> dict:
+    return ok(C.JobStartOut(
+        status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=attempt, exec_epoch=epoch,
+        previous_owner=previous_owner, replay=replay,
+        permit=_issue_permit(r["job_id"], worker, attempt, epoch, r["user_id"] or "anonymous", r["stream"])))
+
+
 @tool
-def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | None = None) -> dict:
-    """[worker] 실행 시작. 결과는 data.status로: started(성공, permit 발급) / done / failed / leased / unknown.
-    lease가 살아 있으면 **같은 worker라도** leased로 거절한다 (자기 메시지를 다시 회수해 중복 실행하는 것 방지).
-    lease_sec=0 (LIVENESS=redis): DB lease로 실행 중을 판단하지 않는다. 실행 세대만 올려 이전 실행자의 permit을 무효로 만들고,
-    worker는 받은 세대(exec_epoch)를 Redis 소유 키에 담는다 — 키는 더 큰 세대만 덮어쓸 수 있다 (ownership.py)."""
+def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | None = None,
+              start_id: str | None = None, expect_epoch: int | None = None) -> dict:
+    """[worker] 실행 승인. 결과는 data.status로: started(승인, permit 발급) / done / failed / leased / unknown /
+    stale_dispatch / superseded. 실행 세대(exec_epoch)와 업무 시도(attempts)는 **승인할 때만** 오른다.
+      start_id     : 같은 값으로 이미 승인된 실행이 지금도 현재면 그 승인을 그대로 돌려준다 (replay — 응답 유실 뒤 재요청).
+                     세대·시도를 다시 올리지 않는다
+      expect_epoch : 현재 exec_epoch가 이 값일 때만 승인 (Redis 소유 키 모드). 다르면 superseded + 현재 세대, 아무것도 안 바꿈.
+                     worker는 소유 키를 가진 채로 들은 세대만 넣는다 → 키를 가진(살아 있는) 실행은 지목되지 않는다
+                     (docs/changes/2026-10-19-start-protocol.md)
+      lease_sec    : DB lease. 살아 있으면 **같은 worker라도** leased (DB 모드의 중복 실행 방지).
+                     0이면 DB lease로 실행 중을 판단하지 않는다 (Redis 소유 키 모드)"""
     now = time.time()
     with tx() as con:
         r = con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -462,16 +476,19 @@ def job_start(job_id: str, worker: str, lease_sec: float, dispatch_gen: int | No
             return ok(C.JobStartOut(status=r["state"]))
         if dispatch_gen is not None and dispatch_gen < _gen(con):   # Redis 유실 전 메시지의 늦은 시작 → 복구가 새로 보낸다
             return ok(C.JobStartOut(status="stale_dispatch"))
+        epoch = r["exec_epoch"] or 0
+        if start_id is not None and r["start_id"] == start_id and r["state"] == "running" and r["lease_owner"] == worker:
+            if lease_sec:                                          # DB 모드: 다시 보낸 시작도 lease를 이어 준다
+                _set(con, job_id, lease_until=now + lease_sec)
+            return _started(r, worker, r["attempts"], epoch, r["lease_owner"], replay=True)
+        if expect_epoch is not None and epoch != expect_epoch:
+            return ok(C.JobStartOut(status="superseded", exec_epoch=epoch))
         if r["state"] == "running" and (r["lease_until"] or 0) > now:
             return ok(C.JobStartOut(status="leased", owner=r["lease_owner"],
                                     lease_left_sec=round(r["lease_until"] - now, 1)))
-        epoch = (r["exec_epoch"] or 0) + 1
         _set(con, job_id, state="running", lease_owner=worker, lease_until=now + lease_sec,
-             attempts=r["attempts"] + 1, exec_epoch=epoch)
-        return ok(C.JobStartOut(
-            status="started", kind=r["kind"], payload=json.loads(r["payload"]), attempt=r["attempts"] + 1, exec_epoch=epoch,
-            previous_owner=r["lease_owner"],
-            permit=_issue_permit(job_id, worker, r["attempts"] + 1, epoch, r["user_id"] or "anonymous", r["stream"])))
+             attempts=r["attempts"] + 1, exec_epoch=epoch + 1, start_id=start_id)
+        return _started(r, worker, r["attempts"] + 1, epoch + 1, r["lease_owner"])
 
 
 @tool

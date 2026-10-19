@@ -10,26 +10,39 @@ from pathlib import Path
 
 import fakeredis
 import pytest
+import redis.asyncio as aioredis
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notree.common import settings as S  # noqa: E402
 from notree.scheduler.allocator import run_allocator  # noqa: E402
 from notree.worker.loop import Worker  # noqa: E402
 from notree.worker.mcp_client import McpClient  # noqa: E402
+from redis_support import shared_redis_url  # noqa: E402
 
 RT = dataclasses.replace(S.RT, lease_sec=1.0, heartbeat_sec=0.3, claim_idle_ms=1200, job_timeout_sec=5,
                          max_attempts=2, concurrency=3)
 
 
 class Env:
-    def __init__(self, tmp_path, allocator: bool = True):
+    """MCP 서버(stdio) 세 연결 + Redis + 배정기. Redis는 모드에 따라:
+      LIVENESS=db    : fakeredis (테스트마다 새것)
+      LIVENESS=redis : 실제 Redis (소유 키 Lua — fakeredis는 Lua를 못 돌림). 없으면 건너뜀 (tests/redis_support.py)"""
+
+    def __init__(self, tmp_path, allocator: bool = True, url: str | None = None):
         self.with_allocator = allocator
         self.db = tmp_path / "skel.db"
         self.env = {**os.environ, "NOTREE_DB": str(self.db), "NOTREE_REQUIRE_PERMIT": "1"}
-        self.r = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)  # 테스트마다 새 Redis
+        self.real = url is not None or S.LIVENESS == "redis"
+        if self.real:                                # 실제 Redis는 시험마다 FLUSHALL (시험 전용 Redis만 쓸 것)
+            self.r = aioredis.from_url(url or shared_redis_url(), decode_responses=True)
+        else:
+            self.r = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)  # 테스트마다 새 Redis
         self.stop = asyncio.Event()
 
     async def __aenter__(self):
+        if self.real:
+            await self.r.flushall()
         self.stack = AsyncExitStack()               # MCP 연결은 연 역순으로 닫아야 한다
         self.api = await self.stack.enter_async_context(McpClient(env=self.env))
         self.m_s = await self.stack.enter_async_context(McpClient(env=self.env))
@@ -65,6 +78,8 @@ class Env:
         self.stop.set()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.stack.aclose()
+        if self.real:
+            await self.r.aclose()
 
 
 def run(coro):
@@ -94,7 +109,10 @@ def test_outcomes(tmp_path):
     run(t())
 
 
-def test_lease_lost_cancels_handler_without_ack(tmp_path, capsys):
+def test_lease_lost_cancels_handler_without_ack(tmp_path, capsys, monkeypatch):
+    """DB 모드의 lease 상실 (Redis 모드의 소유권 상실은 test_redis_ownership·test_start_protocol)."""
+    monkeypatch.setattr(S, "LIVENESS", "db")
+
     async def t():
         async with Env(tmp_path) as e:
             e.start_worker()
@@ -169,8 +187,11 @@ def test_forged_permit_is_rejected(tmp_path):
     run(t())
 
 
-def test_heartbeat_is_counted_in_tool_stats(tmp_path):
-    """heartbeat도 DB를 두드리므로 호출 집계에 잡혀야 한다 (빠져 있던 것, 2026-10-17)."""
+def test_heartbeat_is_counted_in_tool_stats(tmp_path, monkeypatch):
+    """DB 모드: heartbeat도 DB를 두드리므로 호출 집계에 잡혀야 한다 (빠져 있던 것, 2026-10-17).
+    Redis 모드에서 0번인 것은 test_redis_ownership이 본다."""
+    monkeypatch.setattr(S, "LIVENESS", "db")
+
     async def t():
         async with Env(tmp_path) as e:
             e.start_worker()

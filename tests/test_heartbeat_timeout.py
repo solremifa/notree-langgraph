@@ -55,7 +55,7 @@ async def _run_until_lost(lease) -> float:
 @pytest.mark.parametrize("ok_calls", [0, 3])          # 처음부터 무응답 / 몇 번 갱신한 뒤 무응답
 def test_redis_heartbeat_that_never_answers_still_loses_the_lease(ok_calls):
     hang = Hang(ok_calls, ok_value=1)
-    took = asyncio.run(_run_until_lost(RedisLease(_ctx(), _Own(hang))))
+    took = asyncio.run(_run_until_lost(RedisLease(CFG, _Own(hang))))
     assert took < 0.25 + ok_calls * CFG.heartbeat_sec * 1.5, took   # 리뷰 재현: lease 0.1초인데 0.25초에도 실행 중이었다
 
 
@@ -79,7 +79,7 @@ def test_one_slow_heartbeat_inside_the_lease_is_not_a_loss():
             return 1
 
     async def t():
-        async with RedisLease(_ctx(), _Own(SlowOnce())) as lease:
+        async with RedisLease(CFG, _Own(SlowOnce())) as lease:
             await asyncio.sleep(0.5)
         assert not lease.lost
     asyncio.run(t())

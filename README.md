@@ -18,22 +18,32 @@ uv sync            # Python 3.11 이상
 
 ## 돌려 보기
 
-Redis 없이 바로 됩니다 (fakeredis).
+**실행 상태 판단은 기본 `NOTREE_LIVENESS=redis`** (2026-10-19부터): Redis 소유 키 선점 → DB 조건부 승인 → Redis Lua heartbeat.
+DB heartbeat는 보내지 않습니다. `NOTREE_LIVENESS=db`는 명시적으로 고르는 비교·호환 모드이고, Redis 장애 때 자동으로 바뀌지 않습니다.
+절차: [docs/changes/2026-10-19-start-protocol.md](docs/changes/2026-10-19-start-protocol.md)
+
+기본(redis) 모드는 Lua를 돌릴 수 있는 **실제 Redis**가 필요합니다 (fakeredis는 안 됨). Redis 없이 데모만 보려면 DB 모드를 명시하세요.
 
 ```powershell
-uv run python -m notree.dev.demo         # 성공·실패·재시도·한도 초과·마감 초과·LangGraph 이어하기·누락 복구·되살리기·종료 처리
-uv run python -m notree.dev.takeover     # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
+$env:NOTREE_LIVENESS="db"; uv run python -m notree.dev.demo      # Redis 없이 (fakeredis, DB 모드)
+uv run python -m notree.dev.demo --redis redis://localhost:6379/0  # 기본 redis 모드
+uv run python -m notree.dev.takeover --redis redis://localhost:6379/0   # worker-A가 작업 중 죽고 worker-B가 체크포인트에서 이어감
 uv run python -m notree.dev.graph_run    # 그래프만 따로 (--crash-at, --resume, --sloppy, --graph, --help)
 uv run python -m notree.dev.qa_run       # Q&A 근거 탐색 그래프 (feat/qa-graph 실험)
-uv run pytest -q                         # 176개
 ```
 
-**실제 Redis가 필요한 시험**(`test_redis_ownership`, `test_dispatch_recovery`, `test_combined_faults` 일부)은 PATH에 `redis-server`가
-없으면 **조용히 건너뜁니다**. 전체를 확인하려면 `redis-server`(7.x)를 설치하고 건너뛴 목록을 같이 보세요.
+시험: worker 시험은 기본(redis) 모드에서 **실제 Redis**로 돕니다. PATH에 `redis-server`가 있으면 시험이 띄우고, 없으면(Windows 등)
+**시험 전용** Redis를 `NOTREE_TEST_REDIS_URL`로 주세요 — 시험이 FLUSHALL을 하므로 개발·운영 Redis를 주면 안 됩니다.
+둘 다 없으면 Redis가 필요한 시험은 건너뜁니다 (`-rs`로 확인).
 
 ```powershell
-uv run pytest -q -rs      # 맨 아래 "SKIPPED ... redis-server 없음"이 있으면 그 시험은 안 돈 것
+docker run -d --name notree-test-redis -p 127.0.0.1:16399:6379 redis:7-alpine redis-server --save "" --appendonly no
+$env:NOTREE_TEST_REDIS_URL="redis://127.0.0.1:16399/0"
+uv run pytest -q -rs                              # 기본(redis) 모드
+$env:NOTREE_LIVENESS="db"; uv run pytest -q -rs   # DB 모드 (비교·호환)
 ```
+
+`redis-server` 프로세스를 직접 띄워야 하는 시험 3개(스냅숏 복원·스캔 중 재시작·compose 설정 확인)는 `NOTREE_TEST_REDIS_URL`로는 돌지 않습니다.
 
 프록시 환경에서 시험이 HTTP 클라이언트 생성 단계에서 실패하면 (2026-10-18 리뷰 환경):
 - SOCKS 프록시를 쓰는 환경: `uv pip install socksio==1.0.0` (모든 개발자에게 필수는 아님)

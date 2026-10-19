@@ -8,7 +8,6 @@ Redis 소유 키 모드에서 실시간 요약이 실행 중일 때 Redis가 통
 """
 import asyncio
 import dataclasses
-import shutil
 import sys
 from pathlib import Path
 
@@ -19,10 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notree.common import settings as S  # noqa: E402
 from notree.scheduler.periodic import recover_after_redis_loss  # noqa: E402
 from notree.worker.handlers import live_summary as LS  # noqa: E402
+from redis_support import needs_redis  # noqa: E402
 from test_dispatch_recovery import RealEnv, redis_url  # noqa: E402,F401
 from test_summary_coalesce import L, U, lec, ranges, segs, summary_jobs, wait_lec  # noqa: E402
 
-pytestmark = pytest.mark.skipif(shutil.which("redis-server") is None, reason="redis-server 없음")
+pytestmark = needs_redis
 RT = dataclasses.replace(S.RT, lease_sec=1.0, heartbeat_sec=0.3, claim_idle_ms=1200, job_timeout_sec=20)
 
 
