@@ -9,6 +9,17 @@
 
 ---
 
+## 2026-10-19
+
+### 검색 방식 오프라인 비교 도구 (pg_trgm · 벡터 · 결합) · (이번 커밋)
+자세히: [docs/changes/2026-10-19-vector-compare.md](docs/changes/2026-10-19-vector-compare.md) (브랜치 `exp/vector-compare`, worker·그래프 변경 없음)
+
+- 🆕 `notree.dev.vec_embed`: 문서·질문 임베딩을 `data/` 아래에만 저장 (OpenAI, 키 없이 경로 점검용 `--fake`). 문서 색인 시간·토큰과 질문별 임베딩 시간을 따로 기록
+- 🆕 `notree.dev.vec_compare`: 같은 문서·질문·후보 수로 trgm / 벡터(정확 코사인) / RRF 결합 비교. R@3·@5(노트·전사·둘 중 하나), 새 30 항목별 근거 충족률, 범위 밖 최고 점수(거절 판단 아님), 동점 경계 질문 수, 검색만 시간과 준비 시간 분리. `--check`로 문서 수·분할·정답 ID 확인
+- 🔧 `qa_fresh_eval` 결과에 `understand_ms`(LLM 검색어 생성 시간)·`search_ms`·답변별 `ms` 추가 (기존 필드는 그대로)
+- 🔧 `.gitignore`에 `/data` 추가 (worktree에서 data를 심볼릭 링크로 둘 때도 제외)
+- 🆕 의존성 numpy
+
 ## 2026-10-18
 
 ### 새 질문 세트로 검색 + 실제 답변 평가 도구 · `2951927`

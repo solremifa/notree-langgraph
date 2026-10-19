@@ -72,13 +72,15 @@ class PgRetriever:
     """PG 검색. 출처마다 상한을 limit으로 고정 (근거 3개·5개 비교). 웹은 빈 결과 (강의 자료만 평가)."""
 
     def __init__(self, course: str, limit: int) -> None:
-        self.course, self.limit, self.calls = course, limit, []
+        self.course, self.limit, self.calls, self.ms = course, limit, [], []
 
     async def search(self, source, keywords, limit=3, lecture_ids=None):
         self.calls.append(source if not lecture_ids else f"{source}@{','.join(lecture_ids)}")
         if source == "web":
             return []
+        t0 = time.perf_counter()
         rows = await asyncio.to_thread(pg_search.search, USER, self.course, source, keywords, self.limit, lecture_ids)
+        self.ms.append(round((time.perf_counter() - t0) * 1000, 1))
         return [Hit(r["id"], source, r["text"], r["score"], r["ref"], r["lecture_id"]) for r in rows]
 
 
@@ -86,20 +88,23 @@ class Recorder:
     """LLM을 감싸 understand 결과와 answer에 **실제로 전달된 근거**·원본 문장을 남긴다."""
 
     def __init__(self, inner) -> None:
-        self.inner, self.understood, self.attempts = inner, None, []
+        self.inner, self.understood, self.attempts, self.understand_ms = inner, None, [], None
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
 
     async def understand(self, question, course):
+        t0 = time.perf_counter()
         u = await self.inner.understand(question, course)
+        self.understand_ms = round((time.perf_counter() - t0) * 1000, 1)   # LLM 검색어 생성 시간 (질문 처리의 일부)
         self.understood = u.model_dump()
         return u
 
     async def answer(self, question, evidence, attempt, problem="", related=True):
+        t0 = time.perf_counter()
         a = await self.inner.answer(question, evidence, attempt, problem=problem, related=related)
         self.attempts.append({"attempt": attempt, "evidence": [h["id"] for h in evidence],
-                              "needs_more": a.needs_more_evidence})
+                              "needs_more": a.needs_more_evidence, "ms": round((time.perf_counter() - t0) * 1000, 1)})
         return a
 
 
@@ -129,7 +134,7 @@ async def run_one(graph, q: dict, llm_name: str, limit: int, deadline_sec: float
     usage = getattr(inner, "usage", []) or []
     return {"id": q["id"], "limit": limit, "llm": llm_name, "q": q["q"],
             "keywords": (llm.understood or {}).get("keywords", []), "related": (llm.understood or {}).get("related"),
-            "searches": ret.calls, "attempts": llm.attempts,
+            "searches": ret.calls, "search_ms": ret.ms, "understand_ms": llm.understand_ms, "attempts": llm.attempts,
             "status": out.get("status"), "label": out.get("label"), "answer": out.get("answer"),
             "sentences": out.get("sentences") or [], "citations": out.get("citations") or [],
             "sources": [{"id": s["id"], "source": s["source"], "text": s["text"]} for s in out.get("sources") or []],
