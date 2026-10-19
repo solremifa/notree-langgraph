@@ -11,7 +11,7 @@
 
 ## 2026-10-19
 
-### 검색 방식 비교 측정 기록 (문서만) · (이번 커밋)
+### 검색 방식 비교 측정 기록 (문서만) · `6ae423d`
 자세히: [docs/measurements/2026-10-19-vector-compare](docs/measurements/2026-10-19-vector-compare/README.md)
 
 - 🆕 pg_trgm · 벡터 · 동일 비중 RRF 오프라인 비교 기록: 새 30(AI 생성)에서 벡터가 가장 높음, RRF는 개선 못 함. 질문별 순위 · 항목별 "검색 vs 그래프 전달" 표 (질문 ID · 순위 · 개수만)
