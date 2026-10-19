@@ -11,7 +11,7 @@
 
 ## 2026-10-19
 
-### 검색 방식 오프라인 비교 도구 (pg_trgm · 벡터 · 결합) · (이번 커밋)
+### 검색 방식 오프라인 비교 도구 (pg_trgm · 벡터 · 결합) · `2ccba8d`
 자세히: [docs/changes/2026-10-19-vector-compare.md](docs/changes/2026-10-19-vector-compare.md) (브랜치 `exp/vector-compare`, worker·그래프 변경 없음)
 
 - 🆕 `notree.dev.vec_embed`: 문서·질문 임베딩을 `data/` 아래에만 저장 (OpenAI, 키 없이 경로 점검용 `--fake`). 문서 색인 시간·토큰과 질문별 임베딩 시간을 따로 기록
