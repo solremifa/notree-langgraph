@@ -11,6 +11,9 @@
 
 ## 2026-10-19
 
+### 측정 기록 해석 보완 · (이번 커밋)
+- 🔧 측정 기록에 "20/26은 결합의 예상 성능이 아님", "노트 조기 중단은 이번 범위에서 증거가 없을 뿐 해결된 것이 아님", 건너뛴 시험 5개의 이유(PostgreSQL 없음)와 시험 범위를 추가
+
 ### 검색 방식 비교 측정 기록 · `28cfe18`
 자세히: [docs/measurements/2026-10-19-vector-compare](docs/measurements/2026-10-19-vector-compare/README.md)
 
