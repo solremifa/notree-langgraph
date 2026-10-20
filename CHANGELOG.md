@@ -11,7 +11,7 @@
 
 ## 2026-10-20
 
-### pgvector 통합 결정 기록 (문서만) · (이번 커밋)
+### pgvector 통합 결정 기록 (문서만) · `5c1993f`
 자세히: [docs/changes/2026-10-20-pgvector-integration.md](docs/changes/2026-10-20-pgvector-integration.md)
 
 - 🆕 결정 D1~D6: 최신 문서 공백(색인 상태별 후보 자리 배정 · 최근 전사 조회 평가), 임베딩 작업 묶음과 batch 우선순위, 질문 재작성 → 임베딩 순차 지연, 0.3·0.6은 trgm 전용(방식별 설정 분리), RRF 상시 결합 안 함, 첫 통합은 정확 검색
