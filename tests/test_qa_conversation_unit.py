@@ -40,7 +40,8 @@ def r(request, monkeypatch):
         cli = redis_sync.Redis.from_url(request.getfixturevalue("real_server").url, decode_responses=True)
         cli.flushall()
     monkeypatch.setattr(CONV, "_client", cli)
-    return cli
+    yield cli
+    cli.close()                 # 연결을 남기지 않는다 (fakeredis 서버·실제 Redis 종료 때 기다리지 않게)
 
 
 def turn(seq, qid=None, q="질문", a="답", status="completed"):
@@ -118,11 +119,12 @@ def test_long_message_is_clipped_in_store(r, monkeypatch):
 
 
 def test_redis_down_raises_memory_unavailable(monkeypatch):
-    monkeypatch.setattr(CONV, "_client", redis_sync.Redis(port=1, socket_connect_timeout=0.2, decode_responses=True))
-    for call in (lambda: CONV.create("cv", 1, "u", "c"), lambda: CONV.touch("cv", 1, "u", "c"),
-                 lambda: CONV.read("cv", 1, "u", "c"), lambda: CONV.apply_turns("cv", 1, "u", "c", [turn(1)])):
-        with pytest.raises(CONV.MemoryUnavailable):
-            call()
+    with redis_sync.Redis(port=1, socket_connect_timeout=0.2, decode_responses=True) as down:
+        monkeypatch.setattr(CONV, "_client", down)
+        for call in (lambda: CONV.create("cv", 1, "u", "c"), lambda: CONV.touch("cv", 1, "u", "c"),
+                     lambda: CONV.read("cv", 1, "u", "c"), lambda: CONV.apply_turns("cv", 1, "u", "c", [turn(1)])):
+            with pytest.raises(CONV.MemoryUnavailable):
+                call()
 
 
 # ── 모델 입력 이력 (쌍 단위 자르기) ───────────────────────────────────

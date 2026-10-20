@@ -23,6 +23,7 @@ import base64
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import sqlite3
@@ -170,18 +171,38 @@ class Reject(Exception):
         self.code = code
 
 
+def _rejection(e: Exception) -> dict | None:
+    if isinstance(e, Reject):
+        return err(e.code, str(e))
+    if isinstance(e, sqlite3.OperationalError):
+        return err(ErrorCode.UNAVAILABLE, f"DB: {e}")
+    if isinstance(e, (ValueError, KeyError, TypeError)):
+        return err(ErrorCode.INVALID_ARGS, f"{type(e).__name__}: {e}")
+    return None
+
+
 def guarded(fn):
-    """도구 안에서 난 예외를 공통 거절 형식으로 바꾼다. (FastMCP는 functools.wraps로 원래 시그니처를 읽는다)"""
+    """도구 안에서 난 예외를 공통 거절 형식으로 바꾼다. (FastMCP는 functools.wraps로 원래 시그니처를 읽는다)
+    async 도구(대화 메모리: Redis I/O를 스레드로 넘김)는 async 래퍼로 감싸 실제로 await한다 → FastMCP도 async로 부른다."""
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def awrapper(*a, **k):
+            try:
+                return await fn(*a, **k)
+            except Exception as e:
+                if (out := _rejection(e)) is None:
+                    raise
+                return out
+        return awrapper
+
     @functools.wraps(fn)
     def wrapper(*a, **k):
         try:
             return fn(*a, **k)
-        except Reject as e:
-            return err(e.code, str(e))
-        except sqlite3.OperationalError as e:
-            return err(ErrorCode.UNAVAILABLE, f"DB: {e}")
-        except (ValueError, KeyError, TypeError) as e:
-            return err(ErrorCode.INVALID_ARGS, f"{type(e).__name__}: {e}")
+        except Exception as e:
+            if (out := _rejection(e)) is None:
+                raise
+            return out
     return wrapper
 
 
@@ -846,6 +867,8 @@ def qa_seed(user_id: str, course_id: str, course_name: str, docs: list[dict]) ->
 
 # ── Q&A 대화 세션 (2026-10-20, docs/changes/2026-10-20-qa-conversation-memory.md) ─────────
 # DB가 세션의 정체(주인·상태·세대·차례·진행 중 질문)를, Redis(conversation.py)가 최근 문답을 가진다.
+# Redis를 만지는 도구는 async: Redis 호출은 `await CONV.run(...)`으로 전용 스레드에서 (이벤트 루프를 막지 않음, 문서 9절).
+# DB 트랜잭션(tx·db)은 Redis를 부르기 전에 닫는다 — Redis 응답을 기다리는 동안 DB 잠금을 쥐지 않는다.
 # 둘은 한 번에 원자적으로 쓸 수 없으므로 경계마다 순서를 정했다 (문서 3절):
 #   시작: Redis 키 → DB 행 / 질문: DB 확인 → Redis 연장(있을 때만) → DB 슬롯·질문 / 답: DB 저장 → Redis 반영(실패해도 저장 성공)
 #   종료·만료: DB 세대 +1 → Redis 삭제. 종료·만료된 대화를 DB 이력으로 다시 만들지 않는다.
@@ -861,7 +884,7 @@ def _timed_out(r) -> bool:
     return time.time() - (r["last_user_at"] or r["created"]) > S.QA_CONV_TTL_SEC
 
 
-def _end_conversation(conversation_id: str, epoch: int, state: str, reason: str) -> bool:
+async def _end_conversation(conversation_id: str, epoch: int, state: str, reason: str) -> bool:
     """열린 대화를 끝낸다 (closed·expired). 세대를 올려 이전 세대 키로 가는 늦은 쓰기를 무력화하고 단기 문맥을 지운다.
     DB는 조건부(state='open' AND epoch=?)라 여러 번 불려도 한 번만 바뀐다. → Redis 삭제 성공 여부."""
     with tx() as con:
@@ -869,7 +892,7 @@ def _end_conversation(conversation_id: str, epoch: int, state: str, reason: str)
                     "WHERE conversation_id=? AND state='open' AND epoch=?",
                     (state, time.time(), reason, conversation_id, epoch))
     try:
-        CONV.drop(conversation_id, epoch)
+        await CONV.run(CONV.drop, conversation_id, epoch)
         return True
     except CONV.MemoryUnavailable:
         return False                                  # 이전 세대 키는 아무도 읽지 않고 TTL로 사라진다
@@ -905,7 +928,7 @@ def _memory_turns(con, conversation_id: str) -> list[dict]:
     return out
 
 
-def _sync_memory(conversation_id: str) -> tuple[str, int]:
+async def _sync_memory(conversation_id: str) -> tuple[str, int]:
     """DB에 저장됐는데 Redis 이력에 아직 없는 답을 반영한다 (mark 비교라 몇 번 불려도 중복 없음).
     열린 대화의 현재 세대 키가 있을 때만 — 재시도 중인 현재 대화의 결과 확인이지, 끝난 대화의 복원이 아니다.
     → (applied | noop | skipped | failed, 반영 뒤 mark)"""
@@ -915,16 +938,16 @@ def _sync_memory(conversation_id: str) -> tuple[str, int]:
             return "skipped", -1
         turns = _memory_turns(con, conversation_id)
     try:
-        res, mark = CONV.apply_turns(conversation_id, r["epoch"], r["user_id"], r["course_id"], turns)
+        res, mark = await CONV.run(CONV.apply_turns, conversation_id, r["epoch"], r["user_id"], r["course_id"], turns)
     except CONV.MemoryUnavailable:
         return "failed", -1
     return ("skipped" if res == "missing" else res), mark
 
 
-def _context_turns(q) -> tuple[list[dict], str]:
+async def _context_turns(q) -> tuple[list[dict], str]:
     """qa_context용 이전 문답과 memory_state. 현재 질문은 빼고(차례·ID 둘 다), DB에서 지운 질문도 뺀다."""
     cid = q["conversation_id"]
-    sync, _ = _sync_memory(cid)
+    sync, _ = await _sync_memory(cid)
     with db() as con:
         r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (cid,)).fetchone()
         if r["state"] != "open":
@@ -933,7 +956,7 @@ def _context_turns(q) -> tuple[list[dict], str]:
             "SELECT question_id, turn_seq FROM qa_questions WHERE conversation_id=? AND state='answered' AND turn_seq<?",
             (cid, q["turn_seq"]))}
     try:
-        m = CONV.read(cid, r["epoch"], r["user_id"], r["course_id"])
+        m = await CONV.run(CONV.read, cid, r["epoch"], r["user_id"], r["course_id"])
     except CONV.MemoryUnavailable:
         return [], "unavailable"
     if m is None:
@@ -945,7 +968,7 @@ def _context_turns(q) -> tuple[list[dict], str]:
 
 
 @tool
-def qa_conversation_start(user_id: str, course_id: str) -> dict:
+async def qa_conversation_start(user_id: str, course_id: str) -> dict:
     """[api] 새 대화. Redis 키를 먼저 만들고 DB 행을 넣는다 (DB가 실패하면 고아 키는 아무도 읽지 않고 TTL로 사라짐)."""
     with db() as con:
         c = con.execute("SELECT user_id FROM qa_courses WHERE course_id=?", (course_id,)).fetchone()
@@ -953,7 +976,7 @@ def qa_conversation_start(user_id: str, course_id: str) -> dict:
         raise Reject(ErrorCode.NOT_FOUND, f"과목 없음: {course_id}")
     cid = f"cv-{uuid.uuid4().hex[:12]}"
     try:
-        exp = CONV.create(cid, 1, user_id, course_id)
+        exp = await CONV.run(CONV.create, cid, 1, user_id, course_id)
     except CONV.MemoryUnavailable as e:
         raise Reject(ErrorCode.UNAVAILABLE, f"대화 메모리: {e}") from None
     now = time.time()
@@ -964,7 +987,7 @@ def qa_conversation_start(user_id: str, course_id: str) -> dict:
 
 
 @tool
-def qa_conversation_close(conversation_id: str, user_id: str) -> dict:
+async def qa_conversation_close(conversation_id: str, user_id: str) -> dict:
     """[api] 대화 종료. 새 질문을 거절하고 단기 문맥을 지운다. 진행 중 질문은 계속 돌아 DB에 답을 저장하지만,
     세대가 바뀌어 이력에는 들어가지 않는다. DB의 질문·답변은 지우지 않는다 (보관 정책 그대로)."""
     with db() as con:
@@ -984,7 +1007,7 @@ def qa_conversation_close(conversation_id: str, user_id: str) -> dict:
     if n != 1:                                          # 그사이 만료·종료됨
         return ok(C.QaConversationCloseOut(closed=False, state=now_state, memory_cleared=False))
     try:
-        CONV.drop(conversation_id, r["epoch"])
+        await CONV.run(CONV.drop, conversation_id, r["epoch"])
         cleared = True
     except CONV.MemoryUnavailable:
         cleared = False
@@ -992,7 +1015,7 @@ def qa_conversation_close(conversation_id: str, user_id: str) -> dict:
 
 
 @tool
-def qa_conversation_get(conversation_id: str, user_id: str, include_messages: bool = False) -> dict:
+async def qa_conversation_get(conversation_id: str, user_id: str, include_messages: bool = False) -> dict:
     """[api·dev] 대화 상태. 만료는 다음 질문 때 DB에 확정되지만, 여기서는 시간·Redis 키를 보고 계산해 돌려준다."""
     with db() as con:
         r = con.execute("SELECT * FROM qa_conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
@@ -1003,7 +1026,7 @@ def qa_conversation_get(conversation_id: str, user_id: str, include_messages: bo
     state, exp, mstate, msgs = r["state"], None, "ended", []
     if r["state"] == "open":
         try:
-            m = CONV.read(conversation_id, r["epoch"], r["user_id"], r["course_id"])
+            m = await CONV.run(CONV.read, conversation_id, r["epoch"], r["user_id"], r["course_id"])
             mstate = "lost" if m is None else "ok"
             if m is not None:
                 exp = m["expires_at"] / 1000
@@ -1022,21 +1045,21 @@ def _ended(r) -> dict:
                          conversation_id=r["conversation_id"], expire_reason=r["end_reason"]))
 
 
-def _qa_ask_in_conversation(user_id: str, course_id: str, question: str, conversation_id: str) -> dict:
+async def _qa_ask_in_conversation(user_id: str, course_id: str, question: str, conversation_id: str) -> dict:
     with db() as con:
         r = _conv_row(con, conversation_id, user_id, course_id)
     if r["state"] != "open":
         return _ended(r)
     epoch = r["epoch"]
     if _timed_out(r):
-        _end_conversation(conversation_id, epoch, "expired", "ttl")
+        await _end_conversation(conversation_id, epoch, "expired", "ttl")
         return ok(C.QaAskOut(status="expired", conversation_id=conversation_id, expire_reason="ttl"))
     try:
-        alive = CONV.touch(conversation_id, epoch, user_id, course_id)     # 사용자 활동: 있는 키만 연장 (없으면 만들지 않음)
+        alive = await CONV.run(CONV.touch, conversation_id, epoch, user_id, course_id)   # 사용자 활동: 있는 키만 연장
     except CONV.MemoryUnavailable as e:
         raise Reject(ErrorCode.UNAVAILABLE, f"대화 메모리: {e}") from None
     if alive is None:                         # DB는 열려 있는데 키가 없음 → Redis 유실(또는 막 만료). 같은 세션을 되살리지 않는다
-        _end_conversation(conversation_id, epoch, "expired", "context_lost")
+        await _end_conversation(conversation_id, epoch, "expired", "context_lost")
         return ok(C.QaAskOut(status="expired", conversation_id=conversation_id, expire_reason="context_lost"))
     question_id, now = f"q-{uuid.uuid4().hex[:8]}", time.time()
     with tx() as con:
@@ -1083,11 +1106,11 @@ def _qa_retry_blocked(con, question_id: str | None) -> str | None:
 
 
 @tool
-def qa_ask(user_id: str, course_id: str, question: str, conversation_id: str | None = None) -> dict:
+async def qa_ask(user_id: str, course_id: str, question: str, conversation_id: str | None = None) -> dict:
     """[api] 질문 행과 qa 작업 의도를 한 트랜잭션에. 마감은 job_create와 같은 규칙(요청 + 90초).
     conversation_id가 없으면 이전과 같은 단일 질문 (문맥 없음, Redis를 건드리지 않음)."""
     if conversation_id is not None:
-        return _qa_ask_in_conversation(user_id, course_id, question, conversation_id)
+        return await _qa_ask_in_conversation(user_id, course_id, question, conversation_id)
     question_id = f"q-{uuid.uuid4().hex[:8]}"
     now = time.time()
     with tx() as con:
@@ -1101,7 +1124,7 @@ def qa_ask(user_id: str, course_id: str, question: str, conversation_id: str | N
 
 
 @tool
-def qa_context(question_id: str, permit: str | None = None) -> dict:
+async def qa_context(question_id: str, permit: str | None = None) -> dict:
     """[worker] 질문·과목·강의 목록·세대 + 대화의 이전 문답. 이 작업의 답이 이미 저장됐으면 answered (이때도 이력 반영을 재확인)."""
     with db() as con:
         q, _ = _qa_question(con, question_id, permit)
@@ -1111,7 +1134,7 @@ def qa_context(question_id: str, permit: str | None = None) -> dict:
             "SELECT DISTINCT lecture_id FROM qa_docs WHERE course_id=? AND lecture_id IS NOT NULL ORDER BY lecture_id",
             (q["course_id"],))]
         answered = q["state"] == "answered" and q["idem_key"] == q["job_id"]
-    turns, memory_state = _context_turns(q) if q["conversation_id"] else ([], "none")
+    turns, memory_state = (await _context_turns(q)) if q["conversation_id"] else ([], "none")
     return ok(C.QaContextOut(question=q["question"], course_id=q["course_id"], course_name=c["name"] if c else "",
                              lecture_ids=lectures, generation=q["generation"], conversation_id=q["conversation_id"],
                              recent_turns=turns, memory_state=memory_state, answered=answered))
@@ -1151,7 +1174,7 @@ def web_search(question_id: str, query: str, limit: int = 3, permit: str | None 
 
 
 @tool
-def qa_complete(idem_key: str, question_id: str, expected_generation: int, status: str, label: str, answer: str,
+async def qa_complete(idem_key: str, question_id: str, expected_generation: int, status: str, label: str, answer: str,
                 sentences: list[dict], sources: list[dict], notice_code: str | None = None,
                 clarification: dict | None = None, permit: str | None = None) -> dict:
     """[worker] 답변 저장. 같은 idem_key는 처음 결과 그대로 duplicate=true. 실행권과 질문 세대를 확인한다.
@@ -1196,7 +1219,7 @@ def qa_complete(idem_key: str, question_id: str, expected_generation: int, statu
                             "WHERE conversation_id=? AND active_question_id=?", (q["conversation_id"], question_id))
             _log(con, "qa_complete", q["job_id"])
     # DB 커밋 뒤: 이력 반영. 같은 차례는 mark로 한 번만 들어가므로 duplicate(재시도)에서도 그대로 다시 확인한다
-    memory = _sync_memory(q["conversation_id"])[0] if q["conversation_id"] else "none"
+    memory = (await _sync_memory(q["conversation_id"]))[0] if q["conversation_id"] else "none"
     return ok(C.QaCompleteOut(answer_id=answer_id, memory=memory), duplicate=duplicate)
 
 
@@ -1214,7 +1237,7 @@ def qa_get(question_id: str, user_id: str) -> dict:
 
 
 @tool
-def qa_delete(question_id: str, user_id: str) -> dict:
+async def qa_delete(question_id: str, user_id: str) -> dict:
     """[api] 질문 삭제. 질문 원문·답변·출처 복사본을 지우고(보관 안 함), 세대를 올려 진행 중인 답변 저장을 막는다.
     행은 남긴다: 진행 중 작업의 저장이 generation_mismatch로 거절되고, 조회는 'deleted'로 답하게.
     대화 속 질문이면 단기 문맥에서도 뺀다. Redis 장애로 못 빼도 qa_context가 지운 질문의 메시지는 걸러 낸다."""
@@ -1227,7 +1250,8 @@ def qa_delete(question_id: str, user_id: str) -> dict:
                            "WHERE q.question_id=?", (question_id,)).fetchone() if deleted else None
     if conv is not None and conv["state"] == "open":
         try:
-            CONV.remove_question(conv["conversation_id"], conv["epoch"], conv["user_id"], conv["course_id"], question_id)
+            await CONV.run(CONV.remove_question, conv["conversation_id"], conv["epoch"], conv["user_id"],
+                           conv["course_id"], question_id)
         except CONV.MemoryUnavailable:
             pass
     return ok(C.QaDeleteOut(deleted=deleted))
@@ -1246,7 +1270,10 @@ _init_db()
 
 
 def main() -> None:
-    mcp.run("streamable-http" if "--http" in sys.argv else "stdio")
+    try:
+        mcp.run("streamable-http" if "--http" in sys.argv else "stdio")
+    finally:
+        CONV.shutdown()     # 프로세스 수명 = 대화 메모리 스레드·연결 풀 수명 (HTTP는 세션마다 lifespan이 돌아 거기 두지 않음)
 
 
 if __name__ == "__main__":

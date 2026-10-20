@@ -11,6 +11,18 @@
 
 ## 2026-10-20
 
+### 대화 Redis I/O가 MCP 이벤트 루프를 막던 문제 (`feat/qa-conversation-memory`, main 미머지) · (이번 커밋)
+자세히: [docs/changes/2026-10-20-qa-conversation-memory.md](docs/changes/2026-10-20-qa-conversation-memory.md) 14절 · 기준 `f8973b2`
+
+- 🐛 대화 도구의 동기 Redis 호출이 FastMCP 이벤트 루프에서 돌아, Redis가 느리면 같은 서버의 다른 도구(job_heartbeat 등)가 함께 멈춤.
+  Redis 1.5초 지연 중 heartbeat 1.45초 → 0.003초 (시험용 TCP 중계기로 재현, `tests/test_conv_event_loop.py`)
+- 🔧 `conversation.run()`: 대화 Redis 작업은 전용 스레드(상한 4, 연결 풀 상한 같음)에서, 실행+대기 상한 16(넘으면 즉시 unavailable), 작업 시한 3초
+- 🔧 대화 도구(`qa_conversation_*`·`qa_ask`·`qa_context`·`qa_complete`·`qa_delete`)를 async로, `guarded`가 async 도구를 await. 계약(이름·인자·응답) 변경 없음
+- 🆕 설정(잠정값): `NOTREE_CONV_REDIS_THREADS`(4), `NOTREE_CONV_REDIS_MAX_PENDING`(16), `NOTREE_CONV_REDIS_TIMEOUT_SEC`(1.0, 전에는 2초 고정), `NOTREE_CONV_REDIS_OP_DEADLINE_SEC`(3.0)
+- 🆕 `uv run python -m notree.dev.pytest_guard`: 시간 제한·시험별 기록·정체 때 스택/프로세스 목록·요약 뒤 종료 정체(125) 감지
+- 🐛 시험 도구: `FakeRedis.close()`가 서버를 실제로 내리고 남은 연결을 확인, 단위 시험 Redis 클라이언트를 닫음
+- 테스트 → Windows 전체 한 프로세스 188 passed·28 skipped(기존 실제 Redis 시험 27개는 redis-server가 없어 건너뜀), 393초, 정상 종료
+
 ### Q&A 대화 세션별 단기 메모리 (`feat/qa-conversation-memory`, main 미머지) · `1a1d717`
 자세히: [docs/changes/2026-10-20-qa-conversation-memory.md](docs/changes/2026-10-20-qa-conversation-memory.md) · 기준 `a8995e4`
 

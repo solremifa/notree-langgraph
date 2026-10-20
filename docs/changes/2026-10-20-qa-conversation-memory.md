@@ -247,3 +247,100 @@ worker 루프·배정기·permit·lease·전달 세대·ACK 코드는 바꾸지 
 시험의 동기 Redis 클라이언트를 닫지 않아 종료 때 그 스레드를 기다림. 처리 스레드를 데몬으로 하고 클라이언트를 닫도록 고친 뒤
 위 두 파일을 한 프로세스로 돌려 정상 종료를 확인했습니다. 제품 코드 문제는 아닙니다.
 Linux **전체 한 번에 실행**은 수정 뒤 다시 하지 않았습니다 (파일별 결과 + 위 조합으로 대신).
+
+## 14. 후속 수정: 대화 Redis I/O가 MCP 이벤트 루프를 막던 문제 (같은 날, 같은 브랜치)
+
+기준 `f8973b2` → 이 커밋. 대화 메모리 설계(1~9절)는 그대로이고, **Redis를 부르는 위치와 시간 상한만** 바꿨습니다.
+
+### 문제
+`conversation.py`는 동기 `redis.Redis`, 이를 부르는 MCP 도구도 동기 함수였습니다. FastMCP(mcp 1.30)는 동기 도구를
+`fn(**args)`로 **이벤트 루프 스레드에서 바로** 부릅니다(`func_metadata.call_fn_with_arg_validation`). 그래서 대화 Redis가 느리면
+같은 MCP 서버의 다른 요청(job_heartbeat·qa_complete·job_reserve_pending …)이 모두 그만큼 밀렸습니다.
+기존 통합 시험은 api·worker가 각자 MCP 하위 프로세스를 써서 이 간섭이 드러나지 않았습니다.
+
+### 재현 (수정 전 코드, 새 시험 `tests/test_conv_event_loop.py`)
+MCP 서버 **하나**(stdio 하위 프로세스) ↔ 시험용 TCP 중계기(`conv_support.Proxy.stall`) ↔ 시험 전용 Redis(fakeredis TCP / docker redis:7-alpine).
+중계기가 요청 바이트를 1.5초 늦게 넘기거나(지연) 아예 버립니다(무응답). 제품 코드에 sleep을 넣지 않았고 운영 Redis는 건드리지 않았습니다.
+
+| 측정 | 수정 전 | 수정 후 |
+|---|---|---|
+| Redis 1.5초 지연 중 `qa_conversation_start` 0.05초 뒤 보낸 `job_heartbeat` 응답 | **1.45초**(fake)·**1.46초**(real) | **0.003초** (3회) |
+| Redis 무응답 때 `qa_conversation_start`가 끝나는 시간 | 4.02초 (2초 × 재시도) — 그동안 서버 전체 정지 | 시한 1초 설정에서 ≈1.6초, 그동안 heartbeat 즉시 |
+| 무응답 Redis에 `qa_conversation_get` 20개 동시 | 81초 (하나씩 직렬, 서버 정지) | 2.0초, Redis 연결 ≤ 2(스레드 수), 상한 넘은 16개는 즉시 `unavailable` |
+| 시험 파일 결과 | 8개 중 **6 failed** | 8 passed (+ 단위 9 passed) |
+
+### 방식: B. 동기 Redis I/O를 제한된 스레드로 분리 (A. 비동기 클라이언트는 택하지 않음)
+- 이유: ① 서버의 DB 코드(sqlite)와 대화 규칙(`_cas`의 WATCH/MULTI 재시도)이 모두 동기라 규칙 코드를 그대로 두고 **실행 위치만** 옮길 수 있음 —
+  단위 시험(규칙)이 그대로 유효. ② 동기 클라이언트와 스레드 풀은 이벤트 루프에 묶이지 않음 → 시험의 여러 `asyncio.run`, HTTP 세션별
+  수명 주기에서 "다른 루프에 만든 비동기 연결" 문제가 생기지 않음. ③ redis.asyncio로 바꾸면 전역 클라이언트를 루프별로 두고 서버 수명에 맞춰
+  닫는 코드가 새로 필요하고, WATCH 재시도 코드를 다시 써야 함
+- `conversation.run(fn, *args)`: 모든 대화 Redis 작업의 유일한 진입점. MCP 도구는 `await CONV.run(CONV.create, …)`처럼 부릅니다
+  (`test_server_never_calls_conversation_io_directly`가 server.py에서 직접 호출이 없는지 검사)
+- 도구 `qa_conversation_start/close/get`, `qa_ask`(대화 경로), `qa_context`, `qa_complete`, `qa_delete`와 내부 `_sync_memory`·`_context_turns`·
+  `_end_conversation`·`_qa_ask_in_conversation`을 async로. DB 트랜잭션은 전과 같이 **Redis를 부르기 전에 닫힘** (Redis를 기다리며 DB 잠금을 쥐지 않음)
+- `guarded`: async 함수면 async 래퍼로 감싸 실제로 `await`하고 같은 규칙으로 거절 형식으로 바꿈 (`Reject`·DB 오류·인자 오류). 모르는 오류는
+  전처럼 그대로 올림. 취소(`CancelledError`)는 잡지 않음
+
+### 자원 상한 (설정, 잠정값)
+| 설정 | 기본 | 뜻 |
+|---|---|---|
+| `NOTREE_CONV_REDIS_THREADS` | 4 | 전용 스레드 수 = 연결 풀(`BlockingConnectionPool`) 상한 |
+| `NOTREE_CONV_REDIS_MAX_PENDING` | 16 | 실행 중 + 대기 상한. 넘으면 기다리지 않고 `MemoryUnavailable` → 기존 규칙대로 (등록 거절 `unavailable` / 답 저장은 성공 `memory=failed` / 조회 `memory_state=unavailable`) |
+| `NOTREE_CONV_REDIS_TIMEOUT_SEC` | 1.0 | 연결·읽기 각각. 명령당 재시도 1회 (전과 같음, 전에는 2초 고정) |
+| `NOTREE_CONV_REDIS_OP_DEADLINE_SEC` | 3.0 | 작업 하나 시한 (스레드 대기 포함). 대기 중 지나면 Redis에 닿지 않고 실패, WATCH 재시도도 시한까지 |
+
+작업 하나의 최악 ≈ 시한 + 2 × (연결 + 읽기) = 기본 7초. 그 뒤엔 반드시 끝납니다.
+
+### 취소·종료
+- 기다리던 요청이 취소돼도 **이미 시작한 동기 I/O는 멈추지 않는다고 봅니다**. 슬롯은 스레드가 실제로 끝날 때(`Future` 완료 콜백) 돌려받고,
+  아직 시작 안 한 작업은 취소되며 슬롯을 바로 돌려받습니다 (`test_cancel_keeps_slot_until_the_thread_really_finishes`, `test_cancel_before_start_releases_slot`)
+- 서버 수명: `server.main()`이 끝날 때 `CONV.shutdown()` — 대기 작업 취소, 연결 풀 닫기. 도는 스레드는 위 시간 제한으로 빠집니다.
+  FastMCP lifespan에 두지 않은 이유: streamable HTTP는 **세션마다** lifespan이 돌아 다른 세션이 쓰는 풀을 닫게 됨
+- Redis 무응답 중 stdin을 닫으면 서버 프로세스가 0.98초 만에 종료 코드 0으로 끝남 (`test_server_exits_promptly_…`, 수정 전 4.8초)
+
+### 바뀐 파일
+| 파일 | 내용 |
+|---|---|
+| `notree/mcp_server/conversation.py` | `run`·`stats`·`shutdown`, 스레드별 시한, 연결 풀 상한, 시간 제한 설정화 |
+| `notree/mcp_server/server.py` | `guarded` async 지원, 대화 도구·내부 경로 async + `CONV.run`, 종료 때 `CONV.shutdown()` |
+| `notree/common/settings.py` | 위 설정 4개 |
+| `tests/test_conv_event_loop.py` 🆕 | 같은 서버 간섭·무응답 상한·동시 요청 상한·종료 (fake·real) |
+| `tests/test_conv_offload_unit.py` 🆕 | 루프 비차단, 스레드·대기 상한, 대기 중 시한, 취소, 루프 바꿔 쓰기·shutdown 뒤 재사용, 연결 정리, `guarded` async, 직접 호출 금지 |
+| `tests/conv_support.py` | `FakeRedis.close()`가 실제로 서버를 내림, `Proxy.stall()`·동시 연결 수 |
+| `tests/test_qa_conversation_unit.py` | 시험 클라이언트를 닫음 |
+| `notree/dev/pytest_guard.py` 🆕 | 시간 제한 있는 시험 실행기 (아래) |
+
+**계약 변경 없음**: 도구 이름·인자·응답·오류 코드가 같습니다 (`test_server_tools_match_contract` 통과). `notree/contracts/tools.py`는 그대로.
+worker·배정기·큐·실행권·시도 횟수·ACK는 바꾸지 않았습니다.
+
+### 시험 도구 정리 (13절 멈춤의 후속 확인)
+13절의 수정(처리 스레드 데몬, 클라이언트 닫기)만으로는 `FakeRedis.close()`가 **아무것도 하지 않았습니다** — 듣기 소켓과 `serve_forever`
+스레드가 프로세스 끝까지 남고, 데몬 설정이 종료 대기를 가렸을 뿐입니다. 이제 `close()`는 `shutdown()`(처리 스레드에 종료 신호 →
+serve_forever 끝남, 시간 제한 걸어 호출) → `server_close()` → 연결 처리 스레드가 모두 빠졌는지(`clients` 비었는지) 확인하고, 남으면 오류로 드러냅니다.
+`test_qa_conversation_unit.py`의 `r` 고정물이 시험 클라이언트(가짜·실제)를 닫지 않던 것도 고쳤습니다.
+
+### 시험 실행기 `notree/dev/pytest_guard.py`
+전체 시간 제한, 시험별 START/END·결과·소요 시간(`timing.log`), 시험 한도·전체 한도 직전에 모든 스레드의 Python 스택(`stacks.log`, faulthandler),
+시간 초과·종료 정체 때 하위 프로세스 목록(`procs.log`), 요약 줄을 봤는지와 **프로세스가 실제로 끝났는지**(`result.txt`)를 따로 적습니다.
+요약 뒤 `--grace`초 안에 안 끝나면 125로 실패. 일부러 비데몬 스레드를 남기는 시험으로 확인: `1 passed` 출력 뒤 정체 → 주 스레드
+`threading._shutdown` 스택이 남고 종료 코드 125.
+
+### 시험 결과 (Windows 11, Python 3.13.2, docker redis:7-alpine)
+| 실행 | 결과 | 시간 | 종료 |
+|---|---|---|---|
+| 새 시험 2개 파일, 수정 전 코드 | 6 failed, 2 passed (재현) | 240초 | pytest 1 |
+| 새 시험 2개 파일, 수정 후 | 17 passed | 27초 | 0 |
+| **전체 한 프로세스** (`pytest_guard --total 2400 --grace 60`) | **188 passed, 28 skipped, 실패·시간 초과 0** | 393초 | pytest 0, 요약 뒤 프로세스 스스로 종료, 정체 스택 없음 |
+
+건너뜀 28개: 27개는 기존 실제 Redis 시험(`test_redis_ownership` 14·`test_dispatch_recovery` 10·`test_combined_faults` 3)이 PATH의
+`redis-server`만 찾아서(Windows에 없음, docker 대체 없음) — 이번 수정이 건드리지 않는 worker·배정기 경로지만 **이번에 다시 돌리지 않았습니다**.
+1개는 가짜 Redis 재시작 변형(재시작 기능 없음, 초기화 시험으로 대신). 대화 시험의 `[real]` 변형은 모두 docker Redis로 돌았습니다.
+가장 느린 시험 `test_redis_down_raises_memory_unavailable` 33초는 시험이 만든 클라이언트의 redis-py 기본 재시도(지수 대기) 때문이며
+수정 전 코드에서도 같습니다(32.8초).
+
+### 남는 한계
+- **sqlite 호출은 여전히 이벤트 루프에서 돕니다** (모든 도구 공통, 이번 범위 밖). DB가 잠기면(`timeout=10`) 같은 서버의 다른 요청이 밀릴 수 있습니다.
+  PG로 옮길 때 비동기 드라이버나 같은 방식의 스레드 분리가 필요합니다
+- 대기 상한을 넘은 대화 요청은 바로 `unavailable`입니다. 동시 사용자가 많으면 값 조정이 필요합니다 (잠정값, 부하 측정 안 함)
+- 취소된 요청의 스레드는 최악 ≈7초(기본값) 슬롯을 잡습니다. 그동안 상한 계산에 들어갑니다
+- 실제 OpenAI 호출은 하지 않았습니다 (가짜 LLM으로 문맥 전달만 확인, 12절 그대로)

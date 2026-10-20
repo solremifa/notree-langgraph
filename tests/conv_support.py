@@ -3,8 +3,10 @@
 - FakeRedis: fakeredis TCP 서버 (MCP 서버가 하위 프로세스라 메모리 속 가짜는 공유가 안 됨). 재시작 대신 초기화(FLUSHALL)만
 - RealRedis: **시험 전용** 실제 Redis. PATH에 redis-server가 있으면 그것을, 없으면 docker `redis:7-alpine` 컨테이너.
   기존 정책대로 RDB/AOF를 끈다 (`--save "" --appendonly no`). 재시작·초기화는 이 Redis에만 한다
-- Proxy: MCP 서버 ↔ Redis 사이 TCP 중계. cut()이면 연결을 끊고 새 연결을 바로 닫는다 (Redis 장애 흉내)
+- Proxy: MCP 서버 ↔ Redis 사이 TCP 중계. cut()이면 연결을 끊고 새 연결을 바로 닫는다 (Redis 장애 흉내).
+  stall(초)이면 요청 바이트를 그만큼 늦게 넘기고, stall()(무한)이면 넘기지 않는다 (연결은 되는데 응답이 없는 Redis)
 """
+import math
 import shutil
 import socket
 import subprocess
@@ -44,7 +46,8 @@ class FakeRedis:
         # (2026-10-20 Linux 실행에서 재현: 주 스레드 futex 대기 + 같은 프로세스 안 loopback 연결)
         self.srv.daemon_threads = True
         self.srv.block_on_close = False
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()   # shutdown()은 멈추므로 데몬으로 둔다
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
         self.url = f"redis://127.0.0.1:{self.port}/0"
         _wait_ping(self.url)
 
@@ -52,8 +55,22 @@ class FakeRedis:
         with redis.Redis.from_url(self.url) as c:
             c.flushall()
 
-    def close(self) -> None:
-        pass
+    def close(self, timeout: float = 5) -> None:
+        """서버를 실제로 내린다: shutdown()은 처리 스레드들에 종료 신호(_shutdown_event)를 주고 serve_forever 루프가 끝나길
+        기다린다. 그 뒤 듣기 소켓을 닫고, 연결 처리 스레드가 모두 빠졌는지(clients가 비었는지) 시간 제한 안에서 확인한다.
+        데몬 설정은 안전망일 뿐 — 남은 연결이 있으면 여기서 오류로 드러낸다."""
+        stopper = threading.Thread(target=self.srv.shutdown, daemon=True)
+        stopper.start()
+        stopper.join(timeout)
+        self.srv.server_close()
+        self.thread.join(timeout)
+        end = time.time() + timeout
+        while self.srv.clients and time.time() < end:
+            time.sleep(0.05)
+        left = len(self.srv.clients)
+        if stopper.is_alive() or self.thread.is_alive() or left:
+            raise RuntimeError(f"fakeredis 서버 종료 실패: shutdown={not stopper.is_alive()} "
+                               f"serve={not self.thread.is_alive()} 남은 연결={left}")
 
 
 def docker_ok() -> bool:
@@ -121,6 +138,8 @@ class Proxy:
 
     def __init__(self, upstream_port: int) -> None:
         self.up, self.down, self.conns = upstream_port, False, []
+        self.delay = 0.0
+        self.active = self.peak = self.accepted = 0      # 동시 연결 수 (자원 상한 확인용)
         self.lsock = socket.socket()
         self.lsock.bind(("127.0.0.1", 0))
         self.lsock.listen(64)
@@ -145,17 +164,27 @@ class Proxy:
                 continue
             with self.lock:
                 self.conns += [c, u]
-            threading.Thread(target=self._pipe, args=(c, u), daemon=True).start()
-            threading.Thread(target=self._pipe, args=(u, c), daemon=True).start()
+                self.accepted += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            threading.Thread(target=self._pipe, args=(c, u, True), daemon=True).start()
+            threading.Thread(target=self._pipe, args=(u, c, False), daemon=True).start()
 
-    @staticmethod
-    def _pipe(a: socket.socket, b: socket.socket) -> None:
+    def _pipe(self, a: socket.socket, b: socket.socket, upstream: bool) -> None:
         try:
             while data := a.recv(65536):
+                if upstream and self.delay:
+                    if math.isinf(self.delay):
+                        continue    # 무응답: 버린다 (클라이언트는 시간 초과로 이 연결을 버리고, 닫히면 recv가 끝나 집계에서 빠짐)
+                    else:
+                        time.sleep(self.delay)
                 b.sendall(data)
         except OSError:
             pass
         finally:
+            if upstream:
+                with self.lock:
+                    self.active -= 1
             for s in (a, b):
                 try:
                     s.close()
@@ -173,8 +202,13 @@ class Proxy:
                     pass
             self.conns = []
 
+    def stall(self, seconds: float = math.inf) -> None:
+        """요청을 Redis로 늦게 넘긴다 (seconds초). 무한이면 넘기지 않는다: 연결은 되지만 응답이 오지 않는 Redis."""
+        self.delay = seconds
+
     def restore(self) -> None:
         self.down = False
+        self.delay = 0.0
 
     def close(self) -> None:
         self.cut()

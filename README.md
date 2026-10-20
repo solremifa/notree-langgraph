@@ -38,6 +38,15 @@ uv run pytest -q -rs      # 맨 아래 "SKIPPED ... redis-server 없음"이 있�
 
 대화 메모리 시험(`test_qa_conversation*`)은 가짜 Redis와 실제 Redis로 **따로** 돕니다 (`[fake]` / `[real]`).
 실제 쪽은 `redis-server`가 없으면 docker의 `redis:7-alpine`을 시험 전용으로 띄우고(RDB/AOF 끔, 끝나면 삭제), 둘 다 없으면 건너뜁니다.
+(`test_conv_event_loop`도 같음: MCP 서버 하나에서 대화 Redis가 느리거나 응답이 없을 때 다른 도구가 막히지 않는지.)
+
+**전체 시험을 끝없이 기다리지 않으려면** 감시 실행기를 씁니다. 시간 제한·시험별 시작/끝 기록·정체 때 Python 스택과
+하위 프로세스 목록을 `out/test-logs/<시각>/`에 남기고, 요약이 찍힌 뒤 프로세스가 안 끝나는 것도 실패(125)로 봅니다.
+
+```powershell
+uv run python -m notree.dev.pytest_guard --total 2400      # 시간 초과 124, 요약 뒤 종료 정체 125, 나머지는 pytest 종료 코드
+```
+
 Windows에서 저장소 경로가 길면 가상환경 경로가 260자를 넘어 import가 실패할 수 있습니다 → `UV_PROJECT_ENVIRONMENT`로 짧은 경로에 두세요.
 
 프록시 환경에서 시험이 HTTP 클라이언트 생성 단계에서 실패하면 (2026-10-18 리뷰 환경):

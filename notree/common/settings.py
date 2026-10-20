@@ -112,6 +112,11 @@ QA_CONV_MAX_TURNS = int(_f("NOTREE_QA_CONV_MAX_TURNS", 5))              # Redis�
 QA_CONV_TTL_SEC = _f("NOTREE_QA_CONV_TTL_SEC", 1800)                    # 마지막 사용자 활동(질문 등록) 뒤 만료. Q&A 마감(90초)보다 길게
 QA_HISTORY_MAX_TOKENS = int(_f("NOTREE_QA_HISTORY_MAX_TOKENS", 1200))   # 모델 입력 이력 상한 (추정: UTF-8 바이트 / 3)
 QA_CONV_MSG_MAX_CHARS = int(_f("NOTREE_QA_CONV_MSG_MAX_CHARS", 2000))   # 메시지 하나를 Redis에 넣을 때 자르는 길이
+# 대화 Redis I/O는 MCP 이벤트 루프 밖의 제한된 스레드에서 (conversation.run). 최악 한 작업 ≈ 시한 + 2 × (연결 + 읽기)
+CONV_REDIS_TIMEOUT_SEC = _f("NOTREE_CONV_REDIS_TIMEOUT_SEC", 1.0)       # 연결·읽기 각각 (명령당 재시도 1회)
+CONV_REDIS_OP_DEADLINE_SEC = _f("NOTREE_CONV_REDIS_OP_DEADLINE_SEC", 3.0)  # 작업 하나(대기 포함, WATCH 재시도 전체) 시한
+CONV_REDIS_THREADS = int(_f("NOTREE_CONV_REDIS_THREADS", 4))            # 스레드 수 = Redis 연결 풀 상한
+CONV_REDIS_MAX_PENDING = int(_f("NOTREE_CONV_REDIS_MAX_PENDING", 16))   # 실행 중 + 대기 상한. 넘으면 바로 MemoryUnavailable
 
 # scheduler 주기 작업 (팀 결정 6·9번)
 RESEND_INTERVAL_SEC = _f("NOTREE_RESEND_INTERVAL_SEC", 10)        # 누락 복구 주기

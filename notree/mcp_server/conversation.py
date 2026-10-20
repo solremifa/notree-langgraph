@@ -16,9 +16,21 @@ MCP 서버(업무 서비스)만 이 모듈을 부른다. worker는 대화 키를
 - 종료·만료는 DB가 세대를 올린다. 이전 세대 키는 아무도 읽지 않고, 늦은 쓰기는 이전 세대 키(이미 없거나 곧 만료)로만 간다.
 - Redis 오류는 MemoryUnavailable로 바꿔 던진다. 부르는 쪽이 정한다 (답 저장은 성공으로 두고, 질문 등록은 거절).
 - 원문·Redis 값은 로그에 찍지 않는다.
+
+실행 위치 (이벤트 루프 차단 방지, 문서 9절)
+- 아래 갱신 함수(create·touch·read·apply_turns·remove_question·drop)는 동기 Redis를 쓰는 **동기 함수**다.
+  MCP 도구(이벤트 루프)에서는 직접 부르지 말고 `await run(fn, ...)`으로 부른다: 전용 스레드(CONV_REDIS_THREADS개)에서 돈다.
+- 실행 중 + 대기는 CONV_REDIS_MAX_PENDING개까지. 넘으면 기다리지 않고 MemoryUnavailable (요청이 쌓여 무한히 밀리지 않게).
+- 작업마다 시한(CONV_REDIS_OP_DEADLINE_SEC): 스레드를 기다리다 시한이 지나면 Redis에 닿지 않고 실패, WATCH 재시도도 시한까지.
+  명령 하나는 연결·읽기 시간 제한(CONV_REDIS_TIMEOUT_SEC) × 재시도 1회로 끝난다 → 최악 ≈ 시한 + 2 × (연결 + 읽기).
+- 기다리던 쪽이 취소돼도 이미 시작한 스레드의 동기 I/O는 멈추지 않는다. 슬롯은 스레드가 실제로 끝날 때 돌려받는다.
+- 클라이언트·스레드는 이벤트 루프에 묶이지 않는다 (동기 클라이언트 + 연결 풀 상한 = 스레드 수). shutdown()이 둘 다 닫는다.
 """
+import asyncio
 import json
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import redis
 from redis.backoff import NoBackoff
@@ -29,20 +41,90 @@ from notree.common import settings as S
 
 PREFIX = "notree:conv"
 _client: redis.Redis | None = None
+_executor: ThreadPoolExecutor | None = None
+_inflight = 0                         # run()으로 넘겨 아직 끝나지 않은 작업 (대기 + 실행 중)
+_lock = threading.Lock()
+_local = threading.local()            # 스레드에서 도는 작업의 시한 (monotonic)
 
 
 class MemoryUnavailable(Exception):
-    """Redis에 닿지 못함 (연결·시간 초과·경합 반복). 키가 '없음'과는 다르다."""
+    """Redis에 닿지 못함 (연결·시간 초과·경합 반복·요청 밀림). 키가 '없음'과는 다르다."""
 
 
 def client() -> redis.Redis:
     """처음 쓸 때 연결한다 (단일 질문만 쓰면 Redis에 붙지 않음). 장애면 짧게 한 번만 다시 해 보고 MemoryUnavailable로
-    (질문 등록·답 저장이 Redis 장애 때문에 오래 붙잡히지 않게)."""
+    (질문 등록·답 저장이 Redis 장애 때문에 오래 붙잡히지 않게). 연결 수는 스레드 수까지 (넘으면 풀에서 시간 제한만큼 기다림)."""
     global _client
-    if _client is None:
-        _client = redis.Redis.from_url(S.CONV_REDIS_URL, decode_responses=True, socket_timeout=2,
-                                       socket_connect_timeout=2, retry=Retry(NoBackoff(), 1))
-    return _client
+    with _lock:
+        if _client is None:
+            t = S.CONV_REDIS_TIMEOUT_SEC
+            pool = redis.BlockingConnectionPool.from_url(
+                S.CONV_REDIS_URL, max_connections=S.CONV_REDIS_THREADS, timeout=t, decode_responses=True,
+                socket_timeout=t, socket_connect_timeout=t, retry=Retry(NoBackoff(), 1))
+            _client = redis.Redis(connection_pool=pool)
+        return _client
+
+
+def _check_deadline() -> None:
+    d = getattr(_local, "deadline", None)
+    if d is not None and time.monotonic() >= d:
+        raise MemoryUnavailable("시간 초과")
+
+
+def _in_thread(deadline: float, fn, args):
+    _local.deadline = deadline
+    try:
+        _check_deadline()                                   # 스레드를 기다리다 시한이 지났으면 Redis에 닿지 않는다
+        return fn(*args)
+    finally:
+        _local.deadline = None
+
+
+def _finished(_: Future) -> None:
+    global _inflight
+    with _lock:
+        _inflight -= 1
+
+
+async def run(fn, *args):
+    """동기 Redis 작업 fn(*args)을 이벤트 루프 밖 전용 스레드에서 돌려 결과를 기다린다 (MCP 도구는 이것으로만 부른다).
+    상한을 넘으면 바로 MemoryUnavailable. 기다리던 쪽이 취소되면 아직 시작 안 한 작업은 취소되고, 이미 도는 작업은
+    시간 제한으로 끝날 때까지 슬롯을 잡고 있다 (취소가 I/O를 멈춘다고 가정하지 않는다)."""
+    global _executor, _inflight
+    with _lock:
+        if _inflight >= S.CONV_REDIS_MAX_PENDING:
+            raise MemoryUnavailable("대화 메모리 요청이 밀림")
+        if _executor is None:
+            _executor = ThreadPoolExecutor(S.CONV_REDIS_THREADS, thread_name_prefix="conv-redis")
+        ex = _executor
+        _inflight += 1
+    try:
+        fut = ex.submit(_in_thread, time.monotonic() + S.CONV_REDIS_OP_DEADLINE_SEC, fn, args)
+    except RuntimeError:                                    # shutdown() 뒤
+        with _lock:
+            _inflight -= 1
+        raise MemoryUnavailable("종료 중") from None
+    fut.add_done_callback(_finished)                        # 끝남·취소 어느 쪽이든 슬롯 반환 (스레드가 실제로 끝난 뒤)
+    return await asyncio.wrap_future(fut)
+
+
+def stats() -> dict:
+    """시험·점검용: 대기+실행 중 작업 수, 살아 있는 스레드 수."""
+    with _lock:
+        return {"inflight": _inflight, "threads": len(_executor._threads) if _executor else 0}
+
+
+def shutdown(wait: bool = False) -> None:
+    """서버 수명 종료: 새 작업을 받지 않고 대기 작업을 취소, 연결 풀을 닫는다. 이미 도는 스레드는 시간 제한으로 끝난다
+    (wait=True면 그것까지 기다림). 다시 쓰면 새로 만든다."""
+    global _executor, _client
+    with _lock:
+        ex, cli, _executor, _client = _executor, _client, None, None
+    if ex is not None:
+        ex.shutdown(wait=wait, cancel_futures=True)
+    if cli is not None:
+        cli.close()
+        cli.connection_pool.disconnect()                    # 풀을 넘겨 만든 클라이언트는 close()가 풀을 닫지 않는다
 
 
 def key(conversation_id: str, epoch: int) -> str:
@@ -67,6 +149,7 @@ def _cas(k: str, fn):
     try:
         with client().pipeline() as p:
             for _ in range(20):
+                _check_deadline()
                 try:
                     p.watch(k)
                     result, writes = fn(p.hgetall(k))
