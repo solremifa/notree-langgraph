@@ -11,7 +11,7 @@
 
 ## 2026-10-20
 
-### 대화 Redis I/O가 MCP 이벤트 루프를 막던 문제 (`feat/qa-conversation-memory`, main 미머지) · (이번 커밋)
+### 대화 Redis I/O가 MCP 이벤트 루프를 막던 문제 (`feat/qa-conversation-memory`, main 미머지) · `b709b42`
 자세히: [docs/changes/2026-10-20-qa-conversation-memory.md](docs/changes/2026-10-20-qa-conversation-memory.md) 14절 · 기준 `f8973b2`
 
 - 🐛 대화 도구의 동기 Redis 호출이 FastMCP 이벤트 루프에서 돌아, Redis가 느리면 같은 서버의 다른 도구(job_heartbeat 등)가 함께 멈춤.
