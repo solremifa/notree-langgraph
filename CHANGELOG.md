@@ -11,6 +11,14 @@
 
 ## 2026-10-20
 
+### pgvector 채택 확정 · 구현 계획 · 검증 항목 (문서만) · (이번 커밋)
+자세히: [docs/changes/2026-10-20-pgvector-integration.md](docs/changes/2026-10-20-pgvector-integration.md)
+
+- 🔧 결정 변경: PostgreSQL + pgvector를 Q&A 근거 검색의 중심으로 채택. pg_trgm은 미색인 · 최신 문서 보완과 장애 대체, 정확 검색부터, RRF 기본 미적용 (앞선 "기본 검색 변경은 답변 품질 평가 후"를 대체)
+- 🆕 구현 계획: 기준 브랜치 순서, 스키마(doc_version · 임베딩 테이블), 색인 경로(embed_pending · embedding_put), 검색 경로(permit 범위 · 보완 자리), 최신 문서 · 버전 · 삭제 · 권한 · 그래프 분기
+- 🆕 검증 항목 V1~V13
+- 문서만. 코드 · 실행 방법 변경 없음
+
 ### pgvector 통합 결정 기록 (문서만) · `5c1993f`
 자세히: [docs/changes/2026-10-20-pgvector-integration.md](docs/changes/2026-10-20-pgvector-integration.md)
 
