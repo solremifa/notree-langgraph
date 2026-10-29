@@ -5,3 +5,6 @@ __pycache__/
 
 # 실제 강의 자료 (교수님 강의 전사·수업 중 대화 포함). 공개 저장소라 커밋하지 않는다
 data/
+
+# langgraph dev(in-memory 서버)가 쓰는 로컬 저장 폴더
+.langgraph_api/

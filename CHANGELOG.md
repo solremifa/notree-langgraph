@@ -11,7 +11,10 @@
 
 ## 2026-10-29
 
-### 실험: Q&A 그래프를 LangGraph Agent Server로 (1단계, exp 브랜치) · (이번 커밋)
+### `.langgraph_api/` 무시 · (이번 커밋)
+- 🔧 `.gitignore`: `langgraph dev`가 만드는 로컬 저장 폴더 제외
+
+### 실험: Q&A 그래프를 LangGraph Agent Server로 (1단계, exp 브랜치) · `fd3bc89`
 자세히: [docs/changes/2026-10-29-langgraph-server.md](docs/changes/2026-10-29-langgraph-server.md)
 
 - 🆕 `notree/lgserver/`: 서버용 팩토리 `make_qa_graph` · `langgraph.json`. 그래프 코드는 그대로
