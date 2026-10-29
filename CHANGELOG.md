@@ -11,7 +11,16 @@
 
 ## 2026-10-29
 
-### 실험 문서: 같은 thread에 State가 이어 붙는 문제 · (이번 커밋)
+### 실험 2단계: worker 자리를 서버 그래프(qa_job)로 · (이번 커밋)
+자세히: [docs/changes/2026-10-29-langgraph-server.md](docs/changes/2026-10-29-langgraph-server.md#2단계-worker-자리를-서버-그래프로-2026-10-29)
+
+- 🆕 `notree/lgserver/qa_job.py`: start_job(`job_start` · permit) → run_handler(지금 qa handler + heartbeat) → settle(`job_finish` / `job_fail` / `job_release`). `langgraph.json`에 `qa_job` 등록
+- 🆕 `notree/dev/lgserver_ask.py`: 업무 서비스에 질문 등록 → 서버에 run `{job_id}` (Redis · 배정기 · worker 없이)
+- 🆕 시험 `tests/test_lgserver_job.py` 4개 (정상 · 이미 끝남 · 다른 실행이 lease 보유 · 삭제된 질문)
+- 🐛 안쪽 Q&A 그래프가 서버 체크포인터를 물려받아 config의 객체를 저장하려다 실패 → 따로 실행하도록. 근본 해결 후보(Runtime context)는 문서에
+- main worker · scheduler · MCP 경로 변경 없음
+
+### 실험 문서: 같은 thread에 State가 이어 붙는 문제 · `7ce678a`
 - 🔧 Studio에서 같은 thread로 질문을 이어 하면 `llm_calls` · 누적 근거가 남아 시간 초과 · 검색 생략이 생김. 질문마다 새 thread로 실행하도록 안내
 
 ### Windows 실행 안내 (PYTHONUTF8) · `18e5c39`

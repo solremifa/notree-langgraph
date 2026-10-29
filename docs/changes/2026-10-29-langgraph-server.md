@@ -82,7 +82,62 @@ uv run python -m notree.dev.lgserver_run "힙 정렬의 시간 복잡도는?" --
    대화를 thread 하나로 이어가려면 첫 노드에서 질문 단위 칸을 비우도록 그래프를 고쳐야 한다. `lgserver_run.py`는 질문마다 새 thread를 만든다.
 6. **라이선스 · 외부 통신**: 운영용 self-hosted 문서는 `LANGGRAPH_CLOUD_LICENSE_KEY`와 LangSmith 키, `beacon.langchain.com` 통신을 요구한다. 무료로 어디까지 되는지 확인 필요. 이번 실험은 개발용 `langgraph dev`만 썼다.
 
+## 2단계: worker 자리를 서버 그래프로 (2026-10-29)
+
+`qa`(1단계)는 그래프만 서버에 올린 것이다. `qa_job`은 **worker 실행기가 하던 일**까지 노드로 옮겼다.
+
+```
+START → start_job ─(started)→ run_handler → settle → END
+                   └(done · failed · leased · unknown)→ END
+```
+
+| 노드 | 하는 일 | 지금 worker의 어디 |
+|---|---|---|
+| `start_job` | 업무 서비스 `job_start` → permit · 실행 세대 발급 | `loop.py` `_process` 앞부분 |
+| `run_handler` | 지금 qa handler를 그대로 부름 (`qa_context` → Q&A 그래프 → `qa_complete`), 실행 내내 heartbeat, 마감 지킴 | `Lease` + `wait_for(handler)` |
+| `settle` | 성공 `job_finish` / 영구 실패 `job_fail` / 일시 실패 `job_release` | `_confirm` · `_fail` · `_ctl` |
+
+- 파일: `notree/lgserver/qa_job.py`(그래프), `notree/dev/lgserver_ask.py`(질문 등록 → run), `tests/test_lgserver_job.py`(시험 4개)
+- run 입력은 `{"job_id"}` 하나. 질문 저장 + 작업 등록은 지금처럼 업무 서비스 `qa_ask`가 한 트랜잭션으로 한다 → outbox는 그대로. 이 그래프는 "scheduler가 XADD 대신 서버에 run을 만든다"면 들어갈 자리다.
+- permit · 실행 세대 · 멱등 저장은 전부 업무 서비스가 그대로 판단한다. 서버 lease와 별개.
+
+### 실행
+
+```powershell
+uv run python -m notree.mcp_server --http                                      # 터미널 1: 업무 서비스
+$env:PYTHONUTF8 = "1"
+uv run --group lgserver langgraph dev --config notree/lgserver/langgraph.json  # 터미널 2: Agent Server
+uv run python -m notree.dev.lgserver_ask "스택 오버플로는 왜 생겨?"              # 터미널 3
+uv run python -m notree.dev.lgserver_ask "힙 정렬의 시간 복잡도는?" --again
+uv run python -m notree.dev.lgserver_ask "스택은 어떤 구조야?" --delete-first
+```
+
+Redis · 배정기 · worker는 띄우지 않는다.
+
+### 확인한 것
+
+| 시나리오 | 노드 | 작업 상태 |
+|---|---|---|
+| 정상 질문 | start_job(started) → run_handler(ok) → settle(finished) | done, 답 저장 (전사 t1 / 웹 w1) |
+| 같은 작업으로 run 한 번 더 | start_job(**done**) → 끝 | done 그대로, 다시 실행 안 함 |
+| 다른 실행이 lease를 쥠 (시험) | start_job(**leased**) → 끝 | running 그대로 |
+| 질문 삭제 뒤 실행 | start_job → run_handler(fatal: not_found) → settle(failed) | failed, 다시 시도 불가 |
+
+### 발견: config에 넣은 객체가 서버 체크포인트와 충돌한다
+
+처음에는 정상 질문도 Q&A 그래프가 끝까지 돈 뒤 `TypeError: cannot pickle 'async_generator' object`로 실패했다 (작업은 released).
+
+- `run_handler` 안에서 Q&A 그래프를 부르면 LangGraph가 그것을 **이 run의 하위 그래프**로 묶고, 서버 체크포인터를 물려준다.
+- 서버 저장소가 handler가 `config["configurable"]`에 넣은 `FakeQALLM`(msgpack 불가) · `McpRetriever`(MCP 연결, pickle 불가)까지 저장하려다 실패.
+- 로컬 `InMemorySaver`로는 재현되지 않았다. 서버 런타임(langgraph-api 0.16.9)에서만.
+
+이번에는 안쪽 Q&A 그래프를 빈 `contextvars`로 따로 실행해 하위 그래프로 묶이지 않게 했다. 대신 Studio · 스트림에 안쪽 노드(understand 등)가 보이지 않는다.
+
+**근본 해결 후보**: LangGraph 1.x의 **Runtime context**(`StateGraph(..., context_schema=...)`, `ainvoke(..., context=...)`, 노드에서 `runtime.context`). 실행 중 의존 객체를 넘기는 용도이고 체크포인트에 저장되지 않는다. Q&A 그래프가 LLM · 검색기를 config 대신 context에서 읽게 바꾸면, 하위 그래프로 묶어도 안쪽 노드를 볼 수 있다. main 그래프 코드를 고치는 일이라 이번 실험에서는 하지 않았다.
+
 ## 다음 단계
 
-- 2단계: 그래프가 `question_id`만 받아 MCP(`qa_context` · `qa_search` · `qa_complete`)로 질문 · 근거 · 저장을 하도록 팩토리 안에서 MCP 클라이언트와 `McpRetriever`를 만든다. permit은 어디서 받을지 정해야 한다.
+- ~~2단계~~: 위 '2단계'로 했다 (permit은 그래프의 첫 노드가 `job_start`로 받는다).
+- Q&A 그래프의 의존 객체를 Runtime context로 옮기기 (위 '발견'). 하면 안쪽 노드를 Studio에서 볼 수 있다.
+- 재시도: 일시 실패(`job_release`) 뒤 다시 run을 만드는 주체가 없다. scheduler가 run을 만들게 할지, 서버 쪽 재시도를 쓸지.
 - 3단계: Docker로 API와 queue worker를 나눠 띄우고 (`N_JOBS_PER_WORKER=0` / `python -m langgraph_api.queue_entrypoint`), worker 강제 종료 · 중복 실행 때 동작을 지금 worker의 장애 시험과 같은 시나리오로 비교한다.
