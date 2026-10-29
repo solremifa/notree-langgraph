@@ -11,7 +11,10 @@
 
 ## 2026-10-29
 
-### Windows 실행 안내 (PYTHONUTF8) · (이번 커밋)
+### 실험 문서: 같은 thread에 State가 이어 붙는 문제 · (이번 커밋)
+- 🔧 Studio에서 같은 thread로 질문을 이어 하면 `llm_calls` · 누적 근거가 남아 시간 초과 · 검색 생략이 생김. 질문마다 새 thread로 실행하도록 안내
+
+### Windows 실행 안내 (PYTHONUTF8) · `18e5c39`
 - 🔧 실험 문서 · `lgserver_run.py` 안내: Windows에서는 `$env:PYTHONUTF8 = "1"` 먼저 (서버가 cp949로 파일을 읽다 죽음)
 
 ### `.langgraph_api/` 무시 · `8534528`

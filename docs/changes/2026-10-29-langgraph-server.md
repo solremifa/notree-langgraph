@@ -49,6 +49,7 @@ uv run python -m notree.dev.lgserver_run "힙 정렬의 시간 복잡도는?" --
 - **Windows**: 먼저 `$env:PYTHONUTF8 = "1"`. 안 하면 서버가 시작하다 `UnicodeDecodeError: 'cp949' codec can't decode ...`로 죽는다 (langgraph_api가 자기 파일을 인코딩 지정 없이 열어 Windows 기본 cp949로 읽음). 영구 적용은 `[Environment]::SetEnvironmentVariable("PYTHONUTF8", "1", "User")` 뒤 PowerShell 새로 열기.
 - 서버가 뜨면 `API: http://127.0.0.1:2024`가 찍힌다. 2024가 이미 쓰이면 다른 포트로 뜨니 찍힌 주소를 `--url`로 준다.
 - 프록시 환경에서는 `localhost` 요청이 프록시로 가서 끊길 수 있다. `127.0.0.1`을 쓰거나 `NO_PROXY=127.0.0.1,localhost`.
+- Studio에서는 질문마다 새 thread(+ 버튼)로 실행할 것 (아래 '아직 안 맞는 것' 5).
 - 서버 로그의 `Studio UI` 주소를 브라우저로 열면 그래프 그림과 노드별 State를 화면에서 볼 수 있다 (LangSmith 로그인이 필요할 수 있음).
 - 서버 · 클라이언트 모두 OpenAI 없이 가짜 LLM이 기본이다. `--llm openai`는 서버 쪽에 `OPENAI_API_KEY`가 있어야 한다.
 
@@ -74,7 +75,12 @@ uv run python -m notree.dev.lgserver_run "힙 정렬의 시간 복잡도는?" --
 2. **outbox**: run 생성은 HTTP 요청이라 업무 DB 트랜잭션(질문 저장 + 작업 등록)과 묶이지 않는다. 작업 원장을 두고 scheduler가 XADD 대신 run을 만드는 식이 필요하다.
 3. **실행 세대(permit)**: 서버의 lease와 우리 DB의 `exec_epoch`가 따로 있다. 늦게 끝난 이전 실행 결과를 막는 장치는 업무 서비스에 남아야 한다.
 4. **레인 · 마감 · 재시도**: rt · qa · batch 분리, Q&A 90초 마감과 최대 3회 시도를 서버에서 어떻게 거는지 확인 필요.
-5. **라이선스 · 외부 통신**: 운영용 self-hosted 문서는 `LANGGRAPH_CLOUD_LICENSE_KEY`와 LangSmith 키, `beacon.langchain.com` 통신을 요구한다. 무료로 어디까지 되는지 확인 필요. 이번 실험은 개발용 `langgraph dev`만 썼다.
+5. **thread에 State가 이어 붙는다 (Studio에서 확인, 2026-10-29)**: 같은 thread에서 질문을 이어 하면 이전 State가 남는다.
+   `llm_calls`가 질문마다 0으로 돌아가지 않아 상한(4)을 넘으면 시간이 남아도 "시간 초과"로 끝나고,
+   누적 칸(`hits` · `searched`)에 이전 근거가 남아 전사 · 웹 검색을 건너뛴다 (같은 thread 4번째 질문에서 재현).
+   Q&A 그래프는 "실행 한 번 = 질문 하나" 전제라서, 서버에서는 **질문마다 새 thread**로 돌리고 대화 기록은 지금처럼 업무 DB(`qa_context`)에서 읽는 쪽이 맞다.
+   대화를 thread 하나로 이어가려면 첫 노드에서 질문 단위 칸을 비우도록 그래프를 고쳐야 한다. `lgserver_run.py`는 질문마다 새 thread를 만든다.
+6. **라이선스 · 외부 통신**: 운영용 self-hosted 문서는 `LANGGRAPH_CLOUD_LICENSE_KEY`와 LangSmith 키, `beacon.langchain.com` 통신을 요구한다. 무료로 어디까지 되는지 확인 필요. 이번 실험은 개발용 `langgraph dev`만 썼다.
 
 ## 다음 단계
 
