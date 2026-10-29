@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "qa": "./notree/lgserver/qa_app.py:make_qa_graph"
+  },
+  "env": {}
+}

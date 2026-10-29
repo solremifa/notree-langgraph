@@ -9,6 +9,17 @@
 
 ---
 
+## 2026-10-29
+
+### 실험: Q&A 그래프를 LangGraph Agent Server로 (1단계, exp 브랜치) · (이번 커밋)
+자세히: [docs/changes/2026-10-29-langgraph-server.md](docs/changes/2026-10-29-langgraph-server.md)
+
+- 🆕 `notree/lgserver/`: 서버용 팩토리 `make_qa_graph` · `langgraph.json`. 그래프 코드는 그대로
+- 🆕 `notree/dev/lgserver_run.py`: HTTP로 run을 만들고 노드별 결과를 찍는 클라이언트 (`uv run --group lgserver langgraph dev --config notree/lgserver/langgraph.json`로 서버 먼저)
+- 🆕 의존성 그룹 `lgserver`(`langgraph-cli[inmem]`). 기본 `uv sync`에는 안 들어감, langgraph 버전 그대로
+- 🆕 시험 `tests/test_lgserver_app.py` (서버 없이 팩토리만)
+- main worker · scheduler · MCP 경로는 바뀌지 않음. 실행 방법 변경 없음
+
 ## 2026-10-19
 
 ### 검색 방식 비교 측정 기록 (문서만) · `6ae423d`

@@ -18,6 +18,9 @@ dev = [
     "asyncpg>=0.32.0",
     "pytest>=8",
 ]
+lgserver = [
+    "langgraph-cli[inmem]>=0.4.40",
+]
 
 [tool.uv]
 package = false            # 스크립트 모음이라 패키지로 설치하지 않음
