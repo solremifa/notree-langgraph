@@ -46,6 +46,7 @@ uv run python -m notree.dev.lgserver_run "스택은 어떤 구조야?" --bad-cit
 uv run python -m notree.dev.lgserver_run "힙 정렬의 시간 복잡도는?" --deadline-sec 15
 ```
 
+- **Windows**: 먼저 `$env:PYTHONUTF8 = "1"`. 안 하면 서버가 시작하다 `UnicodeDecodeError: 'cp949' codec can't decode ...`로 죽는다 (langgraph_api가 자기 파일을 인코딩 지정 없이 열어 Windows 기본 cp949로 읽음). 영구 적용은 `[Environment]::SetEnvironmentVariable("PYTHONUTF8", "1", "User")` 뒤 PowerShell 새로 열기.
 - 서버가 뜨면 `API: http://127.0.0.1:2024`가 찍힌다. 2024가 이미 쓰이면 다른 포트로 뜨니 찍힌 주소를 `--url`로 준다.
 - 프록시 환경에서는 `localhost` 요청이 프록시로 가서 끊길 수 있다. `127.0.0.1`을 쓰거나 `NO_PROXY=127.0.0.1,localhost`.
 - 서버 로그의 `Studio UI` 주소를 브라우저로 열면 그래프 그림과 노드별 State를 화면에서 볼 수 있다 (LangSmith 로그인이 필요할 수 있음).

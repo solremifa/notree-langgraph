@@ -1,6 +1,7 @@
 """Agent Server(langgraph dev)에 띄운 Q&A 그래프를 HTTP API로 실행해 본다 (실험 1단계).
 
 먼저 다른 터미널에서 서버:
+    $env:PYTHONUTF8 = "1"          # Windows만: 없으면 서버가 cp949 UnicodeDecodeError로 죽음
     uv sync --group lgserver
     uv run --group lgserver langgraph dev --config notree/lgserver/langgraph.json --no-browser
 

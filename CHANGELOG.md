@@ -11,7 +11,10 @@
 
 ## 2026-10-29
 
-### `.langgraph_api/` 무시 · (이번 커밋)
+### Windows 실행 안내 (PYTHONUTF8) · (이번 커밋)
+- 🔧 실험 문서 · `lgserver_run.py` 안내: Windows에서는 `$env:PYTHONUTF8 = "1"` 먼저 (서버가 cp949로 파일을 읽다 죽음)
+
+### `.langgraph_api/` 무시 · `8534528`
 - 🔧 `.gitignore`: `langgraph dev`가 만드는 로컬 저장 폴더 제외
 
 ### 실험: Q&A 그래프를 LangGraph Agent Server로 (1단계, exp 브랜치) · `fd3bc89`
